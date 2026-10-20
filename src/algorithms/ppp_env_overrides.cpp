@@ -144,8 +144,6 @@ PPPEnvOverrides PPPEnvOverrides::fromEnvironment() {
     overrides.madoca_bias_subtract = envPresent("GNSS_PPP_MADOCA_BIAS_SUBTRACT");
     overrides.madoca_allow_partial_ssr = envExactOne("GNSS_PPP_MADOCA_ALLOW_PARTIAL_SSR");
     overrides.require_ssr_orbit = envFirstCharNotZero("GNSS_PPP_REQUIRE_SSR_ORBIT");
-    overrides.disable_madoca_static_anchor =
-        envExactOne("GNSS_PPP_DISABLE_MADOCA_STATIC_ANCHOR");
     overrides.static_anchor_blend = envDoubleOr("GNSS_PPP_STATIC_ANCHOR_BLEND", -1.0);
     overrides.madoca_early_window = !envExactZero("GNSS_PPP_MADOCA_EARLY_WINDOW");
     overrides.madoca_spike_guard = !envExactZero("GNSS_PPP_MADOCA_SPIKE_GUARD");
@@ -188,7 +186,6 @@ PPPEnvOverrides PPPEnvOverrides::fromEnvironment() {
     overrides.gal_inav = envFirstCharNotZero("GNSS_PPP_GAL_INAV");
     overrides.ssr_discnt_slip = envPresent("GNSS_PPP_SSR_DISCNT_SLIP");
     overrides.no_solid_tide = envPresent("GNSS_PPP_NO_SOLID_TIDE");
-    overrides.tide_itrs_sun_moon = envPresent("GNSS_PPP_TIDE_ITRS_SUN_MOON");
     overrides.pf_code_var_scale = envDoubleOr("GNSS_PPP_PF_CODE_VAR_SCALE", 1.0);
     overrides.pf_rx_antenna = envPresent("GNSS_PPP_PF_RX_ANTENNA");
     overrides.pf_wet_trop = envPresent("GNSS_PPP_PF_WET_TROP");
@@ -230,6 +227,12 @@ PPPEnvOverrides PPPEnvOverrides::fromEnvironment() {
             "GNSS_PPP_CLAS_AR_HELD_MAX_PUBLICATION_STREAK", 5, 1, 5);
     overrides.clas_outage_reset_parity =
         !envExactZero("GNSS_PPP_CLAS_OUTAGE_RESET_PARITY");
+    overrides.clas_tide_no_permanent =
+        envExactOne("GNSS_PPP_CLAS_TIDE_NO_PERMANENT");
+    overrides.clas_receiver_tide =
+        envExactOne("GNSS_PPP_CLAS_RECEIVER_TIDE");
+    overrides.clas_grid_blq_path =
+        envStringOrEmpty("GNSS_PPP_CLAS_GRID_BLQ");
     overrides.clas_sis_boundary =
         envExactOne("GNSS_PPP_CLAS_SIS_BOUNDARY");
     overrides.clas_base_clock_parity =
@@ -312,6 +315,7 @@ PPPEnvOverrides PPPEnvOverrides::fromEnvironment() {
         envIntOr("GNSS_PPP_CLAS_POST_RESET_QUARANTINE_MAX_NFIX", 7);
     overrides.clas_hold_cont_min_track =
         envIntOr("GNSS_PPP_CLAS_HOLD_CONT_MIN_TRACK", -1);
+    overrides.clas_par_freq_gate = envExactOne("GNSS_PPP_CLAS_PAR_FREQ_GATE");
     const std::string clas_nl_datum_fix =
         envStringOrEmpty("GNSS_PPP_CLAS_NL_DATUM_FIX");
     if (clas_nl_datum_fix.empty()) {

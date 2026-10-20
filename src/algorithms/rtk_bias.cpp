@@ -186,7 +186,8 @@ void RTKProcessor::updateTdcpDiagnostics(
     }
 }
 
-void RTKProcessor::updateBias(const std::map<SatelliteId, SatelliteData>& sat_data, double dt_s) {
+void RTKProcessor::updateBias(const std::map<SatelliteId, SatelliteData>& sat_data, double dt_s,
+                              const GNSSTime& epoch_time, const GNSSTime& base_epoch_time) {
     updateTdcpDiagnostics(sat_data, dt_s);
     current_epoch_slips_l1_.clear();
     current_epoch_slips_l2_.clear();
@@ -277,29 +278,59 @@ void RTKProcessor::updateBias(const std::map<SatelliteId, SatelliteData>& sat_da
     std::set<SatelliteId> doppler_slips_l1;
     std::set<SatelliteId> doppler_slips_l2;
     std::set<SatelliteId> doppler_slips_l5;  // Phase 18 Step 5
+    // The stored phase samples are one detector call old, not one remembered
+    // solution old: a rejected previous epoch leaves dt_s at 2x (or more) the
+    // sample spacing while the history was still refreshed.
+    double doppler_dt_s = dt_s;
+    // The base advanced over its own span since the same detector call (NaN:
+    // unknown, the prediction then uses the rover span for both receivers).
+    // The base span only goes with a rover span taken from the history.
+    double doppler_base_dt_s = std::numeric_limits<double>::quiet_NaN();
+    if (has_doppler_history_time_) {
+        const double history_dt = epoch_time - doppler_history_time_;
+        if (std::isfinite(history_dt) && history_dt > 0.0) {
+            doppler_dt_s = history_dt;
+            if (has_doppler_history_base_time_) {
+                doppler_base_dt_s = base_epoch_time - doppler_history_base_time_;
+            }
+        }
+    }
     if (rtk_config_.enable_doppler_slip_detection &&
-        std::isfinite(dt_s) &&
-        dt_s > 0.0 &&
-        dt_s <= 5.0) {
+        std::isfinite(doppler_dt_s) &&
+        doppler_dt_s > 0.0 &&
+        doppler_dt_s <= 5.0) {
         const double doppler_slip_threshold =
             apply_dynamic_slip_floor
                 ? std::max(rtk_config_.doppler_slip_threshold, 0.20)
                 : std::max(rtk_config_.doppler_slip_threshold, 0.10);
+        // The base epoch need not advance with the rover epoch (see
+        // rtk_slip_detection::detectDopplerSlipWithBaseSpan). With equal or
+        // unknown spans this is exactly the rover-span test.
+        const auto detect_doppler_slip = [&](double previous_sd_phase_m, double sd_phase_m,
+                                             double rover_doppler_hz, double base_doppler_hz,
+                                             double wavelength_m) {
+            return rtk_slip_detection::detectDopplerSlipWithBaseSpan(
+                previous_sd_phase_m,
+                sd_phase_m,
+                rover_doppler_hz,
+                base_doppler_hz,
+                wavelength_m,
+                doppler_dt_s,
+                doppler_base_dt_s,
+                doppler_slip_threshold);
+        };
         for (const auto& [sat, sd] : sat_data) {
             if (sd.has_l1 && sd.has_l1_doppler && sd.l1_wavelength > 0.0) {
                 const double sd_phase_m =
                     (sd.rover_l1_phase - sd.base_l1_phase) * sd.l1_wavelength;
-                const double sd_range_rate_mps =
-                    rtk_slip_detection::singleDifferenceRangeRateMps(
-                        sd.rover_l1_doppler, sd.base_l1_doppler, sd.l1_wavelength);
                 auto previous = doppler_phase_history_l1_m_.find(sat);
                 if (previous != doppler_phase_history_l1_m_.end() &&
-                    rtk_slip_detection::detectDopplerSlip(
+                    detect_doppler_slip(
                         previous->second,
                         sd_phase_m,
-                        sd_range_rate_mps,
-                        dt_s,
-                        doppler_slip_threshold)) {
+                        sd.rover_l1_doppler,
+                        sd.base_l1_doppler,
+                        sd.l1_wavelength)) {
                     doppler_slips_l1.insert(sat);
                 }
                 doppler_phase_history_l1_m_[sat] = sd_phase_m;
@@ -307,17 +338,14 @@ void RTKProcessor::updateBias(const std::map<SatelliteId, SatelliteData>& sat_da
             if (sd.has_l2 && sd.has_l2_doppler && sd.l2_wavelength > 0.0) {
                 const double sd_phase_m =
                     (sd.rover_l2_phase - sd.base_l2_phase) * sd.l2_wavelength;
-                const double sd_range_rate_mps =
-                    rtk_slip_detection::singleDifferenceRangeRateMps(
-                        sd.rover_l2_doppler, sd.base_l2_doppler, sd.l2_wavelength);
                 auto previous = doppler_phase_history_l2_m_.find(sat);
                 if (previous != doppler_phase_history_l2_m_.end() &&
-                    rtk_slip_detection::detectDopplerSlip(
+                    detect_doppler_slip(
                         previous->second,
                         sd_phase_m,
-                        sd_range_rate_mps,
-                        dt_s,
-                        doppler_slip_threshold)) {
+                        sd.rover_l2_doppler,
+                        sd.base_l2_doppler,
+                        sd.l2_wavelength)) {
                     doppler_slips_l2.insert(sat);
                 }
                 doppler_phase_history_l2_m_[sat] = sd_phase_m;
@@ -327,21 +355,34 @@ void RTKProcessor::updateBias(const std::map<SatelliteId, SatelliteData>& sat_da
                 sd.has_l5 && sd.has_l5_doppler && sd.l5_wavelength > 0.0) {
                 const double sd_phase_m =
                     (sd.rover_l5_phase - sd.base_l5_phase) * sd.l5_wavelength;
-                const double sd_range_rate_mps =
-                    rtk_slip_detection::singleDifferenceRangeRateMps(
-                        sd.rover_l5_doppler, sd.base_l5_doppler, sd.l5_wavelength);
                 auto previous = doppler_phase_history_l5_m_.find(sat);
                 if (previous != doppler_phase_history_l5_m_.end() &&
-                    rtk_slip_detection::detectDopplerSlip(
+                    detect_doppler_slip(
                         previous->second,
                         sd_phase_m,
-                        sd_range_rate_mps,
-                        dt_s,
-                        doppler_slip_threshold)) {
+                        sd.rover_l5_doppler,
+                        sd.base_l5_doppler,
+                        sd.l5_wavelength)) {
                     doppler_slips_l5.insert(sat);
                 }
                 doppler_phase_history_l5_m_[sat] = sd_phase_m;
             }
+        }
+    }
+    if (rtk_config_.enable_doppler_slip_detection) {
+        if (std::isfinite(doppler_dt_s) && doppler_dt_s > 0.0 && doppler_dt_s <= 5.0) {
+            doppler_history_time_ = epoch_time;
+            has_doppler_history_time_ = true;
+            doppler_history_base_time_ = base_epoch_time;
+            has_doppler_history_base_time_ = true;
+        } else {
+            // Gap too long (or invalid) for a Doppler prediction: drop the
+            // stale samples instead of comparing against them later.
+            doppler_phase_history_l1_m_.clear();
+            doppler_phase_history_l2_m_.clear();
+            doppler_phase_history_l5_m_.clear();
+            has_doppler_history_time_ = false;
+            has_doppler_history_base_time_ = false;
         }
     }
     debug_telemetry_.doppler_slip_l1_count = static_cast<int>(doppler_slips_l1.size());
@@ -463,7 +504,24 @@ void RTKProcessor::updateBias(const std::map<SatelliteId, SatelliteData>& sat_da
         for (const auto& [sat, sd] : sat_data) {
             if (!has_freq_signal(sd, freq)) continue;
             int lli = freq_lli(sd, freq);
-            const bool lli_slip = (lli & 0x01) != 0;
+            bool lli_slip = (lli & 0x01) != 0;
+            if (rtk_config_.use_half_cycle_lli) {
+                // demo5 detslp_ll: a transition of the half-cycle-unresolved
+                // flag (either direction) on the rover or the base
+                // observation of this satellite/frequency is a slip for that
+                // satellite/frequency only. The previous flag survives
+                // observation gaps (demo5 keeps it in ssat.slip).
+                const bool rover_half = sd.roverHalfCycle(freq);
+                const bool base_half = sd.baseHalfCycle(freq);
+                const auto key = std::make_pair(sat, freq);
+                const auto previous = half_cycle_lli_history_.find(key);
+                if (previous != half_cycle_lli_history_.end() &&
+                    (previous->second.first != rover_half ||
+                     previous->second.second != base_half)) {
+                    lli_slip = true;
+                }
+                half_cycle_lli_history_[key] = {rover_half, base_half};
+            }
             if (lli_slip) {
                 lli_slip_count++;
             }
@@ -603,6 +661,12 @@ void RTKProcessor::updateBias(const std::map<SatelliteId, SatelliteData>& sat_da
             for (const auto& [sat, b] : bias) {
                 auto idx_it = indices.find(sat);
                 if (idx_it != indices.end() && filter_state_.state(idx_it->second) != 0.0) continue;
+                if (rtk_config_.enable_canyon_carrier_prior &&
+                    carrier_prior_.engaged_this_epoch &&
+                    initializeAmbiguityFromCarrierPrior(sat, freq, sat_data)) {
+                    lock_counts[sat] = 0;
+                    continue;
+                }
                 if (freq == 0) getOrCreateN1Index(sat, b);
                 else if (freq == 1) getOrCreateN2Index(sat, b);
                 else getOrCreateN5Index(sat, b);

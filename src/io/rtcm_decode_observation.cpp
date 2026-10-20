@@ -10,6 +10,8 @@
 #include <iterator>
 #include <limits>
 #include <string>
+#include <utility>
+#include <vector>
 
 #ifndef _WIN32
 #include <netdb.h>
@@ -28,6 +30,7 @@ namespace io {
 using namespace rtcm_internal;
 
 bool RTCMProcessor::decodeObservationMessage(const RTCMMessage& message, ObservationData& obs_data) {
+    last_observation_more_follows_ = false;
     if (isGlonassMsmMessageType(message.type)) {
         const bool msm5 = isMsm5MessageType(message.type);
         const bool msm6 = isMsm6MessageType(message.type);
@@ -47,6 +50,8 @@ bool RTCMProcessor::decodeObservationMessage(const RTCMMessage& message, Observa
         const uint32_t epoch_field =
             static_cast<uint32_t>(readUnsignedBits(message.data.data(), message.data.size(), bit_pos, 30));
         bit_pos += 30;
+        last_observation_more_follows_ =
+            readUnsignedBits(message.data.data(), message.data.size(), bit_pos, 1) != 0;
         bit_pos += 1;  // multiple message bit
         bit_pos += 3;  // issue of data station
         bit_pos += 7;  // session transmit time
@@ -201,7 +206,8 @@ bool RTCMProcessor::decodeObservationMessage(const RTCMMessage& message, Observa
         }
 
         obs_data.clear();
-        obs_data.time = glonassMsmEpochToGpst(epoch_field);
+        obs_data.time = reference_time_ ? glonassMsmEpochToGpst(epoch_field, *reference_time_) :
+                                         glonassMsmEpochToGpst(epoch_field);
         if (has_reference_position_) {
             obs_data.receiver_position = reference_position_;
         }
@@ -232,6 +238,7 @@ bool RTCMProcessor::decodeObservationMessage(const RTCMMessage& message, Observa
                 }
                 continue;
             }
+            std::vector<MsmCandidate> candidates;
             for (size_t sig_index = 0; sig_index < signal_ids.size(); ++sig_index) {
                 if (!cell_mask[sat_index * signal_ids.size() + sig_index]) {
                     continue;
@@ -240,7 +247,9 @@ bool RTCMProcessor::decodeObservationMessage(const RTCMMessage& message, Observa
                     return false;
                 }
 
-                const SignalType signal = decodeGlonassMsmSignal(signal_ids[sig_index]);
+                const MsmSignalEntry signal_entry =
+                    lookupMsmSignal(GNSSSystem::GLONASS, signal_ids[sig_index]);
+                const SignalType signal = signal_entry.signal;
                 const double wavelength =
                     has_frequency_channel ? glonassSignalWavelength(signal, frequency_channel) : 0.0;
                 const auto& cell = cells[cell_index++];
@@ -294,9 +303,15 @@ bool RTCMProcessor::decodeObservationMessage(const RTCMMessage& message, Observa
                 obs.signal_strength = static_cast<int>(std::lround(obs.snr / 6.0));
                 obs.valid = obs.has_pseudorange || obs.has_carrier_phase || obs.has_doppler;
                 if (obs.valid) {
-                    obs_data.addObservation(obs);
+                    annotateMsmObservationCodes(obs, signal_entry.code);
+                    MsmCandidate candidate;
+                    candidate.obs = std::move(obs);
+                    candidate.code = signal_entry.code;
+                    candidate.rank = msmTrackingRank(GNSSSystem::GLONASS, signal_entry);
+                    candidates.push_back(std::move(candidate));
                 }
             }
+            appendMsmSatelliteCandidates(candidates, obs_data);
         }
 
         return !obs_data.isEmpty();
@@ -326,6 +341,8 @@ bool RTCMProcessor::decodeObservationMessage(const RTCMMessage& message, Observa
         const uint32_t epoch_ms =
             static_cast<uint32_t>(readUnsignedBits(message.data.data(), message.data.size(), bit_pos, 30));
         bit_pos += 30;
+        last_observation_more_follows_ =
+            readUnsignedBits(message.data.data(), message.data.size(), bit_pos, 1) != 0;
         bit_pos += 1;  // multiple message bit
         bit_pos += 3;  // issue of data station
         bit_pos += 7;  // session transmit time
@@ -494,6 +511,7 @@ bool RTCMProcessor::decodeObservationMessage(const RTCMMessage& message, Observa
                 }
                 continue;
             }
+            std::vector<MsmCandidate> candidates;
             for (size_t sig_index = 0; sig_index < signal_ids.size(); ++sig_index) {
                 if (!cell_mask[sat_index * signal_ids.size() + sig_index]) {
                     continue;
@@ -502,7 +520,8 @@ bool RTCMProcessor::decodeObservationMessage(const RTCMMessage& message, Observa
                     return false;
                 }
 
-                const SignalType signal = decodeFixedFrequencyMsmSignal(system, signal_ids[sig_index]);
+                const MsmSignalEntry signal_entry = lookupMsmSignal(system, signal_ids[sig_index]);
+                const SignalType signal = signal_entry.signal;
                 const double wavelength = signalWavelength(signal);
                 const auto& cell = cells[cell_index++];
                 if (signal == SignalType::SIGNAL_TYPE_COUNT) {
@@ -551,9 +570,15 @@ bool RTCMProcessor::decodeObservationMessage(const RTCMMessage& message, Observa
                 obs.signal_strength = static_cast<int>(std::lround(obs.snr / 6.0));
                 obs.valid = obs.has_pseudorange || obs.has_carrier_phase || obs.has_doppler;
                 if (obs.valid) {
-                    obs_data.addObservation(obs);
+                    annotateMsmObservationCodes(obs, signal_entry.code);
+                    MsmCandidate candidate;
+                    candidate.obs = std::move(obs);
+                    candidate.code = signal_entry.code;
+                    candidate.rank = msmTrackingRank(system, signal_entry);
+                    candidates.push_back(std::move(candidate));
                 }
             }
+            appendMsmSatelliteCandidates(candidates, obs_data);
         }
 
         return !obs_data.isEmpty();
@@ -578,6 +603,8 @@ bool RTCMProcessor::decodeObservationMessage(const RTCMMessage& message, Observa
     const uint32_t epoch_ms =
         static_cast<uint32_t>(readUnsignedBits(message.data.data(), message.data.size(), bit_pos, 30));
     bit_pos += 30;
+    last_observation_more_follows_ =
+        readUnsignedBits(message.data.data(), message.data.size(), bit_pos, 1) != 0;
     bit_pos += 1;  // synchronous GNSS flag
     const uint64_t num_sats = readUnsignedBits(message.data.data(), message.data.size(), bit_pos, 5);
     bit_pos += 5;

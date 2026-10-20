@@ -588,8 +588,41 @@ PositionSolution PPPProcessor::processEpochStandard(
             detectCycleSlips(obs, nav);
             predictState(dt, seed_ptr);
 
-            bool updated = updateFilter(obs, nav, dt);
-            if (!updated && ppp_config_.enable_ambiguity_resolution) {
+            // Position / velocity / acceleration dynamics without an SPP seed:
+            // RTKLIB runs no PPP update when pntpos() fails. The receiver
+            // clock is re-seeded from SPP every epoch, and after an outage
+            // the motion states wait for the next seed to restart from.
+            const bool skip_update_without_seed =
+                seed_ptr == nullptr && filter_state_.accel_index >= 0 &&
+                ppp_internal::usePvaDynamics(
+                    ppp_config_.use_pva_dynamics,
+                    ppp_config_.use_dynamics_model,
+                    ppp_config_.kinematic_mode,
+                    ppp_config_.low_dynamics_mode,
+                    ppp_config_.use_clas_osr_filter);
+            // Doppler velocity: the SPP solves the receiver velocity from the
+            // Doppler range rates every epoch. Without it the velocity is
+            // observed only through the position changes of the carrier-phase
+            // rows, and a few epochs of rejected or code-only updates leave a
+            // velocity error that the dynamics integrate into the position.
+            if (!skip_update_without_seed && seed_ptr != nullptr &&
+                filter_state_.accel_index >= 0 &&
+                ppp_config_.pva_doppler_velocity_update &&
+                seed_solution.has_velocity) {
+                const bool applied = applyVelocityMeasurement(
+                    filter_state_,
+                    seed_solution.velocity_ecef,
+                    seed_solution.velocity_covariance,
+                    0.0);
+                if (!applied && pppDebugEnabled()) {
+                    std::cerr << "[PPP] Doppler velocity update skipped at tow="
+                              << obs.time.tow << "\n";
+                }
+            }
+            bool updated =
+                !skip_update_without_seed && updateFilter(obs, nav, dt);
+            if (!updated && !skip_update_without_seed &&
+                ppp_config_.enable_ambiguity_resolution) {
                 bool had_fixed_ambiguities = false;
                 for (auto& [satellite, ambiguity] : ambiguity_states_) {
                     if (!ambiguity.is_fixed) {
@@ -853,122 +886,6 @@ double calculateMelbourneWubbena(double l1_phase,
     }
     return (l1_phase - l2_phase) * constants::SPEED_OF_LIGHT / (f1 - f2) -
            (f1 * p1_range + f2 * p2_range) / (f1 + f2);
-}
-
-double calculateGeometryFree(double l1_phase, double l2_phase) {
-    return l1_phase - l2_phase;
-}
-
-bool interpolatePreciseOrbit(const std::vector<PreciseOrbitClock>& orbit_data,
-                             const GNSSTime& time,
-                             Vector3d& position,
-                             Vector3d& velocity) {
-    if (orbit_data.empty()) {
-        return false;
-    }
-    auto upper = std::lower_bound(
-        orbit_data.begin(), orbit_data.end(), time,
-        [](const PreciseOrbitClock& lhs, const GNSSTime& rhs) {
-            return lhs.time < rhs;
-        });
-    if (upper == orbit_data.begin()) {
-        if (!upper->position_valid) {
-            return false;
-        }
-        position = upper->position;
-        velocity = upper->velocity;
-        return true;
-    }
-    if (upper == orbit_data.end()) {
-        const auto& last = orbit_data.back();
-        if (!last.position_valid) {
-            return false;
-        }
-        position = last.position;
-        velocity = last.velocity;
-        return true;
-    }
-
-    const auto& before = *(upper - 1);
-    const auto& after = *upper;
-    if (!before.position_valid || !after.position_valid) {
-        return false;
-    }
-    const double dt = after.time - before.time;
-    if (std::abs(dt) < 1e-9) {
-        position = before.position;
-        velocity = before.velocity;
-        return true;
-    }
-    const double alpha = (time - before.time) / dt;
-    position = before.position + alpha * (after.position - before.position);
-    velocity = (after.position - before.position) / dt;
-    return true;
-}
-
-bool interpolatePreciseClock(const std::vector<PreciseOrbitClock>& clock_data,
-                             const GNSSTime& time,
-                             double& clock_bias,
-                             double& clock_drift) {
-    if (clock_data.empty()) {
-        return false;
-    }
-    auto upper = std::lower_bound(
-        clock_data.begin(), clock_data.end(), time,
-        [](const PreciseOrbitClock& lhs, const GNSSTime& rhs) {
-            return lhs.time < rhs;
-        });
-    if (upper == clock_data.begin()) {
-        if (!upper->clock_valid) {
-            return false;
-        }
-        clock_bias = upper->clock_bias;
-        clock_drift = upper->clock_drift;
-        return true;
-    }
-    if (upper == clock_data.end()) {
-        const auto& last = clock_data.back();
-        if (!last.clock_valid) {
-            return false;
-        }
-        clock_bias = last.clock_bias;
-        clock_drift = last.clock_drift;
-        return true;
-    }
-
-    const auto& before = *(upper - 1);
-    const auto& after = *upper;
-    if (!before.clock_valid || !after.clock_valid) {
-        return false;
-    }
-    const double dt = after.time - before.time;
-    if (std::abs(dt) < 1e-9) {
-        clock_bias = before.clock_bias;
-        clock_drift = before.clock_drift;
-        return true;
-    }
-    const double alpha = (time - before.time) / dt;
-    clock_bias = before.clock_bias + alpha * (after.clock_bias - before.clock_bias);
-    clock_drift = (after.clock_bias - before.clock_bias) / dt;
-    return true;
-}
-
-Vector3d calculateSatelliteAntennaPCO(const SatelliteId& satellite,
-                                      const Vector3d& satellite_pos,
-                                      const Vector3d& sun_pos) {
-    (void)satellite;
-    (void)satellite_pos;
-    (void)sun_pos;
-    return Vector3d::Zero();
-}
-
-Vector3d calculateReceiverAntennaPCO(const Vector3d& receiver_pos,
-                                     const Vector3d& satellite_pos,
-                                     const std::string& antenna_type) {
-    (void)receiver_pos;
-    (void)satellite_pos;
-    (void)antenna_type;
-    return Vector3d::Zero();
 }
 
 double calculatePhaseWindup(const Vector3d& receiver_pos,

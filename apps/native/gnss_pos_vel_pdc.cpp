@@ -27,10 +27,16 @@
 #include <stdexcept>
 #include <string>
 #include <tuple>
-#include <unistd.h>
 #include <vector>
 
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
+
 #include "observable_measurement_helpers.hpp"
+#include "observable_pd_common.hpp"
 #include "observable_upstream_preprocessing.hpp"
 #include "observable_robust_loss.hpp"
 #include "observable_seed_positions.hpp"
@@ -38,12 +44,19 @@
 
 namespace {
 
+using libgnss_apps::CarrierResidual;
+using libgnss_apps::NormalEquation;
+using libgnss_apps::PseudorangeFactor;
 using libgnss_apps::SeedPosition;
+using libgnss_apps::SolveResult;
+using libgnss_apps::TdcpFactor;
+using libgnss_apps::addWeightedRow;
 using libgnss_apps::clockGroup;
 using libgnss_apps::findSeedPosition;
 using libgnss_apps::groupDelayCorrectionMeters;
 using libgnss_apps::isHealthyForPositioning;
 using libgnss_apps::isPrimaryPdSignal;
+using libgnss_apps::jsonBool;
 using libgnss_apps::readSeedPositions;
 using libgnss_apps::robustHuberLoss;
 using libgnss_apps::robustHuberWeight;
@@ -57,6 +70,13 @@ constexpr double kDegreesToRadians = kPi / 180.0;
 constexpr double kRadiansToDegrees = 180.0 / kPi;
 constexpr std::size_t kClockGroups = 5;
 constexpr std::size_t kStateStride = 12;
+
+// Norm of a native solution vector, or NaN when any coefficient is
+// non-finite (e.g. a failed SPP epoch that never assigned a position).
+double finiteNormOrNaN(const libgnss::Vector3d& vector) {
+    return vector.allFinite() ? vector.norm()
+                              : std::numeric_limits<double>::quiet_NaN();
+}
 
 struct Options {
     std::string obs_path;
@@ -120,65 +140,7 @@ struct DopplerFactor {
     libgnss::Vector3d los = libgnss::Vector3d::Zero();
 };
 
-struct PseudorangeFactor {
-    std::size_t epoch_index = 0;
-    libgnss::GNSSTime time;
-    libgnss::SatelliteId satellite;
-    libgnss::SignalType signal = libgnss::SignalType::GPS_L1CA;
-    std::size_t clock_group = 0;
-    double snr_dbhz = 0.0;
-    double elevation_rad = 0.0;
-    double sigma_m = 1.0;
-    double residual_m = 0.0;
-    double corrected_pseudorange_m = 0.0;
-    double modeled_range_m = 0.0;
-    double ionosphere_delay_m = 0.0;
-    double troposphere_delay_m = 0.0;
-    double satellite_clock_m = 0.0;
-    double group_delay_m = 0.0;
-    libgnss::Vector3d los = libgnss::Vector3d::Zero();
-};
-
 using ObservationKey = upstream::ObservationKey;
-
-struct CarrierResidual {
-    std::size_t epoch_index = 0;
-    libgnss::GNSSTime time;
-    libgnss::SatelliteId satellite;
-    libgnss::SignalType signal = libgnss::SignalType::GPS_L1CA;
-    double snr_dbhz = 0.0;
-    double elevation_rad = 0.0;
-    double residual_m = 0.0;
-    double corrected_carrier_m = 0.0;
-    double modeled_range_m = 0.0;
-    double raw_carrier_cycles = 0.0;
-    double wavelength_m = 0.0;
-    double ionosphere_delay_m = 0.0;
-    double troposphere_delay_m = 0.0;
-    double satellite_clock_m = 0.0;
-    std::uint8_t lli = 0;
-    bool loss_of_lock = false;
-    libgnss::Vector3d los = libgnss::Vector3d::Zero();
-};
-
-struct TdcpFactor {
-    std::size_t epoch_index = 0;
-    std::size_t previous_epoch_index = 0;
-    libgnss::GNSSTime time;
-    libgnss::SatelliteId satellite;
-    libgnss::SignalType signal = libgnss::SignalType::GPS_L1CA;
-    double snr_dbhz = 0.0;
-    double elevation_rad = 0.0;
-    double previous_elevation_rad = 0.0;
-    double sigma_m = 1.0;
-    double residual_m = 0.0;
-    double previous_carrier_residual_m = 0.0;
-    double current_carrier_residual_m = 0.0;
-    double previous_raw_carrier_cycles = 0.0;
-    double current_raw_carrier_cycles = 0.0;
-    double wavelength_m = 0.0;
-    libgnss::Vector3d los = libgnss::Vector3d::Zero();
-};
 
 struct Problem {
     std::vector<libgnss::ObservationData> epochs;
@@ -225,15 +187,6 @@ struct Problem {
     std::size_t upstream_pseudorange_global_groups = 0;
 };
 
-struct SolveResult {
-    Eigen::VectorXd state;
-    double initial_cost = 0.0;
-    double final_cost = 0.0;
-    double residual_rms_mps = 0.0;
-    int iterations = 0;
-    bool converged = false;
-};
-
 [[noreturn]] void usageError(const std::string& message, const char* argv0) {
     std::cerr << "Error: " << message << "\n\n"
               // Keep the original RINEX usage text byte-for-byte.  The raw
@@ -257,27 +210,11 @@ struct SolveResult {
 }
 
 int parseIntArg(const std::string& value, const std::string& name, const char* argv0) {
-    try {
-        std::size_t consumed = 0;
-        const int parsed = std::stoi(value, &consumed);
-        if (consumed == value.size()) {
-            return parsed;
-        }
-    } catch (const std::exception&) {
-    }
-    usageError("invalid integer for " + name + ": " + value, argv0);
+    return libgnss_apps::parseIntArg(value, name, argv0, usageError);
 }
 
 double parseDoubleArg(const std::string& value, const std::string& name, const char* argv0) {
-    try {
-        std::size_t consumed = 0;
-        const double parsed = std::stod(value, &consumed);
-        if (consumed == value.size() && std::isfinite(parsed)) {
-            return parsed;
-        }
-    } catch (const std::exception&) {
-    }
-    usageError("invalid number for " + name + ": " + value, argv0);
+    return libgnss_apps::parseDoubleArg(value, name, argv0, usageError);
 }
 
 Options parseArguments(int argc, char* argv[]) {
@@ -422,14 +359,6 @@ Options parseArguments(int argc, char* argv[]) {
         usageError("sigma, threshold, and tolerance values must be positive", argv[0]);
     }
     return options;
-}
-
-void writeCsvDouble(std::ostream& output, double value) {
-    if (std::isfinite(value)) {
-        output << value;
-    } else {
-        output << "NaN";
-    }
 }
 
 int positionColumn(std::size_t epoch_index, int component) {
@@ -611,30 +540,6 @@ double computeCost(const Problem& problem,
         cost += robustHuberLoss(error, options.huber_threshold_sigma);
     }
     return cost;
-}
-
-struct NormalEquation {
-    Eigen::SparseMatrix<double> hessian;
-    Eigen::VectorXd rhs;
-};
-
-void addWeightedRow(std::vector<Eigen::Triplet<double>>& triplets,
-                    Eigen::VectorXd& rhs,
-                    const std::vector<int>& columns,
-                    const std::vector<double>& coefficients,
-                    double residual,
-                    double sigma,
-                    double robust_weight) {
-    const double inv_variance = robust_weight / (sigma * sigma);
-    for (std::size_t a = 0; a < columns.size(); ++a) {
-        const double weighted_a = inv_variance * coefficients[a];
-        rhs(columns[a]) += weighted_a * residual;
-        for (std::size_t b = 0; b < columns.size(); ++b) {
-            triplets.emplace_back(columns[a],
-                                  columns[b],
-                                  weighted_a * coefficients[b]);
-        }
-    }
 }
 
 NormalEquation buildNormalEquation(const Problem& problem,
@@ -1470,7 +1375,8 @@ Problem buildProblem(const Options& options) {
                 native_spp.processEpoch(spp_epoch, nav_data);
             problem.native_spp_last_satellites = spp_solution.num_satellites;
             problem.native_spp_last_iterations = spp_solution.iterations;
-            problem.native_spp_last_position_norm_m = spp_solution.position_ecef.norm();
+            problem.native_spp_last_position_norm_m =
+                finiteNormOrNaN(spp_solution.position_ecef);
             problem.native_spp_last_status = static_cast<int>(spp_solution.status);
             problem.native_spp_last_gdop = spp_solution.gdop;
             problem.native_spp_last_residual_rms_m = spp_solution.residual_rms;
@@ -1491,7 +1397,8 @@ Problem buildProblem(const Options& options) {
                 spp_solution = native_spp.processEpoch(spp_epoch, nav_data);
                 problem.native_spp_last_satellites = spp_solution.num_satellites;
                 problem.native_spp_last_iterations = spp_solution.iterations;
-                problem.native_spp_last_position_norm_m = spp_solution.position_ecef.norm();
+                problem.native_spp_last_position_norm_m =
+                    finiteNormOrNaN(spp_solution.position_ecef);
                 problem.native_spp_last_status = static_cast<int>(spp_solution.status);
                 problem.native_spp_last_gdop = spp_solution.gdop;
                 problem.native_spp_last_residual_rms_m = spp_solution.residual_rms;
@@ -1525,7 +1432,7 @@ Problem buildProblem(const Options& options) {
                     problem.native_spp_first_failure_satellites =
                         spp_solution.num_satellites;
                     problem.native_spp_first_failure_position_norm_m =
-                        spp_solution.position_ecef.norm();
+                        finiteNormOrNaN(spp_solution.position_ecef);
                     problem.native_spp_first_failure_gdop = spp_solution.gdop;
                     problem.native_spp_first_failure_residual_rms_m =
                         spp_solution.residual_rms;
@@ -1924,8 +1831,13 @@ bool writeAtomicText(const std::string& path, const std::string& content) {
         std::filesystem::create_directories(destination.parent_path(), error);
         if (error) return false;
     }
+#ifdef _WIN32
+    const auto process_id = ::_getpid();
+#else
+    const auto process_id = ::getpid();
+#endif
     const std::string temporary =
-        path + ".tmp." + std::to_string(static_cast<long long>(::getpid()));
+        path + ".tmp." + std::to_string(static_cast<long long>(process_id));
     {
         std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
         if (!output.is_open()) return false;
@@ -2119,10 +2031,6 @@ bool writeGraphCsv(const std::string& path,
     return true;
 }
 
-std::string jsonBool(bool value) {
-    return value ? "true" : "false";
-}
-
 void writeJsonDoubleOrNull(std::ostream& output, double value) {
     if (std::isfinite(value)) {
         output << value;
@@ -2195,8 +2103,9 @@ bool writeSummaryJson(const std::string& path,
                << problem.native_spp_last_satellites << ",\n"
                << "  \"native_spp_last_iterations\": "
                << problem.native_spp_last_iterations << ",\n"
-               << "  \"native_spp_last_position_norm_m\": "
-               << problem.native_spp_last_position_norm_m << ",\n"
+               << "  \"native_spp_last_position_norm_m\": ";
+        writeJsonDoubleOrNull(output, problem.native_spp_last_position_norm_m);
+        output << ",\n"
                << "  \"native_spp_last_status\": "
                << problem.native_spp_last_status << ",\n"
                << "  \"native_spp_last_gdop\": " << problem.native_spp_last_gdop << ",\n"
@@ -2212,8 +2121,10 @@ bool writeSummaryJson(const std::string& path,
                << problem.native_spp_first_failure_status << ",\n"
                << "  \"native_spp_first_failure_satellites\": "
                << problem.native_spp_first_failure_satellites << ",\n"
-               << "  \"native_spp_first_failure_position_norm_m\": "
-               << problem.native_spp_first_failure_position_norm_m << ",\n"
+               << "  \"native_spp_first_failure_position_norm_m\": ";
+        writeJsonDoubleOrNull(output,
+                              problem.native_spp_first_failure_position_norm_m);
+        output << ",\n"
                << "  \"native_spp_first_failure_gdop\": "
                << problem.native_spp_first_failure_gdop << ",\n"
                << "  \"native_spp_first_failure_residual_rms_m\": "

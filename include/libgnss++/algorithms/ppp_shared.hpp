@@ -200,6 +200,24 @@ struct PPPConfig {
     bool kinematic_mode = false;
     bool low_dynamics_mode = false;
     bool use_dynamics_model = false;
+    // Position / velocity / acceleration motion model for the non-CLAS
+    // kinematic filter (RTKLIB ppp-kine with pos1-dynamics=on, udpos_ppp()):
+    // acceleration random walk in local ENU, no process noise on position or
+    // velocity, velocity seeded from the SPP Doppler solution, and position /
+    // velocity / acceleration re-seeded from SPP when the mean position
+    // variance exceeds initial_position_variance. Requires use_dynamics_model;
+    // the CLAS filter has its own MRTKLIB dynamics and ignores this flag.
+    bool use_pva_dynamics = false;
+    double process_noise_acceleration_horizontal = 1.0;  // m/s^2/sqrt(s)
+    double process_noise_acceleration_vertical = 0.1;    // m/s^2/sqrt(s)
+    double initial_acceleration_variance = 100.0;        // (m/s^2)^2
+    // PVA only: update the velocity states with the SPP Doppler velocity
+    // (and its covariance) every epoch before the GNSS measurement update.
+    bool pva_doppler_velocity_update = true;
+    // PVA only: re-seed position / velocity / acceleration from SPP when the
+    // predicted position disagrees with the SPP seed beyond this normalized
+    // squared distance (chi-square, 3 degrees of freedom; <= 0 disables).
+    double pva_seed_disagreement_gate = 16.27;
     bool reset_clock_to_spp_each_epoch = true;
     bool reset_kinematic_position_to_spp_each_epoch = true;
     bool emit_solution_epoch_time = false;
@@ -301,14 +319,11 @@ struct PPPConfig {
 
     bool apply_ocean_loading = false;
     bool apply_solid_earth_tides = true;
-    // Apply satellite antenna PCO (read from ANTEX) by shifting the
-    // SP3-interpolated satellite position to the ionosphere-free
-    // combination phase center. Default off because IGS final products
-    // since the 2017 convention switch publish SP3 / CLK already at the
-    // IF antenna phase center, so the additional shift double-applies
-    // the offset on those products. Enable for SP3 sources known to
-    // report centre of mass (some legacy AC products / GLONASS-only
-    // analyses). The ANTEX loader is unconditional when --antex is set.
+    // Satellite antenna PCO (read from ANTEX; the loader is unconditional
+    // when --antex is set) is always applied to precise (SP3) orbits, which
+    // refer to the satellite centre of mass. This flag additionally forces
+    // it for broadcast / SSR-corrected broadcast orbits, which normally
+    // already refer to the antenna phase centre.
     bool apply_satellite_antenna_pco = false;
     // Hard-blend the static-mode position state toward the SPP-derived
     // anchor each epoch (50 % post-convergence with precise products).
@@ -401,7 +416,6 @@ struct PPPConfig {
     double outlier_threshold = 4.0;
     bool enable_cycle_slip_detection = true;
     double cycle_slip_threshold = 0.05;
-    int filter_iterations = 8;
 };
 
 struct PPPState {

@@ -633,6 +633,114 @@ complete matrix and append schema, metric, and exact-command artifact links to
 the GitHub job summary.  Default CMake builds retain
 `MADOCALIB_PARITY_LINK=OFF`.
 
+#### Kinematic ionosphere-free: one measurement update per epoch (2026-09-30)
+
+MADOCALIB `pppos()` (`ppp.c:1359-1381`) restarts every residual-screening
+pass from `rtk->x`/`rtk->P` and commits exactly one measurement update per
+epoch.  Native `--kinematic` MADOCA without per-frequency AR (the bridge's
+default `ppp` profile: `sample.conf`, `ppp-kine`, `dual-freq`) still re-applied
+the same epoch's update up to eight times at the SPP-seeded prior geometry and
+settled metres off.  It now commits one update, like the per-frequency path
+and the other kinematic PPP lanes.  Static, `--low-dynamics` and per-frequency
+AR outputs are byte-identical, so the release baseline (native `ppp` is
+`--static`) is unchanged.  Native kinematic IF vs the bridge `ppp` profile
+(1 h / 6 h, `delta RMS 3D`): MIZU 5.326 -> 0.505 m / 8.032 -> 0.383 m,
+ALIC 2.268 -> 0.392 m / 4.971 -> 0.225 m.
+
+#### Static ionosphere-free: no SPP anchor blend, one update per epoch (2026-10-01)
+
+The native release-matrix `ppp` profile (`--static`, L6E, ionosphere-free)
+was the last path that re-applied an epoch's measurement update up to eight
+times at the prior geometry.  After every pass, again after the update, and
+in prediction it also blended 26-30% of the first SPP position back into the
+position state and reset the position covariance to a fixed 2-3 m isotropic
+sigma with no cross-covariance.  That blend held the solution near the SPP seed and hid the
+drift of the stale-geometry passes: with the blend switched off
+(`GNSS_PPP_DISABLE_MADOCA_STATIC_ANCHOR=1`) the eight passes reached
+245 m (MIZU) / 338 m (ALIC) 3D RMS over the first hour.  MADOCALIB has no
+such blend: `udpos_ppp()` initializes a static position once from the SPP
+solution and afterwards only adds its process noise (`stats-prnpos`, 0 in
+`sample.conf`), and `pppos()` commits one update per epoch.  The blend and its
+opt-out are removed, and the profile commits one update per epoch like every
+other PPP path.  The opt-in `PPPConfig::apply_static_anchor_blend` path is
+unchanged; per-frequency AR (`pppar`, `pppar-ion`) outputs are byte-identical.
+
+Release matrix, native `ppp` vs the bridge `ppp` profile (`delta RMS 3D` /
+`delta max 3D`, Windows MSVC build):
+
+| case | before | after |
+|---|---:|---:|
+| `mizu.ppp.1h` | 1.631 / 4.071 m | 0.646 / 3.931 m |
+| `mizu.ppp.6h` | 1.274 / 4.071 m | 0.266 / 3.931 m |
+| `alic.ppp.1h` | 0.958 / 3.387 m | 0.526 / 2.086 m |
+| `alic.ppp.6h` | 0.706 / 3.387 m | 0.217 / 2.086 m |
+
+From 30 min on, the native static solution is 0.17 / 0.08 m (MIZU / ALIC,
+1 h) RMS from the bridge, against 1.28 / 0.66 m before.  Against the mean of
+the bridge `pppar` 6 h fixed solutions (the matrix's MIZU coordinate is
+4.4 m from it; ALIC's agrees within 0.3 m), 3D RMS over the 1 h / 6 h runs
+is 1.51 -> 0.58 m / 1.23 -> 0.24 m at MIZU and 1.02 -> 0.51 m /
+0.74 -> 0.21 m at ALIC; the bridge (kinematic) is at 0.37 / 0.15 m and
+0.42 / 0.18 m.  The remaining early-epoch difference is the start-up:
+a static filter seeded from SPP against a kinematic bridge that re-seeds
+every epoch.
+
+#### Per-frequency AR: MADOCALIB innovation gate and post-fit screening (2026-10-18)
+
+Over a full day, native `pppar` / `pppar-ion` lost Fix in the local afternoon
+and evening at low latitudes, and the lost epochs were not a ratio or
+partial-AR question: the float solution itself degraded.  The seed SPP is
+L1-only with Klobuchar, so under a large ionosphere its receiver clock is
+10-27 m off.  The native phase prefit gate then sat at 10 m (L2 and extra
+frequencies) or 20 m (kinematic L1) after convergence and rejected most L2
+rows, while MADOCALIB uses `pos2-rejionno` = 50 m (`sample_pppar.conf`,
+`sample_pppar_iono.conf`).  MADOCALIB also follows each update with
+`ppp_res()` (`ppp.c`), which excludes the satellite of the largest post-fit
+residual beyond four sigmas and redoes the epoch; native screening
+(`usePostfitResidualScreening`) was off for coherent MADOCA.
+
+With L6E loaded on the per-frequency path (uncombined, ionosphere estimated,
+not CLAS OSR), the L1, L2 and extra-frequency phase gates now use
+`max(native floor, 50 m)` and kinematic post-fit screening is on (the w-test
+of [Broadcast kinematic PPP](broadcast_kinematic_ppp.md)).  Both are needed
+together.  Each was tried alone first under its own frozen acceptance plan,
+and both were rejected:
+
+- 50 m alone: +42 % Fix but +89 % truth-labeled wrong Fix.
+- The MADOCALIB post-fit check alone: wrong Fix only −13.9 %, against a
+  −25 % requirement.
+
+The static ionosphere-free `ppp` profile, CLAS, HAS, RTCM SSR, precise-product
+and broadcast-only PPP are unchanged.  The IGS-final MIZU static `.pos` and
+the broadcast-only PPC Tokyo run1 `.pos` are byte-identical before and after.
+
+Held-out check, frozen before the measurement: 23 IGS stations not used in
+development, chosen mechanically and all inside the MADOCA service area
+(BKG 2025/091 30 s MO, NGL `llh.out` latitude −45° to +50° and longitude
+90° E to 180° E, an NGL IGS20 `txyz2` row for 25APR01).  Each ran for 24 h
+of 2025-04-01 at 30 s.  Truth is the NGL IGS20 daily solution.  A wrong Fix
+is a Fix more than 0.20 m (3D) from truth.  A station whose median pre-change
+6-24 h float error exceeded 0.15 m was excluded from the wrong-Fix count as
+truth-inconsistent.  Runs that failed before and after were dropped.
+
+| profile | usable stations | Fix before -> after | wrong Fix before -> after | stations with wrong Fix +20 or more |
+|---|---:|---:|---:|---:|
+| `pppar` | 23 | 34,829 -> 52,936 (+52 %) | 695 -> 162 (−77 %) | 0 |
+| `pppar-ion` | 13 | 24,455 -> 33,645 (+38 %) | 423 -> 125 (−70 %) | 1 |
+
+Against the MADOCALIB bridge (the M5 matrix, oracle outputs of the
+2026-10-12 CI artifact replayed against the current native build), no 1 h /
+6 h case gains a wrong Fix.  Missed fixes drop from 24 to 0 on `mizu.pppar.6h`
+and from 30 to 6 on `mizu.pppar-ion.6h`, and `delta RMS 3D` falls or holds in
+every case: for example `mizu.pppar.6h` 0.0296 -> 0.0185 m and
+`alic.pppar.6h` 0.0483 -> 0.0438 m.  The 1 h / 6 h entries of
+`docs/madoca_release_baseline.json` are regenerated from that replay.  Native
+runtime ceilings keep the larger of the previous CI-measured ceiling and the
+new value.
+
+The 24 h entries are not regenerated here.  They run only on
+`workflow_dispatch` and already predate several earlier native changes.
+
 ### M6 -- Complete the migration
 
 - Promote native behavior only after M2--M5 pass with an explicit opt-out for

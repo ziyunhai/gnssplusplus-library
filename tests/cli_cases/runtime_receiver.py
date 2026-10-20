@@ -36,6 +36,46 @@ class RuntimeReceiverCases:
                 if line and not line.startswith("%")
             ]
             self.assertGreater(len(solution_lines), 0)
+    def test_replay_base_rtcm_resolves_the_stream_week(self) -> None:
+        # GPS MSM carries only a time of week; gnss replay must date the base epochs from the stream
+        # reference (nav RINEX seed, else the in-stream 1019), not leave them in week 0.
+        fixture = ROOT_DIR / "tests" / "fixtures" / "realtime_stress"
+        with tempfile.TemporaryDirectory(prefix="gnss_replay_rtcm_week_") as temp_dir:
+            temp_root = Path(temp_dir)
+            rover_obs = temp_root / "rover.obs"
+            base_nav = temp_root / "base.nav"
+            for src, flag, out in (
+                (fixture / "rover.rtcm", "--obs-out", rover_obs),
+                (fixture / "base.rtcm", "--nav-out", base_nav),
+            ):
+                converted = self.run_gnss(
+                    "convert", "--format", "rtcm", "--input", str(src),
+                    flag, str(out), "--gps-week", "2324", "--quiet",
+                )
+                self.assertEqual(converted.returncode, 0, msg=converted.stderr)
+
+            for label, extra in (
+                ("stream-ephemeris seed", []),
+                ("nav-rinex seed", ["--nav-rinex", str(base_nav)]),
+            ):
+                output_path = temp_root / f"replay_{len(extra)}.pos"
+                result = self.run_gnss(
+                    "replay",
+                    "--rover-rinex", str(rover_obs),
+                    "--base-rtcm", str(fixture / "base.rtcm"),
+                    *extra,
+                    "--out", str(output_path),
+                    "--quiet",
+                )
+                self.assertEqual(result.returncode, 0, msg=f"{label}: {result.stderr}")
+                records = [
+                    line.split()
+                    for line in output_path.read_text(encoding="ascii").splitlines()
+                    if line and not line.startswith("%")
+                ]
+                self.assertGreaterEqual(len(records), 30, msg=label)
+                self.assertEqual({row[0] for row in records}, {"2324"}, msg=label)
+
     def test_replay_supports_moving_base_mode(self) -> None:
         with tempfile.TemporaryDirectory(prefix="gnss_replay_moving_base_") as temp_dir:
             temp_root = Path(temp_dir)
@@ -67,6 +107,7 @@ class RuntimeReceiverCases:
         self.assertIn("Usage:", result.stdout)
         self.assertIn("--rover-rtcm", result.stdout)
         self.assertIn("--rover-ubx", result.stdout)
+        self.assertIn("--ubx-nav", result.stdout)
         self.assertIn("--base-hold-seconds", result.stdout)
         self.assertIn("--mode <kinematic|moving-base>", result.stdout)
         self.assertIn("--preset <survey|low-cost|moving-base>", result.stdout)
@@ -79,6 +120,272 @@ class RuntimeReceiverCases:
         self.assertIn("--min-full-ratio-for-subset-ar", result.stdout)
         self.assertIn("--max-pos-jump-rate", result.stdout)
         self.assertIn("--max-float-prefit-rms", result.stdout)
+    def test_live_ubx_nav_requires_a_ubx_rover(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="gnss_live_ubx_nav_arg_") as temp_dir:
+            temp_root = Path(temp_dir)
+            result = self.run_gnss(
+                "live",
+                "--rover-rtcm",
+                str(temp_root / "rover.rtcm3"),
+                "--base-rtcm",
+                str(temp_root / "base.rtcm3"),
+                "--ubx-nav",
+                "--quiet",
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("--ubx-nav requires --rover-ubx", result.stderr)
+    def test_live_ubx_nav_merges_sfrbx_ephemerides_only_when_enabled(self) -> None:
+        # Real X20 frames (GPS G10, Galileo E04, BeiDou C27) after a RAWX epoch that supplies the
+        # GPST reference; the base is the recorded RTCM fixture, which is not time-aligned with the
+        # rover, so no solution is written: the summary counters are what is checked.
+        fixture = ROOT_DIR / "tests" / "fixtures" / "realtime_stress" / "base.rtcm"
+        with tempfile.TemporaryDirectory(prefix="gnss_live_ubx_nav_") as temp_dir:
+            temp_root = Path(temp_dir)
+            rover_path = temp_root / "rover.ubx"
+            # The excerpt is sent twice: accept-then-confirm (D3) merges a record at once and a second
+            # transmission of the same record confirms it, so a single copy would be counted as unconfirmed.
+            rover_path.write_bytes(
+                build_rawx_message(week=2374, tow=244800.0)
+                + build_x20_sfrbx_excerpt()
+                + build_rawx_message(week=2374, tow=244801.0)
+                + build_x20_sfrbx_excerpt()
+                + build_rawx_message(week=2374, tow=244802.0)
+            )
+            common = [
+                "live",
+                "--rover-ubx",
+                str(rover_path),
+                "--base-rtcm",
+                str(fixture),
+                "--out",
+                str(temp_root / "live.pos"),
+                "--quiet",
+            ]
+            plain = self.run_gnss(*common)
+            self.assertIn("rover_source=ubx", plain.stdout)
+            self.assertNotIn("ubx_nav_ephemerides", plain.stdout)
+
+            enabled = self.run_gnss(*common, "--ubx-nav")
+            self.assertIn("rover_source=ubx", enabled.stdout)
+            self.assertIn(
+                "ubx_nav_ephemerides=3 ubx_nav_klobuchar=0 ubx_nav_unhealthy_skipped=0 "
+                "ubx_nav_unconfirmed=0 ubx_nav_conflicts=0 ubx_nav_retracted=0 ubx_nav_held_new_issue=0",
+                enabled.stdout,
+            )
+
+            # One transmission only (D3): the three records are merged at once and, with no second copy,
+            # stay unconfirmed. (Under confirm-twice, D2, none of them reached the database.)
+            single_path = temp_root / "rover_single.ubx"
+            single_path.write_bytes(
+                build_rawx_message(week=2374, tow=244800.0)
+                + build_x20_sfrbx_excerpt()
+                + build_rawx_message(week=2374, tow=244801.0)
+            )
+            single = self.run_gnss(*common[:2], str(single_path), *common[3:], "--ubx-nav")
+            self.assertIn(
+                "ubx_nav_ephemerides=3 ubx_nav_klobuchar=0 ubx_nav_unhealthy_skipped=0 "
+                "ubx_nav_unconfirmed=3 ubx_nav_conflicts=0 ubx_nav_retracted=0 ubx_nav_held_new_issue=0",
+                single.stdout,
+            )
+
+    def test_live_ubx_nav_takes_a_merged_record_back_when_a_second_copy_differs(self) -> None:
+        # Two complete GPS sets of G12 that differ in the health field (the same IODE, toe and toc, so the
+        # decoder itself would call the second a repeat). Accept-then-confirm (D3, which replaced the
+        # confirm-twice expectations of this test): the first copy is merged at once; a differing second
+        # copy removes it (ubx_nav_retracted) and the satellite then needs two equal copies from different
+        # transmissions before anything is merged for it again.
+        fixture = ROOT_DIR / "tests" / "fixtures" / "realtime_stress" / "base.rtcm"
+        with tempfile.TemporaryDirectory(prefix="gnss_live_ubx_nav_conflict_") as temp_dir:
+            temp_root = Path(temp_dir)
+
+            def run(healths):
+                rover_path = temp_root / ("rover_" + "_".join(str(h) for h in healths) + ".ubx")
+                rover_path.write_bytes(
+                    build_rawx_message()
+                    + b"".join(
+                        build_gps_lnav_sfrbx_message(n, sv_id=12, health=h) for h in healths for n in (1, 2, 3)
+                    )
+                    + build_rawx_message(tow=345601.125)
+                )
+                return self.run_gnss(
+                    "live",
+                    "--rover-ubx",
+                    str(rover_path),
+                    "--base-rtcm",
+                    str(fixture),
+                    "--out",
+                    str(temp_root / "live.pos"),
+                    "--ubx-nav",
+                    "--quiet",
+                )
+
+            # healthy, unhealthy: merged, then retracted; the unhealthy copy is pending (unconfirmed).
+            differing = run((0, 63))
+            self.assertIn(
+                "ubx_nav_ephemerides=1 ubx_nav_klobuchar=0 ubx_nav_unhealthy_skipped=0 "
+                "ubx_nav_unconfirmed=1 ubx_nav_conflicts=1 ubx_nav_retracted=1 ubx_nav_held_new_issue=0",
+                differing.stdout,
+            )
+            # healthy, unhealthy, unhealthy: the repeat confirms the unhealthy record, which the health
+            # rule skips; the satellite ends without a record.
+            confirmed = run((0, 63, 63))
+            self.assertIn(
+                "ubx_nav_ephemerides=1 ubx_nav_klobuchar=0 ubx_nav_unhealthy_skipped=1 "
+                "ubx_nav_unconfirmed=0 ubx_nav_conflicts=1 ubx_nav_retracted=1 ubx_nav_held_new_issue=0",
+                confirmed.stdout,
+            )
+            # healthy, unhealthy, healthy: the next good copy confirms the first record, which is merged
+            # again (counted twice in ubx_nav_ephemerides); the differing copy was never confirmed.
+            recovered = run((0, 63, 0))
+            self.assertIn(
+                "ubx_nav_ephemerides=2 ubx_nav_klobuchar=0 ubx_nav_unhealthy_skipped=0 "
+                "ubx_nav_unconfirmed=1 ubx_nav_conflicts=1 ubx_nav_retracted=1 ubx_nav_held_new_issue=0",
+                recovered.stdout,
+            )
+    def test_live_ubx_nav_holds_a_new_issue_while_the_satellite_holds_a_valid_record(self) -> None:
+        # D4 rule A: G12 issue 1 (IODE 77, toe 345600) is merged at once. A second issue (IODE 78, toe two
+        # hours later) arrives while issue 1 is held and valid, so it waits for a second transmission
+        # (ubx_nav_held_new_issue); rule B: the second issue's confirmation removes an unconfirmed issue 1.
+        fixture = ROOT_DIR / "tests" / "fixtures" / "realtime_stress" / "base.rtcm"
+        with tempfile.TemporaryDirectory(prefix="gnss_live_ubx_nav_held_") as temp_dir:
+            temp_root = Path(temp_dir)
+
+            def run(name, issues):
+                rover_path = temp_root / f"rover_{name}.ubx"
+                rover_path.write_bytes(
+                    build_rawx_message()
+                    + b"".join(
+                        build_gps_lnav_sfrbx_message(n, sv_id=12, iode=iode, toe_offset_s=offset)
+                        for iode, offset in issues
+                        for n in (1, 2, 3)
+                    )
+                    + build_rawx_message(tow=345601.125)
+                )
+                return self.run_gnss(
+                    "live",
+                    "--rover-ubx",
+                    str(rover_path),
+                    "--base-rtcm",
+                    str(fixture),
+                    "--out",
+                    str(temp_root / f"live_{name}.pos"),
+                    "--ubx-nav",
+                    "--quiet",
+                )
+
+            issue1, issue2 = (77, 0), (78, 7200)
+            # Issue 1 twice (merged, confirmed), issue 2 once: held, never merged (a single, possibly
+            # corrupted copy of a new issue); it counts as unconfirmed.
+            held = run("held", [issue1, issue1, issue2])
+            self.assertIn(
+                "ubx_nav_ephemerides=1 ubx_nav_klobuchar=0 ubx_nav_unhealthy_skipped=0 "
+                "ubx_nav_unconfirmed=1 ubx_nav_conflicts=0 ubx_nav_retracted=0 ubx_nav_held_new_issue=1",
+                held.stdout,
+            )
+            # Issue 1 twice, issue 2 twice: issue 2 is merged by its second copy.
+            confirmed = run("confirmed", [issue1, issue1, issue2, issue2])
+            self.assertIn(
+                "ubx_nav_ephemerides=2 ubx_nav_klobuchar=0 ubx_nav_unhealthy_skipped=0 "
+                "ubx_nav_unconfirmed=0 ubx_nav_conflicts=0 ubx_nav_retracted=0 ubx_nav_held_new_issue=1",
+                confirmed.stdout,
+            )
+            # Issue 1 once (unconfirmed), issue 2 twice: issue 2 is held, then merged and confirmed, and
+            # the unconfirmed issue 1 is removed (counted in ubx_nav_retracted).
+            cleaned = run("cleaned", [issue1, issue2, issue2])
+            self.assertIn(
+                "ubx_nav_ephemerides=2 ubx_nav_klobuchar=0 ubx_nav_unhealthy_skipped=0 "
+                "ubx_nav_unconfirmed=0 ubx_nav_conflicts=0 ubx_nav_retracted=1 ubx_nav_held_new_issue=1",
+                cleaned.stdout,
+            )
+
+    def test_live_ubx_nav_dates_a_base_without_ephemerides_from_the_rover_time(self) -> None:
+        # The recorded base stream with its ephemeris messages removed has no GPST reference, so its
+        # TOW-only epochs are dated from the host clock. With --ubx-nav the rover's first RAWX epoch
+        # is that reference and the epochs align; without it none do (unchanged behaviour).
+        fixture = ROOT_DIR / "tests" / "fixtures" / "realtime_stress"
+        stream = (fixture / "base.rtcm").read_bytes()
+        kept = bytearray()
+        index = 0
+        while index + 6 <= len(stream):
+            if stream[index] != 0xD3:
+                index += 1
+                continue
+            length = ((stream[index + 1] & 0x03) << 8) | stream[index + 2]
+            frame = stream[index : index + 6 + length]
+            message_type = (frame[3] << 4) | (frame[4] >> 4)
+            if message_type not in (1019, 1020, 1042, 1044, 1045, 1046):
+                kept += frame
+            index += 6 + length
+        first_epochs = [line.split() for line in (fixture / "base.idx").read_text().splitlines()[1:4]]
+        with tempfile.TemporaryDirectory(prefix="gnss_live_ubx_nav_ref_") as temp_dir:
+            temp_root = Path(temp_dir)
+            (temp_root / "base_no_eph.rtcm").write_bytes(bytes(kept))
+            (temp_root / "rover.ubx").write_bytes(
+                b"".join(build_rawx_message(week=int(week), tow=float(tow)) for tow, week, *_ in first_epochs)
+            )
+            common = [
+                "live",
+                "--rover-ubx",
+                str(temp_root / "rover.ubx"),
+                "--base-rtcm",
+                str(temp_root / "base_no_eph.rtcm"),
+                "--out",
+                str(temp_root / "live.pos"),
+                "--quiet",
+            ]
+            plain = self.run_gnss(*common)
+            self.assertIn("aligned_epochs=0", plain.stdout)
+            enabled = self.run_gnss(*common, "--ubx-nav")
+            self.assertRegex(enabled.stdout, r"aligned_epochs=[1-9]")
+            self.assertIn("ubx_nav_ephemerides=0", enabled.stdout)
+    def test_live_ubx_nav_skips_unhealthy_ephemerides(self) -> None:
+        # G12 is healthy, G13 broadcasts svh=63 (the receiver forwards default data sets like this).
+        # --ubx-nav must merge only G12 and count the other one; with a healthy G13 both are merged.
+        fixture = ROOT_DIR / "tests" / "fixtures" / "realtime_stress" / "base.rtcm"
+        with tempfile.TemporaryDirectory(prefix="gnss_live_ubx_nav_health_") as temp_dir:
+            temp_root = Path(temp_dir)
+
+            def run(g13_health: int):
+                rover_path = temp_root / f"rover_{g13_health}.ubx"
+                # Two transmissions of each set (accept-then-confirm); the health rule applies to a record
+                # before it is merged.
+                rover_path.write_bytes(
+                    build_rawx_message()
+                    + b"".join(
+                        build_gps_lnav_sfrbx_message(n, sv_id=12) for _ in range(2) for n in (1, 2, 3)
+                    )
+                    + b"".join(
+                        build_gps_lnav_sfrbx_message(n, sv_id=13, health=g13_health)
+                        for _ in range(2)
+                        for n in (1, 2, 3)
+                    )
+                    + build_rawx_message(tow=345601.125)
+                )
+                return self.run_gnss(
+                    "live",
+                    "--rover-ubx",
+                    str(rover_path),
+                    "--base-rtcm",
+                    str(fixture),
+                    "--out",
+                    str(temp_root / f"live_{g13_health}.pos"),
+                    "--ubx-nav",
+                    "--quiet",
+                )
+
+            unhealthy = run(63)
+            self.assertIn(
+                "ubx_nav_ephemerides=1 ubx_nav_klobuchar=0 ubx_nav_unhealthy_skipped=1 "
+                "ubx_nav_unconfirmed=0 ubx_nav_conflicts=0 ubx_nav_retracted=0 ubx_nav_held_new_issue=0",
+                unhealthy.stdout,
+            )
+            healthy = run(0)
+            self.assertIn(
+                "ubx_nav_ephemerides=2 ubx_nav_klobuchar=0 ubx_nav_unhealthy_skipped=0 "
+                "ubx_nav_unconfirmed=0 ubx_nav_conflicts=0 ubx_nav_retracted=0 ubx_nav_held_new_issue=0",
+                healthy.stdout,
+            )
+
     def test_replay_command_help_mentions_arfilter(self) -> None:
         result = self.run_gnss("replay", "--help")
         self.assertEqual(result.returncode, 0, msg=result.stderr)
@@ -93,6 +400,238 @@ class RuntimeReceiverCases:
         self.assertIn("--min-full-ratio-for-subset-ar", result.stdout)
         self.assertIn("--max-pos-jump-rate", result.stdout)
         self.assertIn("--max-float-prefit-rms", result.stdout)
+    def test_hold_fix_unchanged_set_flag_is_accepted_by_solve_live_and_replay(self) -> None:
+        # Opt-in hold-fix rule (RTKConfig::hold_fix_unchanged_set_only): a flag without an argument, listed next to
+        # the other hold options by every RTK tool and parsed by each of them. It is not part of any preset.
+        flag = "--hold-fix-unchanged-set"
+        for command, help_option in (("solve", "--help-advanced"), ("live", "--help"), ("replay", "--help")):
+            helped = self.run_gnss(command, help_option)
+            self.assertEqual(helped.returncode, 0, msg=helped.stderr)
+            self.assertIn(flag, helped.stdout, msg=command)
+        # gnss solve parses the flag and only then stops on the missing inputs (an unknown flag is reported first).
+        solve = self.run_gnss("solve", flag)
+        self.assertNotEqual(solve.returncode, 0)
+        self.assertIn("provide --data-dir or all of --rover, --base, and --nav", solve.stderr)
+        self.assertNotIn("unknown or incomplete argument", solve.stderr)
+
+        fixture = ROOT_DIR / "tests" / "fixtures" / "realtime_stress"
+        with tempfile.TemporaryDirectory(prefix="gnss_hold_fix_unchanged_set_") as temp_dir:
+            temp_root = Path(temp_dir)
+            live = self.run_gnss(
+                "live",
+                "--rover-rtcm",
+                str(fixture / "rover.rtcm"),
+                "--base-rtcm",
+                str(fixture / "base.rtcm"),
+                flag,
+                "--out",
+                str(temp_root / "live.pos"),
+                "--quiet",
+            )
+            self.assertEqual(live.returncode, 0, msg=live.stderr)
+            self.assertIn("written_solutions=", live.stdout)
+
+            rover_obs = temp_root / "rover.obs"
+            converted = self.run_gnss(
+                "convert", "--format", "rtcm", "--input", str(fixture / "rover.rtcm"),
+                "--obs-out", str(rover_obs), "--gps-week", "2324", "--quiet",
+            )
+            self.assertEqual(converted.returncode, 0, msg=converted.stderr)
+            replay = self.run_gnss(
+                "replay",
+                "--rover-rinex",
+                str(rover_obs),
+                "--base-rtcm",
+                str(fixture / "base.rtcm"),
+                flag,
+                "--out",
+                str(temp_root / "replay.pos"),
+                "--quiet",
+            )
+            self.assertEqual(replay.returncode, 0, msg=replay.stderr)
+            self.assertIn("written_solutions=", replay.stdout)
+    def test_hold_fix_min_matched_pairs_flag_is_accepted_by_solve_live_and_replay(self) -> None:
+        # Opt-in hold-fix rule (RTKConfig::hold_fix_min_matched_pairs): an integer option, listed next to the other
+        # hold options by every RTK tool and parsed by each of them. 4 is the legacy floor, so a smaller value is an
+        # argument error. It is not part of any preset.
+        flag = "--hold-fix-min-matched-pairs"
+        for command, help_option in (("solve", "--help-advanced"), ("live", "--help"), ("replay", "--help")):
+            helped = self.run_gnss(command, help_option)
+            self.assertEqual(helped.returncode, 0, msg=helped.stderr)
+            self.assertIn(flag, helped.stdout, msg=command)
+        # gnss solve parses the flag and only then stops on the missing inputs (an unknown flag is reported first).
+        solve = self.run_gnss("solve", flag, "12")
+        self.assertNotEqual(solve.returncode, 0)
+        self.assertIn("provide --data-dir or all of --rover, --base, and --nav", solve.stderr)
+        self.assertNotIn("unknown or incomplete argument", solve.stderr)
+        # Below the legacy floor of 4 every tool reports an argument error. The input checks run first, so each
+        # command gets inputs that are never opened.
+        for command, inputs in (
+            ("solve", ("--rover", "rover.obs", "--base", "base.obs", "--nav", "base.nav")),
+            ("live", ("--rover-rtcm", "rover.rtcm", "--base-rtcm", "base.rtcm")),
+            ("replay", ("--rover-rinex", "rover.obs", "--base-rtcm", "base.rtcm")),
+        ):
+            rejected = self.run_gnss(command, *inputs, flag, "3")
+            self.assertNotEqual(rejected.returncode, 0, msg=command)
+            self.assertIn("--hold-fix-min-matched-pairs must be >= 4", rejected.stderr, msg=command)
+            self.assertNotIn("unknown or incomplete argument", rejected.stderr, msg=command)
+
+        fixture = ROOT_DIR / "tests" / "fixtures" / "realtime_stress"
+        with tempfile.TemporaryDirectory(prefix="gnss_hold_fix_min_matched_pairs_") as temp_dir:
+            temp_root = Path(temp_dir)
+            live = self.run_gnss(
+                "live",
+                "--rover-rtcm",
+                str(fixture / "rover.rtcm"),
+                "--base-rtcm",
+                str(fixture / "base.rtcm"),
+                flag,
+                "12",
+                "--out",
+                str(temp_root / "live.pos"),
+                "--quiet",
+            )
+            self.assertEqual(live.returncode, 0, msg=live.stderr)
+            self.assertIn("written_solutions=", live.stdout)
+
+            rover_obs = temp_root / "rover.obs"
+            converted = self.run_gnss(
+                "convert", "--format", "rtcm", "--input", str(fixture / "rover.rtcm"),
+                "--obs-out", str(rover_obs), "--gps-week", "2324", "--quiet",
+            )
+            self.assertEqual(converted.returncode, 0, msg=converted.stderr)
+            replay = self.run_gnss(
+                "replay",
+                "--rover-rinex",
+                str(rover_obs),
+                "--base-rtcm",
+                str(fixture / "base.rtcm"),
+                flag,
+                "12",
+                "--out",
+                str(temp_root / "replay.pos"),
+                "--quiet",
+            )
+            self.assertEqual(replay.returncode, 0, msg=replay.stderr)
+            self.assertIn("written_solutions=", replay.stdout)
+    def test_min_fix_satellites_flag_is_accepted_by_solve_live_and_replay(self) -> None:
+        # Opt-in AR-fix rule (RTKConfig::min_fix_satellites): an integer option, listed next to the other hold options
+        # by every RTK tool and parsed by each of them. 0 means off, so a negative value is an argument error. It is
+        # not part of any preset.
+        flag = "--min-fix-satellites"
+        for command, help_option in (("solve", "--help-advanced"), ("live", "--help"), ("replay", "--help")):
+            helped = self.run_gnss(command, help_option)
+            self.assertEqual(helped.returncode, 0, msg=helped.stderr)
+            self.assertIn(flag, helped.stdout, msg=command)
+        # gnss solve parses the flag and only then stops on the missing inputs (an unknown flag is reported first).
+        solve = self.run_gnss("solve", flag, "6")
+        self.assertNotEqual(solve.returncode, 0)
+        self.assertIn("provide --data-dir or all of --rover, --base, and --nav", solve.stderr)
+        self.assertNotIn("unknown or incomplete argument", solve.stderr)
+        # A negative value is an argument error in every tool. The input checks run first, so each command gets
+        # inputs that are never opened.
+        for command, inputs in (
+            ("solve", ("--rover", "rover.obs", "--base", "base.obs", "--nav", "base.nav")),
+            ("live", ("--rover-rtcm", "rover.rtcm", "--base-rtcm", "base.rtcm")),
+            ("replay", ("--rover-rinex", "rover.obs", "--base-rtcm", "base.rtcm")),
+        ):
+            rejected = self.run_gnss(command, *inputs, flag, "-1")
+            self.assertNotEqual(rejected.returncode, 0, msg=command)
+            self.assertIn("--min-fix-satellites must be >= 0", rejected.stderr, msg=command)
+            self.assertNotIn("unknown or incomplete argument", rejected.stderr, msg=command)
+
+        fixture = ROOT_DIR / "tests" / "fixtures" / "realtime_stress"
+        with tempfile.TemporaryDirectory(prefix="gnss_min_fix_satellites_") as temp_dir:
+            temp_root = Path(temp_dir)
+            live = self.run_gnss(
+                "live",
+                "--rover-rtcm",
+                str(fixture / "rover.rtcm"),
+                "--base-rtcm",
+                str(fixture / "base.rtcm"),
+                flag,
+                "6",
+                "--out",
+                str(temp_root / "live.pos"),
+                "--quiet",
+            )
+            self.assertEqual(live.returncode, 0, msg=live.stderr)
+            self.assertIn("written_solutions=", live.stdout)
+
+            rover_obs = temp_root / "rover.obs"
+            converted = self.run_gnss(
+                "convert", "--format", "rtcm", "--input", str(fixture / "rover.rtcm"),
+                "--obs-out", str(rover_obs), "--gps-week", "2324", "--quiet",
+            )
+            self.assertEqual(converted.returncode, 0, msg=converted.stderr)
+            replay = self.run_gnss(
+                "replay",
+                "--rover-rinex",
+                str(rover_obs),
+                "--base-rtcm",
+                str(fixture / "base.rtcm"),
+                flag,
+                "6",
+                "--out",
+                str(temp_root / "replay.pos"),
+                "--quiet",
+            )
+            self.assertEqual(replay.returncode, 0, msg=replay.stderr)
+            self.assertIn("written_solutions=", replay.stdout)
+    def test_min_fix_satellites_reaches_the_solver_of_solve_live_and_replay(self) -> None:
+        # The recorded fixture sees seven GPS satellites, so six non-reference ones. In every tool a minimum of 6 keeps
+        # the fixes of the default run and a minimum of 7 refuses every ambiguity-resolution fix (the hold-fix
+        # fallback has no earlier fix to hold), so the flag must reach the solver and not only the parser.
+        flag = "--min-fix-satellites"
+        fixture = ROOT_DIR / "tests" / "fixtures" / "realtime_stress"
+        with tempfile.TemporaryDirectory(prefix="gnss_min_fix_satellites_effect_") as temp_dir:
+            temp_root = Path(temp_dir)
+            rover_obs = temp_root / "rover.obs"
+            base_obs = temp_root / "base.obs"
+            base_nav = temp_root / "base.nav"
+            for source, outputs in (
+                ("rover.rtcm", ("--obs-out", str(rover_obs))),
+                ("base.rtcm", ("--obs-out", str(base_obs), "--nav-out", str(base_nav))),
+            ):
+                converted = self.run_gnss(
+                    "convert", "--format", "rtcm", "--input", str(fixture / source), *outputs,
+                    "--gps-week", "2324", "--quiet",
+                )
+                self.assertEqual(converted.returncode, 0, msg=converted.stderr)
+
+            def fixed_solutions(summary: str) -> int:
+                return int(summary.split("fixed_solutions=")[1].split()[0])
+
+            def solve(minimum: str) -> int:
+                pos_path = temp_root / f"solve_{minimum}.pos"
+                result = self.run_gnss(
+                    "solve", "--rover", str(rover_obs), "--base", str(base_obs), "--nav", str(base_nav),
+                    "--base-ecef", "-3961905.0275", "3348993.7526", "3698211.7831",
+                    flag, minimum, "--out", str(pos_path), "--no-kml",
+                )
+                self.assertEqual(result.returncode, 0, msg=result.stderr)
+                return sum(int(record["status"]) == 4 for record in self.read_pos_records(pos_path))
+
+            def live(minimum: str) -> int:
+                result = self.run_gnss(
+                    "live", "--rover-rtcm", str(fixture / "rover.rtcm"), "--base-rtcm", str(fixture / "base.rtcm"),
+                    flag, minimum, "--out", str(temp_root / f"live_{minimum}.pos"), "--quiet",
+                )
+                self.assertEqual(result.returncode, 0, msg=result.stderr)
+                return fixed_solutions(result.stdout)
+
+            def replay(minimum: str) -> int:
+                result = self.run_gnss(
+                    "replay", "--rover-rinex", str(rover_obs), "--base-rtcm", str(fixture / "base.rtcm"),
+                    flag, minimum, "--out", str(temp_root / f"replay_{minimum}.pos"), "--quiet",
+                )
+                self.assertEqual(result.returncode, 0, msg=result.stderr)
+                return fixed_solutions(result.stdout)
+
+            for command, run in (("solve", solve), ("live", live), ("replay", replay)):
+                with self.subTest(command=command):
+                    self.assertGreater(run("6"), 0)
+                    self.assertEqual(run("7"), 0)
     def test_solve_accepts_low_cost_preset_and_hold_knobs(self) -> None:
         with tempfile.TemporaryDirectory(prefix="gnss_solve_preset_") as temp_dir:
             output_path = Path(temp_dir) / "solve_preset.pos"
@@ -351,8 +890,8 @@ class RuntimeReceiverCases:
                 "\n".join(
                     [
                         "[live_signoff]",
-                        f'use_existing_log = "{log_path}"',
-                        f'summary_json = "{summary_path}"',
+                        f'use_existing_log = "{log_path.as_posix()}"',
+                        f'summary_json = "{summary_path.as_posix()}"',
                         'require_termination = "completed"',
                         "require_written_solutions_min = 3",
                         "require_fixed_solutions_min = 1",
@@ -909,7 +1448,11 @@ class RuntimeReceiverCases:
                 self.assertTrue(status_payload["available"])
                 self.assertEqual(status_payload["state"], "running")
             finally:
-                process.terminate()
+                if os.name == "nt":
+                    subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                                   capture_output=True, check=False, creationflags=subprocess.CREATE_NO_WINDOW)
+                else:
+                    process.terminate()
                 try:
                     process.communicate(timeout=5)
                 except subprocess.TimeoutExpired:
@@ -1327,11 +1870,11 @@ class RuntimeReceiverCases:
                         "[moving_base_signoff]",
                         'solver = "replay"',
                         "use_existing_solution = true",
-                        f'out = "{solution_path}"',
-                        f'reference_csv = "{reference_csv}"',
-                        f'summary_json = "{summary_path}"',
-                        f'matched_csv = "{matched_csv}"',
-                        f'plot_png = "{plot_path}"',
+                        f'out = "{solution_path.as_posix()}"',
+                        f'reference_csv = "{reference_csv.as_posix()}"',
+                        f'summary_json = "{summary_path.as_posix()}"',
+                        f'matched_csv = "{matched_csv.as_posix()}"',
+                        f'plot_png = "{plot_path.as_posix()}"',
                         "solver_wall_time_s = 0.5",
                         "require_valid_epochs_min = 2",
                         "require_matched_epochs_min = 2",
@@ -1489,7 +2032,7 @@ class RuntimeReceiverCases:
                         'run_root = "runs"',
                         "[station.receiver]",
                         'rover_rtcm = "ntrip://field:super-secret@caster.example/MOUNT"',
-                        f'base_rtcm = "{temp_root / "base.rtcm3"}"',
+                        f'base_rtcm = "{(temp_root / "base.rtcm3").as_posix()}"',
                         "auto_restart = false",
                     ]
                 )
@@ -1539,7 +2082,8 @@ class RuntimeReceiverCases:
             self.assertEqual(launch["schema_version"], "station.v1")
             for name in ("run.json", "receiver.conf", "status.json", "live.log"):
                 self.assertTrue((run_dir / name).is_file(), name)
-            self.assertEqual(stat.S_IMODE((run_dir / "receiver.conf").stat().st_mode) & 0o077, 0)
+            if os.name != "nt":  # Windows chmod does not implement POSIX group/other permissions.
+                self.assertEqual(stat.S_IMODE((run_dir / "receiver.conf").stat().st_mode) & 0o077, 0)
 
             manifest = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["source_config_path"], str(config_path))
@@ -1577,6 +2121,20 @@ class RuntimeReceiverCases:
 
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("process identity does not match", result.stderr)
+
+    @unittest.skipUnless(os.name == "nt", "Windows process probe regression")
+    def test_receiver_process_probe_does_not_terminate_the_probed_process(self) -> None:
+        command = (
+            "import os,sys; "
+            f"sys.path[:0] = {[str(ROOT_DIR / 'apps/commands'), str(ROOT_DIR / 'apps/commands/receivers')]!r}; "
+            "import gnss_rcv; "
+            "assert gnss_rcv.process_is_running(os.getpid()); "
+            "assert not gnss_rcv.process_is_running(0); "
+            "print('probe survived')"
+        )
+        result = subprocess.run([sys.executable, "-c", command], capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("probe survived", result.stdout)
     def test_rcv_start_and_status_report_failed_background_run(self) -> None:
         with tempfile.TemporaryDirectory(prefix="gnss_rcv_start_test_") as temp_dir:
             temp_root = Path(temp_dir)
@@ -1748,6 +2306,10 @@ class RuntimeReceiverCases:
             self.assertIn('"config_path":', result.stdout)
             self.assertIn('"log_tail": [', result.stdout)
             self.assertIn("summary: messages=5 written_solutions=3", result.stdout)
+    def wait_for_background_receiver_exit(self, status_path: Path) -> None:
+        """Let a receiver launched in the background finish before the temp dir is removed."""
+        self.run_gnss("rcv", "status", "--status-out", str(status_path), "--wait-seconds", "5")
+
     def test_rcv_restart_without_existing_status_behaves_like_start(self) -> None:
         with tempfile.TemporaryDirectory(prefix="gnss_rcv_restart_test_") as temp_dir:
             temp_root = Path(temp_dir)
@@ -1782,6 +2344,7 @@ class RuntimeReceiverCases:
             launched = json.loads(restart_result.stdout)
             self.assertEqual(launched["state"], "starting")
             self.assertEqual(launched["status_path"], str(status_path))
+            self.wait_for_background_receiver_exit(status_path)
     def test_rcv_reload_without_existing_status_behaves_like_start(self) -> None:
         with tempfile.TemporaryDirectory(prefix="gnss_rcv_reload_test_") as temp_dir:
             temp_root = Path(temp_dir)
@@ -1816,6 +2379,7 @@ class RuntimeReceiverCases:
             launched = json.loads(reload_result.stdout)
             self.assertEqual(launched["state"], "starting")
             self.assertEqual(launched["status_path"], str(status_path))
+            self.wait_for_background_receiver_exit(status_path)
     def test_rcv_reload_resolves_config_from_existing_status(self) -> None:
         with tempfile.TemporaryDirectory(prefix="gnss_rcv_reload_managed_test_") as temp_dir:
             temp_root = Path(temp_dir)
@@ -1860,6 +2424,7 @@ class RuntimeReceiverCases:
             self.assertEqual(launched["state"], "starting")
             self.assertEqual(launched["config_path"], str(config_path))
             self.assertEqual(launched["status_path"], str(status_path))
+            self.wait_for_background_receiver_exit(status_path)
     @unittest.skipUnless(
         os.path.exists("gnssplusplus_thesis_ws/data/clas/claslib/data/0627239Q.obs"),
         "CLAS regression data not available"

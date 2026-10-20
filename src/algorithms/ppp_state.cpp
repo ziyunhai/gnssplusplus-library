@@ -250,6 +250,23 @@ bool validReceiverSeed(const Vector3d& receiver_position) {
            receiver_position.norm() > 1000.0;
 }
 
+bool pvaDynamicsEnabled(const PPPProcessor::PPPConfig& config) {
+    return usePvaDynamics(config.use_pva_dynamics,
+                          config.use_dynamics_model,
+                          config.kinematic_mode,
+                          config.low_dynamics_mode,
+                          config.use_clas_osr_filter);
+}
+
+Vector3d seedVelocityOrZero(const PositionSolution& solution) {
+    // SPP Doppler velocity when it was solved; otherwise start from rest
+    // (RTKLIB's pntpos leaves rr[3..5] zero without Doppler).
+    if (solution.has_velocity && solution.velocity_ecef.allFinite()) {
+        return solution.velocity_ecef;
+    }
+    return Vector3d::Zero();
+}
+
 double wrapFractionalCycle(double value) {
     if (!std::isfinite(value)) {
         return 0.0;
@@ -267,14 +284,17 @@ bool PPPProcessor::initializeFilter(const ObservationData& obs,
                                     const NavigationData& nav,
                                     const PositionSolution* seed_solution) {
     Vector3d initial_position = Vector3d::Zero();
+    Vector3d initial_velocity = Vector3d::Zero();
     double initial_clock_bias_m = 0.0;
     if (seed_solution != nullptr && seed_solution->isValid()) {
         initial_position = seed_solution->position_ecef;
+        initial_velocity = seedVelocityOrZero(*seed_solution);
         initial_clock_bias_m = seed_solution->receiver_clock_bias;
     } else {
         auto spp_solution = spp_processor_.processEpoch(obs, nav);
         if (spp_solution.isValid()) {
             initial_position = spp_solution.position_ecef;
+            initial_velocity = seedVelocityOrZero(spp_solution);
             initial_clock_bias_m = spp_solution.receiver_clock_bias;
         } else if (validReceiverSeed(obs.receiver_position)) {
             initial_position = obs.receiver_position;
@@ -285,7 +305,15 @@ bool PPPProcessor::initializeFilter(const ObservationData& obs,
     }
 
     // Allocate per-system receiver clocks after the base states:
-    // pos(3) + vel(3) + gps_clk(1) + glo_clk(1) + trop(1).
+    // pos(3) + vel(3) [+ acc(3) with the PVA dynamics] + gps_clk(1) +
+    // glo_clk(1) + trop(1).
+    const bool pva_dynamics = pvaDynamicsEnabled(ppp_config_);
+    filter_state_.pos_index = 0;
+    filter_state_.vel_index = 3;
+    filter_state_.accel_index = pva_dynamics ? 6 : -1;
+    filter_state_.clock_index = pva_dynamics ? 9 : 6;
+    filter_state_.glo_clock_index = pva_dynamics ? 10 : 7;
+    const int fixed_state_count = pva_dynamics ? 12 : 9;
     filter_state_.gal_clock_index = -1;
     filter_state_.qzs_clock_index = -1;
     filter_state_.bds_clock_index = -1;
@@ -303,8 +331,8 @@ bool PPPProcessor::initializeFilter(const ObservationData& obs,
     for (const auto& sat : obs.getSatellites()) {
         visible_systems.insert(sat.system);
     }
-    filter_state_.trop_index = 8;  // keep original
-    int isb_start = 9;
+    filter_state_.trop_index = fixed_state_count - 1;
+    int isb_start = fixed_state_count;
     if (env_overrides_.estimate_isb_gal && visible_systems.count(GNSSSystem::Galileo)) {
         filter_state_.gal_clock_index = isb_start++;
     }
@@ -315,10 +343,22 @@ bool PPPProcessor::initializeFilter(const ObservationData& obs,
         visible_systems.count(GNSSSystem::QZSS)) {
         filter_state_.qzs_clock_index = isb_start++;
     }
-    if ((env_overrides_.estimate_isb_bds || require_coherent_ssr_) &&
+    // Broadcast BeiDou clocks are referenced to BDT, and the B1I/B3I (BDS-3)
+    // and B1I/B2I (BDS-2) ionosphere-free codes carry receiver delays of their
+    // own: with the GPS receiver clock their prefit code residuals sit about
+    // +2 m (BDS-3) and +5 m (BDS-2) above the GPS ones on the Kamakura hours,
+    // which the static filter turned into a metre-level up bias. Estimate one
+    // receiver clock for BDS-3 and one for BDS-2 when only broadcast
+    // ephemerides are used, as MADOCALIB does (RTKLIB estimates one clock per
+    // system); precise / SSR products keep their own clock datum handling.
+    const bool broadcast_beidou_clocks = broadcastClockIonosphereFree(
+        ppp_config_.use_ionosphere_free, precise_products_loaded_,
+        ssr_products_loaded_, dcb_products_loaded_);
+    if ((env_overrides_.estimate_isb_bds || require_coherent_ssr_ ||
+         broadcast_beidou_clocks) &&
         visible_systems.count(GNSSSystem::BeiDou)) {
         filter_state_.bds_clock_index = isb_start++;
-        if (require_coherent_ssr_) {
+        if (require_coherent_ssr_ || broadcast_beidou_clocks) {
             filter_state_.bds2_clock_index = isb_start++;
         }
     }
@@ -343,13 +383,14 @@ bool PPPProcessor::initializeFilter(const ObservationData& obs,
             ++n_iono_states;
         }
     }
-    const int n_isb = isb_start - 9;
-    const int n_states = 9 + n_isb + n_iono_states;
-    filter_state_.amb_index = 9 + n_isb + n_iono_states;
+    const int n_isb = isb_start - fixed_state_count;
+    const int n_states = fixed_state_count + n_isb + n_iono_states;
+    filter_state_.amb_index = fixed_state_count + n_isb + n_iono_states;
     filter_state_.state = VectorXd::Zero(n_states);
     filter_state_.covariance = MatrixXd::Identity(n_states, n_states);
     filter_state_.state.segment(filter_state_.pos_index, 3) = initial_position;
-    filter_state_.state.segment(filter_state_.vel_index, 3).setZero();
+    filter_state_.state.segment(filter_state_.vel_index, 3) =
+        pva_dynamics ? initial_velocity : Vector3d::Zero();
     filter_state_.state(filter_state_.clock_index) = initial_clock_bias_m;
     filter_state_.state(filter_state_.glo_clock_index) = initial_clock_bias_m;
     // Initialize per-system clock states.
@@ -369,7 +410,15 @@ bool PPPProcessor::initializeFilter(const ObservationData& obs,
     filter_state_.covariance.block(filter_state_.pos_index, filter_state_.pos_index, 3, 3) *=
         use_broadcast_rtklib_model ? ppp_config_.initial_position_variance : 100.0;
     filter_state_.covariance.block(filter_state_.vel_index, filter_state_.vel_index, 3, 3) *=
-        use_broadcast_rtklib_model ? ppp_config_.initial_velocity_variance : 25.0;
+        use_broadcast_rtklib_model || pva_dynamics
+            ? ppp_config_.initial_velocity_variance
+            : 25.0;
+    if (pva_dynamics) {
+        // Acceleration starts at zero (RTKLIB: 1e-6) with VAR_ACC.
+        filter_state_.covariance.block(
+            filter_state_.accel_index, filter_state_.accel_index, 3, 3) *=
+            ppp_config_.initial_acceleration_variance;
+    }
     filter_state_.covariance(filter_state_.clock_index, filter_state_.clock_index) =
         use_broadcast_rtklib_model ? ppp_config_.initial_clock_variance : 1e8;
     filter_state_.covariance(filter_state_.glo_clock_index, filter_state_.glo_clock_index) =
@@ -429,10 +478,18 @@ void PPPProcessor::predictState(double dt, const PositionSolution* seed_solution
     const bool use_broadcast_rtklib_model = !precise_products_loaded_;
     const bool use_dynamic_prediction =
         ppp_config_.kinematic_mode && (!use_broadcast_rtklib_model || ppp_config_.use_dynamics_model);
+    const bool pva_dynamics =
+        pvaDynamicsEnabled(ppp_config_) && filter_state_.accel_index >= 0;
     MatrixXd F = MatrixXd::Identity(filter_state_.total_states, filter_state_.total_states);
     if (use_dynamic_prediction) {
         F.block(filter_state_.pos_index, filter_state_.vel_index, 3, 3) =
             MatrixXd::Identity(3, 3) * dt;
+        if (pva_dynamics) {
+            F.block(filter_state_.pos_index, filter_state_.accel_index, 3, 3) =
+                MatrixXd::Identity(3, 3) * (0.5 * dt * dt);
+            F.block(filter_state_.vel_index, filter_state_.accel_index, 3, 3) =
+                MatrixXd::Identity(3, 3) * dt;
+        }
     }
 
     filter_state_.state = F * filter_state_.state;
@@ -444,11 +501,19 @@ void PPPProcessor::predictState(double dt, const PositionSolution* seed_solution
     if (!ppp_config_.kinematic_mode) {
         Q.block(filter_state_.pos_index, filter_state_.pos_index, 3, 3) =
             MatrixXd::Identity(3, 3) * ppp_config_.process_noise_position * dt;
-    } else if (use_dynamic_prediction) {
+    } else if (use_dynamic_prediction && !pva_dynamics) {
         Q.block(filter_state_.pos_index, filter_state_.pos_index, 3, 3) =
             MatrixXd::Identity(3, 3) * ppp_config_.process_noise_position * dt;
     }
-    if (use_dynamic_prediction) {
+    if (pva_dynamics) {
+        // Process noise on the acceleration only (RTKLIB udpos_ppp()).
+        Q.block(filter_state_.accel_index, filter_state_.accel_index, 3, 3) =
+            pvaAccelerationProcessNoiseEcef(
+                filter_state_.state.segment(filter_state_.pos_index, 3),
+                ppp_config_.process_noise_acceleration_horizontal,
+                ppp_config_.process_noise_acceleration_vertical,
+                dt);
+    } else if (use_dynamic_prediction) {
         Q.block(filter_state_.vel_index, filter_state_.vel_index, 3, 3) =
             MatrixXd::Identity(3, 3) * ppp_config_.process_noise_velocity * dt;
     } else {
@@ -499,6 +564,56 @@ void PPPProcessor::predictState(double dt, const PositionSolution* seed_solution
     }
 
     filter_state_.covariance = F * filter_state_.covariance * F.transpose() + Q;
+    // RTKLIB udpos_ppp() re-seeds position / velocity / acceleration from SPP
+    // when the mean position variance exceeds the initial position variance
+    // (repeated rejected epochs). The test is applied to the predicted
+    // covariance so that an outage of several seconds, over which the
+    // acceleration noise has grown the position variance past that bound,
+    // restarts from SPP instead of from a stale velocity.
+    bool pva_reset =
+        pva_dynamics && seed_solution != nullptr && seed_solution->isValid() &&
+        !(filter_state_.covariance
+                  .block(filter_state_.pos_index, filter_state_.pos_index, 3, 3)
+                  .trace() / 3.0 <=
+          ppp_config_.initial_position_variance);
+    // Divergence guard: the predicted position must stay consistent with the
+    // SPP seed. A wrong position carried with a small covariance makes the
+    // post-fit screening reject the code rows that disagree with it (urban
+    // stops under NLOS, a wrong Doppler velocity), so it would never recover.
+    // Re-seeding costs one epoch of the default white-noise position.
+    if (pva_dynamics && !pva_reset && seed_solution != nullptr &&
+        seed_solution->isValid() &&
+        ppp_config_.pva_seed_disagreement_gate > 0.0) {
+        Matrix3d seed_covariance = seed_solution->position_covariance;
+        if (!seed_covariance.allFinite()) {
+            seed_covariance = Matrix3d::Identity() * kPvaFallbackSeedVariance;
+        }
+        const double disagreement = seedPositionDisagreement(
+            filter_state_.state.segment(filter_state_.pos_index, 3),
+            filter_state_.covariance.block(
+                filter_state_.pos_index, filter_state_.pos_index, 3, 3),
+            seed_solution->position_ecef,
+            seed_covariance);
+        pva_reset = !(disagreement <= ppp_config_.pva_seed_disagreement_gate);
+        if (pva_reset && pppDebugEnabled()) {
+            std::cerr << "[PPP] PVA reset: SPP disagreement nis=" << disagreement
+                      << "\n";
+        }
+    }
+    if (pva_reset) {
+        reinitializeVectorState(
+            filter_state_.pos_index,
+            seed_solution->position_ecef,
+            ppp_config_.initial_position_variance);
+        reinitializeVectorState(
+            filter_state_.vel_index,
+            seedVelocityOrZero(*seed_solution),
+            ppp_config_.initial_velocity_variance);
+        reinitializeVectorState(
+            filter_state_.accel_index,
+            Vector3d::Zero(),
+            ppp_config_.initial_acceleration_variance);
+    }
     if (use_broadcast_rtklib_model && seed_solution != nullptr && seed_solution->isValid()) {
         if (ppp_config_.reset_clock_to_spp_each_epoch || useLowDynamicsBroadcastSeedAssist()) {
             const double gps_clock_before_reset = filter_state_.state(filter_state_.clock_index);
@@ -524,20 +639,66 @@ void PPPProcessor::predictState(double dt, const PositionSolution* seed_solution
                     seed_solution->receiver_clock_bias + reset_offset,
                     ppp_config_.initial_clock_variance);
             };
-            reinitializeScalarState(
-                filter_state_.clock_index,
-                seed_solution->receiver_clock_bias,
-                ppp_config_.initial_clock_variance);
-            reinitializeSystemClock(
-                filter_state_.glo_clock_index, GNSSSystem::GLONASS, true);
-            reinitializeSystemClock(
-                filter_state_.gal_clock_index, GNSSSystem::Galileo, false);
-            reinitializeSystemClock(
-                filter_state_.qzs_clock_index, GNSSSystem::QZSS, false);
-            reinitializeSystemClock(
-                filter_state_.bds_clock_index, GNSSSystem::BeiDou, false);
-            reinitializeSystemClock(
-                filter_state_.bds2_clock_index, GNSSSystem::BeiDou, false);
+            // With broadcast ephemerides only, the Galileo / QZSS / BeiDou
+            // clocks are the GPS clock plus an inter-system bias that is
+            // constant over a run. Re-seeding the GPS clock from SPP must not
+            // discard what the filter has learned about those biases (a free
+            // system clock each epoch costs a kinematic urban epoch a whole
+            // constellation's worth of clock information), so keep each bias
+            // and its covariance and move only the common clock.
+            const bool keep_inter_system_biases = broadcastClockIonosphereFree(
+                ppp_config_.use_ionosphere_free, precise_products_loaded_,
+                ssr_products_loaded_, dcb_products_loaded_);
+            if (keep_inter_system_biases) {
+                std::vector<int> bias_indices;
+                for (const int index : {filter_state_.gal_clock_index,
+                                        filter_state_.qzs_clock_index,
+                                        filter_state_.bds_clock_index,
+                                        filter_state_.bds2_clock_index}) {
+                    if (index >= 0) {
+                        bias_indices.push_back(index);
+                    }
+                }
+                const int g = filter_state_.clock_index;
+                auto& x = filter_state_.state;
+                auto& P = filter_state_.covariance;
+                // System clocks -> biases relative to the GPS clock.
+                for (const int s : bias_indices) {
+                    x(s) -= x(g);
+                    P.row(s) -= P.row(g);
+                }
+                for (const int s : bias_indices) {
+                    P.col(s) -= P.col(g);
+                }
+                reinitializeScalarState(
+                    g, seed_solution->receiver_clock_bias,
+                    ppp_config_.initial_clock_variance);
+                // Biases -> system clocks on the re-seeded GPS clock.
+                for (const int s : bias_indices) {
+                    x(s) += x(g);
+                    P.row(s) += P.row(g);
+                }
+                for (const int s : bias_indices) {
+                    P.col(s) += P.col(g);
+                }
+                reinitializeSystemClock(
+                    filter_state_.glo_clock_index, GNSSSystem::GLONASS, true);
+            } else {
+                reinitializeScalarState(
+                    filter_state_.clock_index,
+                    seed_solution->receiver_clock_bias,
+                    ppp_config_.initial_clock_variance);
+                reinitializeSystemClock(
+                    filter_state_.glo_clock_index, GNSSSystem::GLONASS, true);
+                reinitializeSystemClock(
+                    filter_state_.gal_clock_index, GNSSSystem::Galileo, false);
+                reinitializeSystemClock(
+                    filter_state_.qzs_clock_index, GNSSSystem::QZSS, false);
+                reinitializeSystemClock(
+                    filter_state_.bds_clock_index, GNSSSystem::BeiDou, false);
+                reinitializeSystemClock(
+                    filter_state_.bds2_clock_index, GNSSSystem::BeiDou, false);
+            }
         }
         if (ppp_config_.kinematic_mode &&
             !ppp_config_.low_dynamics_mode &&
@@ -649,17 +810,12 @@ bool PPPProcessor::updateFilter(const ObservationData& obs,
         return false;
     }
 
-    // MADOCALIB restarts each residual-screening pass from rtk->x/rtk->P and
-    // commits one measurement update per epoch. Re-applying the same epoch's
-    // rows to the already-updated covariance makes the native uncombined
-    // MADOCA filter overconfident before PPP-AR (ppp.c:1359-1378).
-    const bool madoca_per_frequency_update =
-        require_coherent_ssr_ && ssr_products_loaded_ &&
-        !ppp_config_.use_ionosphere_free && ppp_config_.estimate_ionosphere;
-    const int filter_iterations = filterIterationCount(
-        madoca_per_frequency_update,
-        precise_products_loaded_,
-        ppp_config_.filter_iterations);
+    // One committed measurement update per epoch (RTKLIB/MADOCALIB pppos():
+    // every residual-screening pass restarts from rtk->x/rtk->P). The rows
+    // keep the prior-position geometry, so re-applying them would push the
+    // position again by the innovation it already absorbed; see
+    // kMeasurementUpdatesPerEpoch.
+    const int filter_iterations = kMeasurementUpdatesPerEpoch;
     const PPPState pre_update_state = filter_state_;
     const bool madoca_static_spike_guard =
         require_coherent_ssr_ && ssr_products_loaded_ &&
@@ -673,9 +829,48 @@ bool PPPProcessor::updateFilter(const ObservationData& obs,
         filter_state_ = pre_update_state;
         pre_anchor_covariance_ = filter_state_.covariance;
     };
+    const bool postfit_screening = usePostfitResidualScreening(
+        ppp_config_.kinematic_mode && !ppp_config_.low_dynamics_mode,
+        require_coherent_ssr_,
+        ppp_config_.use_clas_osr_filter,
+        madocaPerFrequencyPath(
+            require_coherent_ssr_, ssr_products_loaded_,
+            ppp_config_.use_ionosphere_free, ppp_config_.estimate_ionosphere,
+            ppp_config_.use_clas_osr_filter));
+    std::set<SatelliteId> screened_satellites;
+    const auto dropScreenedSatellites = [&](MeasurementEquation& equation) {
+        std::vector<int> keep;
+        keep.reserve(equation.row_satellites.size());
+        for (int i = 0; i < static_cast<int>(equation.row_satellites.size()); ++i) {
+            if (screened_satellites.count(equation.row_satellites[static_cast<size_t>(i)]) == 0) {
+                keep.push_back(i);
+            }
+        }
+        const int rows = static_cast<int>(keep.size());
+        MeasurementEquation reduced;
+        reduced.design_matrix = MatrixXd::Zero(rows, equation.design_matrix.cols());
+        reduced.observations = VectorXd::Zero(rows);
+        reduced.predicted = VectorXd::Zero(rows);
+        reduced.weight_matrix = MatrixXd::Zero(rows, rows);
+        reduced.residuals = VectorXd::Zero(rows);
+        for (int r = 0; r < rows; ++r) {
+            const int i = keep[static_cast<size_t>(r)];
+            reduced.design_matrix.row(r) = equation.design_matrix.row(i);
+            reduced.observations(r) = equation.observations(i);
+            reduced.predicted(r) = equation.predicted(i);
+            reduced.weight_matrix(r, r) = equation.weight_matrix(i, i);
+            reduced.residuals(r) = equation.residuals(i);
+            reduced.row_satellites.push_back(equation.row_satellites[static_cast<size_t>(i)]);
+            reduced.row_is_phase.push_back(equation.row_is_phase[static_cast<size_t>(i)]);
+        }
+        equation = std::move(reduced);
+    };
     int completed_filter_iterations = 0;
     for (int iteration = 0; iteration < filter_iterations; ++iteration) {
         MeasurementEquation meas_eq = formMeasurementEquations(if_obs, nav, obs.time);
+        if (!screened_satellites.empty()) {
+            dropScreenedSatellites(meas_eq);
+        }
 
         if (meas_eq.observations.size() < config_.min_satellites) {
             if (pppDebugEnabled()) {
@@ -699,6 +894,34 @@ bool PPPProcessor::updateFilter(const ObservationData& obs,
         const VectorXd delta_state = gain * meas_eq.residuals;
         const double position_delta_norm =
             delta_state.segment(filter_state_.pos_index, 3).norm();
+
+        if (postfit_screening) {
+            const int worst_row = worstStandardizedResidualRow(
+                meas_eq.residuals, innovation_inverse, kPostfitRejectSigma);
+            if (worst_row >= 0) {
+                const SatelliteId worst_satellite =
+                    meas_eq.row_satellites[static_cast<size_t>(worst_row)];
+                std::set<SatelliteId> remaining(
+                    meas_eq.row_satellites.begin(), meas_eq.row_satellites.end());
+                remaining.erase(worst_satellite);
+                if (pppDebugEnabled()) {
+                    std::cerr << "[PPP] postfit reject " << worst_satellite.toString()
+                              << (meas_eq.row_is_phase[static_cast<size_t>(worst_row)]
+                                      ? " phase" : " code")
+                              << " innovation=" << meas_eq.residuals(worst_row)
+                              << " excluded=" << screened_satellites.size() + 1
+                              << " remaining=" << remaining.size() << "\n";
+                }
+                if (remaining.size() < static_cast<size_t>(config_.min_satellites)) {
+                    // Not enough satellites left to screen further (RTKLIB
+                    // "iteration overflows"): commit no update this epoch.
+                    return false;
+                }
+                screened_satellites.insert(worst_satellite);
+                --iteration;  // redo this pass from the predicted state
+                continue;
+            }
+        }
 
         if (madoca_static_spike_guard &&
             std::isfinite(position_delta_norm) &&
@@ -738,12 +961,6 @@ bool PPPProcessor::updateFilter(const ObservationData& obs,
             (identity - kh) * filter_state_.covariance * (identity - kh).transpose() +
             gain * meas_eq.weight_matrix * gain.transpose();
         completed_filter_iterations = iteration + 1;
-
-        if (delta_state.segment(filter_state_.pos_index, 3).norm() < 1e-4 &&
-            std::abs(delta_state(filter_state_.clock_index)) < 1e-3 &&
-            std::abs(delta_state(filter_state_.trop_index)) < 1e-3) {
-            break;
-        }
     }
 
     const bool madoca_postfit_shadow =
@@ -763,12 +980,10 @@ bool PPPProcessor::updateFilter(const ObservationData& obs,
     const double epoch_position_update_norm_m =
         (filter_state_.state.segment(filter_state_.pos_index, 3) -
          pre_update_state.state.segment(pre_update_state.pos_index, 3)).norm();
-    const bool madoca_static_anchor_blend =
-        require_coherent_ssr_ && !env_overrides_.disable_madoca_static_anchor;
     const bool anchor_active =
         (!ppp_config_.kinematic_mode || ppp_config_.low_dynamics_mode) &&
         has_static_anchor_position_ &&
-        (ppp_config_.apply_static_anchor_blend || madoca_static_anchor_blend) &&
+        ppp_config_.apply_static_anchor_blend &&
         !(precise_products_loaded_ && !ppp_config_.estimate_troposphere);
     if (madoca_postfit_shadow) {
         // applyPreciseCorrections() materializes each antenna phase-centre
@@ -875,14 +1090,16 @@ void PPPProcessor::detectCycleSlips(const ObservationData& obs, const Navigation
     }
 
     constexpr double kMinimumMwSlipThresholdMeters = 10.0;
-    // Enable combination (GF/MW) slip detection in SSR mode even for static,
-    // because MW averaging is needed for Wide-Lane AR. CLAS kinematic OSR uses
-    // OSR-corrected GF/MW in detectClasCycleSlips instead.
+    // Geometry-free / Melbourne-Wubbena slip detection for every
+    // ionosphere-free solution (static included) and for kinematic motion;
+    // CLAS kinematic OSR uses OSR-corrected GF/MW in detectClasCycleSlips.
+    // The MW averages also feed wide-lane AR.
     const bool clas_kinematic_osr =
         ppp_config_.use_clas_osr_filter && ppp_config_.kinematic_mode;
-    const bool use_combination_slip_detection =
-        (ppp_config_.kinematic_mode && !clas_kinematic_osr) ||
-        (ssr_products_loaded_ && ppp_config_.use_ionosphere_free);
+    const bool use_combination_slip_detection = useCombinationSlipDetection(
+        ppp_config_.kinematic_mode,
+        clas_kinematic_osr,
+        ppp_config_.use_ionosphere_free);
 
     for (const auto& satellite : obs.getSatellites()) {
         const std::vector<SignalType> primary_candidates =
@@ -968,10 +1185,24 @@ void PPPProcessor::detectCycleSlips(const ObservationData& obs, const Navigation
             !ppp_config_.use_ionosphere_free &&
             ppp_config_.estimate_ionosphere;
 
+        // A broadcast ionosphere-free BDS-3 row pairs B1I with B3I, which the
+        // reader keeps outside the selected observations when the satellite
+        // also logs B2b (formIonosphereFree); test the same pair, including
+        // the B3I loss-of-lock flag.
+        const bool broadcast_beidou3 =
+            ppp_internal::isBeiDou3Satellite(satellite) &&
+            broadcastClockIonosphereFree(ppp_config_.use_ionosphere_free,
+                                         precise_products_loaded_,
+                                         ssr_products_loaded_,
+                                         dcb_products_loaded_);
         const Observation* secondary =
-            use_combination_slip_detection ?
-                findCarrierObservationForSignals(obs, satellite, secondary_candidates) :
-                nullptr;
+            !use_combination_slip_detection ? nullptr
+            : broadcast_beidou3
+                ? findBroadcastBeiDouSecondaryObservation(obs, satellite, true)
+                : findCarrierObservationForSignals(obs, satellite, secondary_candidates);
+        if (broadcast_beidou3 && secondary != nullptr && secondary->loss_of_lock) {
+            lli_slip = true;
+        }
         if (secondary != nullptr) {
             const Ephemeris* eph = nav.getEphemeris(satellite, obs.time);
             const double lambda1 =
@@ -1922,10 +2153,14 @@ void PPPProcessor::constrainStaticAnchorPosition() {
         !has_static_anchor_position_) {
         return;
     }
-    const bool madoca_static_anchor_blend =
-        require_coherent_ssr_ &&
-        !env_overrides_.disable_madoca_static_anchor;
-    if (!ppp_config_.apply_static_anchor_blend && !madoca_static_anchor_blend) {
+    // Opt-in only (PPPConfig::apply_static_anchor_blend). Coherent MADOCA
+    // static used to blend 26-30% of the SPP seed back into the position
+    // after every measurement pass and reset its covariance to a fixed
+    // 2-3 m isotropic sigma, which held the solution near the seed and hid
+    // the drift of its eight stale-geometry passes. MADOCALIB udpos_ppp()
+    // initializes a static position once and then only adds its process
+    // noise.
+    if (!ppp_config_.apply_static_anchor_blend) {
         return;
     }
     if (precise_products_loaded_ && !ppp_config_.estimate_troposphere) {
@@ -1937,17 +2172,13 @@ void PPPProcessor::constrainStaticAnchorPosition() {
     // Root cause of 4m floor is 20-40m SSR residual spread (light travel time).
     // Fix the residuals first, then loosen the anchor.
 
-    const double default_madoca_anchor_blend =
-        env_overrides_.madoca_early_window ? 0.26 : 0.30;
     const double default_anchor_blend =
-        madoca_static_anchor_blend && !ppp_config_.apply_static_anchor_blend
-            ? default_madoca_anchor_blend
-            : (ppp_config_.low_dynamics_mode
-                   ? (precise_products_loaded_ ? (converged_ ? 0.65 : 0.9) : 0.95)
-                   : (precise_products_loaded_ ? (converged_ ? 0.5 : 0.85)
-                      : (ssr_products_loaded_
-                             ? (converged_ ? 0.5 : 0.7)
-                             : 1.0)));
+        ppp_config_.low_dynamics_mode
+            ? (precise_products_loaded_ ? (converged_ ? 0.65 : 0.9) : 0.95)
+            : (precise_products_loaded_ ? (converged_ ? 0.5 : 0.85)
+               : (ssr_products_loaded_
+                      ? (converged_ ? 0.5 : 0.7)
+                      : 1.0));
     const double configured_anchor_blend = env_overrides_.static_anchor_blend;
     const double anchor_blend =
         configured_anchor_blend >= 0.0 && configured_anchor_blend <= 1.0

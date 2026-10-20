@@ -46,8 +46,10 @@ bool RTCMProcessor::decodeEphemerisMessage(const RTCMMessage& message, Navigatio
 
         Ephemeris eph;
         eph.satellite = SatelliteId(GNSSSystem::GPS, prn);
-        eph.week = static_cast<uint16_t>(adjustGpsWeek(static_cast<uint16_t>(
-            readUnsignedBits(message.data.data(), message.data.size(), bit_pos, 10))));
+        const auto week_mod = static_cast<uint16_t>(
+            readUnsignedBits(message.data.data(), message.data.size(), bit_pos, 10));
+        eph.week = static_cast<uint16_t>(reference_time_ ? adjustGpsWeek(week_mod, reference_time_->week) :
+                                                      adjustGpsWeek(week_mod));
         bit_pos += 10;
         eph.ura = static_cast<uint8_t>(
             readUnsignedBits(message.data.data(), message.data.size(), bit_pos, 4));
@@ -131,7 +133,7 @@ bool RTCMProcessor::decodeEphemerisMessage(const RTCMMessage& message, Navigatio
         eph.tgd = static_cast<double>(
             readSignedBits(message.data.data(), message.data.size(), bit_pos, 8)) * kPow2Neg31;
         bit_pos += 8;
-        eph.health = static_cast<uint8_t>(
+        eph.health = static_cast<uint16_t>(
             readUnsignedBits(message.data.data(), message.data.size(), bit_pos, 6));
         eph.sv_health = static_cast<double>(eph.health);
         bit_pos += 6;
@@ -234,7 +236,7 @@ bool RTCMProcessor::decodeEphemerisMessage(const RTCMMessage& message, Navigatio
         eph.health = bn;
         eph.sv_health = static_cast<double>(bn);
         eph.iode = tb & 0x7FU;
-        const GNSSTime current_utc = gpstToUtcApprox(currentGpstApprox());
+        const GNSSTime current_utc = gpstToUtcApprox(reference_time_ ? *reference_time_ : currentGpstApprox());
         const GNSSTime tof_utc = alignUtcTimeOfDay(tk_h * 3600.0 + tk_m * 60.0 + tk_s - 10800.0, current_utc);
         const GNSSTime toe_utc = alignUtcTimeOfDay(static_cast<double>(tb) * 900.0 - 10800.0, current_utc);
         eph.tof = utcToGpstApprox(tof_utc);
@@ -242,6 +244,250 @@ bool RTCMProcessor::decodeEphemerisMessage(const RTCMMessage& message, Navigatio
         eph.week = static_cast<uint16_t>(eph.toe.week);
         eph.valid = true;
         glonass_frequency_channels_[eph.satellite] = eph.glonass_frequency_channel;
+        nav_data.addEphemeris(eph);
+        return true;
+    }
+
+    if (message.type == RTCMMessageType::RTCM_1045 ||
+        message.type == RTCMMessageType::RTCM_1046) {
+        // RTCM 10403.3 3.5.13: Galileo F/NAV (1045) and I/NAV (1046)
+        // ephemerides. Field layout and scaling follow RTKLIB
+        // decode_type1045/1046.
+        const bool inav = message.type == RTCMMessageType::RTCM_1046;
+        const size_t required_bits = inav ? 502U : 496U;
+        if (message.data.size() * 8U < required_bits ||
+            message_number != static_cast<uint64_t>(message.type)) {
+            return false;
+        }
+        const uint8_t* data = message.data.data();
+        const size_t size = message.data.size();
+        const auto u = [&](int bits) {
+            const uint64_t value = readUnsignedBits(data, size, bit_pos, bits);
+            bit_pos += bits;
+            return value;
+        };
+        const auto s = [&](int bits) {
+            const int64_t value = readSignedBits(data, size, bit_pos, bits);
+            bit_pos += bits;
+            return static_cast<double>(value);
+        };
+
+        const uint8_t prn = static_cast<uint8_t>(u(6));
+        if (prn == 0 || prn > 36) {
+            return false;
+        }
+        Ephemeris eph;
+        eph.satellite = SatelliteId(GNSSSystem::Galileo, prn);
+        const int gst_week = static_cast<int>(u(12));
+        eph.iode = static_cast<uint16_t>(u(10));
+        eph.iodc = eph.iode;
+        const uint8_t sisa = static_cast<uint8_t>(u(8));
+        eph.ura = sisa;
+        eph.sv_accuracy = galileoSisaMeters(sisa);
+        eph.idot = s(14) * kPow2Neg43 * kSemiCircleToRadians;
+        eph.i_dot = eph.idot;
+        const double toc = static_cast<double>(u(14)) * 60.0;
+        eph.af2 = s(6) * kPow2Neg59;
+        eph.af1 = s(21) * kPow2Neg46;
+        eph.af0 = s(31) * kPow2Neg34;
+        eph.crs = s(16) * kPow2Neg5;
+        eph.delta_n = s(16) * kPow2Neg43 * kSemiCircleToRadians;
+        eph.m0 = s(32) * kPow2Neg31 * kSemiCircleToRadians;
+        eph.cuc = s(16) * kPow2Neg29;
+        eph.e = static_cast<double>(u(32)) * kPow2Neg33;
+        eph.cus = s(16) * kPow2Neg29;
+        eph.sqrt_a = static_cast<double>(u(32)) * kPow2Neg19;
+        eph.toes = static_cast<double>(u(14)) * 60.0;
+        eph.cic = s(16) * kPow2Neg29;
+        eph.omega0 = s(32) * kPow2Neg31 * kSemiCircleToRadians;
+        eph.cis = s(16) * kPow2Neg29;
+        eph.i0 = s(32) * kPow2Neg31 * kSemiCircleToRadians;
+        eph.crc = s(16) * kPow2Neg5;
+        eph.omega = s(32) * kPow2Neg31 * kSemiCircleToRadians;
+        eph.omega_dot = s(24) * kPow2Neg43 * kSemiCircleToRadians;
+        eph.tgd = s(10) * kPow2Neg32;  // BGD E5a/E1
+        int svh = 0;
+        if (inav) {
+            eph.tgd_secondary = s(10) * kPow2Neg32;  // BGD E5b/E1
+            const int e5b_hs = static_cast<int>(u(2));
+            const int e5b_dvs = static_cast<int>(u(1));
+            const int e1_hs = static_cast<int>(u(2));
+            const int e1_dvs = static_cast<int>(u(1));
+            svh = (e5b_hs << 7) | (e5b_dvs << 6) | (e1_hs << 1) | e1_dvs;
+            // RINEX data-source word: I/NAV E1-B, clock referenced to E5b/E1.
+            eph.data_source_code =
+                galileo_data_source::kInavE1B | galileo_data_source::kClockE5bE1;
+            eph.navigation_message_type = NavigationMessageType::INAV;
+        } else {
+            const int e5a_hs = static_cast<int>(u(2));
+            const int e5a_dvs = static_cast<int>(u(1));
+            svh = (e5a_hs << 4) | (e5a_dvs << 3);
+            // RINEX data-source word: F/NAV E5a-I, clock referenced to E5a/E1.
+            eph.data_source_code =
+                galileo_data_source::kFnavE5aI | galileo_data_source::kClockE5aE1;
+            eph.navigation_message_type = NavigationMessageType::FNAV;
+        }
+        // Keep the full Galileo health word: E5b HS occupies bits 7-8, so an
+        // 8-bit store would wrap HS=2 (word 256) to "healthy".
+        eph.health = static_cast<uint16_t>(svh);
+        eph.sv_health = static_cast<double>(svh);
+        // Galileo week in the libgnss++/RINEX convention is aligned with the
+        // GPS week: GST week + 1024.
+        const int week = gst_week + 1024;
+        eph.week = static_cast<uint16_t>(week);
+        eph.toe = GNSSTime(week, eph.toes);
+        eph.toc = GNSSTime(week, toc);
+        eph.valid = true;
+        nav_data.addEphemeris(eph);
+        return true;
+    }
+
+    if (message.type == RTCMMessageType::RTCM_1042) {
+        // RTCM 10403.3 BeiDou ephemeris. Layout and scaling follow RTKLIB
+        // decode_type1042. toe/toc are BDT in the message; the library keeps
+        // them in GPST exactly as the RINEX reader does (BDT week + 1356,
+        // + 14 s), with the raw BDT toe seconds in `toes` and the BDT week in
+        // `week`. GEO handling lives in the satellite position code and is
+        // keyed on the PRN, so nothing GEO specific is needed here.
+        if (message.data.size() * 8U < 511U || message_number != 1042U) {
+            return false;
+        }
+        const uint8_t* data = message.data.data();
+        const size_t size = message.data.size();
+        const auto u = [&](int bits) {
+            const uint64_t value = readUnsignedBits(data, size, bit_pos, bits);
+            bit_pos += bits;
+            return value;
+        };
+        const auto s = [&](int bits) {
+            const int64_t value = readSignedBits(data, size, bit_pos, bits);
+            bit_pos += bits;
+            return static_cast<double>(value);
+        };
+
+        const uint8_t prn = static_cast<uint8_t>(u(6));
+        if (prn == 0 || prn > 63) {
+            return false;
+        }
+        Ephemeris eph;
+        eph.satellite = SatelliteId(GNSSSystem::BeiDou, prn);
+        const int bdt_week = static_cast<int>(u(13));
+        const uint8_t sva = static_cast<uint8_t>(u(4));
+        eph.ura = sva;
+        eph.sv_accuracy = uraMetersFromIndex(sva);
+        eph.idot = s(14) * kPow2Neg43 * kSemiCircleToRadians;
+        eph.i_dot = eph.idot;
+        eph.iode = static_cast<uint16_t>(u(5));  // AODE
+        const double toc = static_cast<double>(u(17)) * 8.0;
+        eph.af2 = s(11) * kPow2Neg66;
+        eph.af1 = s(22) * kPow2Neg50;
+        eph.af0 = s(24) * kPow2Neg33;
+        eph.iodc = static_cast<uint16_t>(u(5));  // AODC
+        eph.crs = s(18) * kPow2Neg6;
+        eph.delta_n = s(16) * kPow2Neg43 * kSemiCircleToRadians;
+        eph.m0 = s(32) * kPow2Neg31 * kSemiCircleToRadians;
+        eph.cuc = s(18) * kPow2Neg31;
+        eph.e = static_cast<double>(u(32)) * kPow2Neg33;
+        eph.cus = s(18) * kPow2Neg31;
+        eph.sqrt_a = static_cast<double>(u(32)) * kPow2Neg19;
+        eph.toes = static_cast<double>(u(17)) * 8.0;
+        eph.cic = s(18) * kPow2Neg31;
+        eph.omega0 = s(32) * kPow2Neg31 * kSemiCircleToRadians;
+        eph.cis = s(18) * kPow2Neg31;
+        eph.i0 = s(32) * kPow2Neg31 * kSemiCircleToRadians;
+        eph.crc = s(18) * kPow2Neg6;
+        eph.omega = s(32) * kPow2Neg31 * kSemiCircleToRadians;
+        eph.omega_dot = s(24) * kPow2Neg43 * kSemiCircleToRadians;
+        eph.tgd = s(10) * 1e-10;            // TGD1 (B1/B3)
+        eph.tgd_secondary = s(10) * 1e-10;  // TGD2 (B2/B3)
+        const int svh = static_cast<int>(u(1));
+        eph.health = static_cast<uint16_t>(svh);
+        eph.sv_health = static_cast<double>(svh);
+
+        eph.week = static_cast<uint16_t>(bdt_week);
+        eph.toe = GNSSTime(bdt_week + kBdtWeekOffset, eph.toes) + kBdtToGpstSeconds;
+        eph.toc = GNSSTime(bdt_week + kBdtWeekOffset, toc) + kBdtToGpstSeconds;
+        // toc is the epoch nearest toe, as a RINEX record's calendar date is.
+        if (eph.toc - eph.toe > 302400.0) {
+            eph.toc = eph.toc - 604800.0;
+        } else if (eph.toc - eph.toe < -302400.0) {
+            eph.toc = eph.toc + 604800.0;
+        }
+        eph.valid = true;
+        nav_data.addEphemeris(eph);
+        return true;
+    }
+
+    if (message.type == RTCMMessageType::RTCM_1044) {
+        // RTCM 10403.3 QZSS ephemeris. Layout and scaling follow RTKLIB
+        // decode_type1044. The 4-bit satellite field is the PRN within the QZSS
+        // range (1 -> PRN 193, "J01"); the library stores QZSS PRNs as printed
+        // in RINEX (J01 -> 1), like its MSM decoder.
+        if (message.data.size() * 8U < 485U || message_number != 1044U) {
+            return false;
+        }
+        const uint8_t* data = message.data.data();
+        const size_t size = message.data.size();
+        const auto u = [&](int bits) {
+            const uint64_t value = readUnsignedBits(data, size, bit_pos, bits);
+            bit_pos += bits;
+            return value;
+        };
+        const auto s = [&](int bits) {
+            const int64_t value = readSignedBits(data, size, bit_pos, bits);
+            bit_pos += bits;
+            return static_cast<double>(value);
+        };
+
+        const uint8_t prn = static_cast<uint8_t>(u(4));
+        if (prn == 0 || prn > 10) {
+            return false;
+        }
+        Ephemeris eph;
+        eph.satellite = SatelliteId(GNSSSystem::QZSS, prn);
+        const double toc = static_cast<double>(u(16)) * 16.0;
+        eph.af2 = s(8) * kPow2Neg55;
+        eph.af1 = s(16) * kPow2Neg43;
+        eph.af0 = s(22) * kPow2Neg31;
+        eph.iode = static_cast<uint16_t>(u(8));
+        eph.crs = s(16) * kPow2Neg5;
+        eph.delta_n = s(16) * kPow2Neg43 * kSemiCircleToRadians;
+        eph.m0 = s(32) * kPow2Neg31 * kSemiCircleToRadians;
+        eph.cuc = s(16) * kPow2Neg29;
+        eph.e = static_cast<double>(u(32)) * kPow2Neg33;
+        eph.cus = s(16) * kPow2Neg29;
+        eph.sqrt_a = static_cast<double>(u(32)) * kPow2Neg19;
+        eph.toes = static_cast<double>(u(16)) * 16.0;
+        eph.cic = s(16) * kPow2Neg29;
+        eph.omega0 = s(32) * kPow2Neg31 * kSemiCircleToRadians;
+        eph.cis = s(16) * kPow2Neg29;
+        eph.i0 = s(32) * kPow2Neg31 * kSemiCircleToRadians;
+        eph.crc = s(16) * kPow2Neg5;
+        eph.omega = s(32) * kPow2Neg31 * kSemiCircleToRadians;
+        eph.omega_dot = s(24) * kPow2Neg43 * kSemiCircleToRadians;
+        eph.idot = s(14) * kPow2Neg43 * kSemiCircleToRadians;
+        eph.i_dot = eph.idot;
+        (void)u(2);  // L2 code indicator
+        const auto week_mod = static_cast<uint16_t>(u(10));
+        eph.week = static_cast<uint16_t>(reference_time_ ? adjustGpsWeek(week_mod, reference_time_->week) :
+                                                      adjustGpsWeek(week_mod));
+        const uint8_t sva = static_cast<uint8_t>(u(4));
+        eph.ura = sva;
+        eph.sv_accuracy = uraMetersFromIndex(sva);
+        eph.health = static_cast<uint16_t>(u(6));
+        eph.sv_health = static_cast<double>(eph.health);
+        eph.tgd = s(8) * kPow2Neg31;
+        eph.iodc = static_cast<uint16_t>(u(10));
+        // The trailing fit-interval flag has no field in Ephemeris.
+
+        eph.toe = GNSSTime(eph.week, eph.toes);
+        eph.toc = GNSSTime(eph.week, toc);
+        if (eph.toc - eph.toe > 302400.0) {
+            eph.toc = eph.toc - 604800.0;
+        } else if (eph.toc - eph.toe < -302400.0) {
+            eph.toc = eph.toc + 604800.0;
+        }
+        eph.valid = true;
         nav_data.addEphemeris(eph);
         return true;
     }

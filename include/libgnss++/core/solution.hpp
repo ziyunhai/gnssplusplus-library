@@ -38,18 +38,24 @@ struct PositionSolution {
     GNSSTime time;
     SolutionStatus status = SolutionStatus::NONE;
     
+    // Eigen vectors/matrices do not value-initialize their coefficients.
+    // Keep an absent position, velocity, or covariance visibly invalid (NaN)
+    // so consumers can select a documented fallback instead of accidentally
+    // treating stack garbage as a value.  A solution whose producer never
+    // assigned these fields (e.g. a failed SPP epoch) stays non-finite.
+
     // Position
-    Vector3d position_ecef;         ///< Position in ECEF coordinates
+    Vector3d position_ecef =
+        Vector3d::Constant(std::numeric_limits<double>::quiet_NaN());  ///< Position in ECEF coordinates
     GeodeticCoord position_geodetic; ///< Position in geodetic coordinates
-    // Eigen matrices do not value-initialize their coefficients.  Keep an
-    // absent covariance visibly invalid so consumers can select a documented
-    // fallback instead of accidentally treating stack garbage as R.
     Matrix3d position_covariance =
         Matrix3d::Constant(std::numeric_limits<double>::quiet_NaN());
     
-    // Velocity (if available)
-    Vector3d velocity_ecef;         ///< Velocity in ECEF coordinates
-    Vector3d velocity_ned;          ///< Velocity in NED coordinates
+    // Velocity (valid only when has_velocity is true)
+    Vector3d velocity_ecef =
+        Vector3d::Constant(std::numeric_limits<double>::quiet_NaN());  ///< Velocity in ECEF coordinates
+    Vector3d velocity_ned =
+        Vector3d::Constant(std::numeric_limits<double>::quiet_NaN());  ///< Velocity in NED coordinates
     Matrix3d velocity_covariance =
         Matrix3d::Constant(std::numeric_limits<double>::quiet_NaN());
     bool has_velocity = false;
@@ -119,11 +125,27 @@ struct PositionSolution {
     int rtk_update_suppressed_outliers = 0;
     double rtk_update_prefit_residual_rms_m = 0.0;
     double rtk_update_prefit_residual_max_m = 0.0;
+    // True when this solution's own update prefit residual exceeded the RTK
+    // processor's configured max_float_prefit_residual_rms_m / _max_m (each
+    // checked only when its configured value is > 0). Set by RTKProcessor;
+    // false for every other producer.
+    bool float_prefit_gate_exceeded = false;
     double rtk_update_post_suppression_residual_rms_m = 0.0;
     double rtk_update_post_suppression_residual_max_m = 0.0;
     double rtk_update_normalized_innovation_squared = 0.0;
     double rtk_update_normalized_innovation_squared_per_observation = 0.0;
     int rtk_update_rejected_by_innovation_gate = 0;
+    // RTK reported-covariance factors (RTKConfig::reported_covariance_mode);
+    // 1.0 when the mode is LEGACY_FIXED_SIGMA or the factor does not apply.
+    double rtk_covariance_variance_factor = 1.0;
+    double rtk_covariance_spp_scale = 1.0;
+    bool rtk_reported_covariance_replaced = false;
+    // Float position of the same epoch (ECEF), computed before ambiguity
+    // resolution, recorded on RTK FIXED solutions only. Read-only metadata for
+    // the --pos-fix-diagnostics .pos columns; nothing in the solver reads it.
+    bool rtk_float_reference_valid = false;
+    Vector3d rtk_float_position_ecef =
+        Vector3d::Constant(std::numeric_limits<double>::quiet_NaN());
     
     // Satellite information
     std::vector<SatelliteId> satellites_used;
@@ -152,12 +174,19 @@ struct PositionSolution {
     }
     
     /**
-     * @brief Get horizontal accuracy (95% confidence)
+     * @brief Position covariance rotated into the local East/North/Up frame at
+     * position_ecef (position_covariance itself is ECEF). All NaN when the
+     * position or its covariance is not finite.
+     */
+    Matrix3d positionCovarianceEnu() const;
+
+    /**
+     * @brief Get horizontal accuracy (95% confidence, from the ENU covariance)
      */
     double getHorizontalAccuracy() const;
     
     /**
-     * @brief Get vertical accuracy (95% confidence)
+     * @brief Get vertical accuracy (95% confidence, from the ENU covariance)
      */
     double getVerticalAccuracy() const;
     
@@ -190,17 +219,6 @@ public:
     void addSolution(const PositionSolution& sol) {
         solutions.push_back(sol);
     }
-    
-    /**
-     * @brief Get solution by time
-     */
-    const PositionSolution* getSolution(const GNSSTime& time) const;
-    
-    /**
-     * @brief Get solutions in time range
-     */
-    std::vector<PositionSolution> getSolutions(const GNSSTime& start, 
-                                             const GNSSTime& end) const;
     
     /**
      * @brief Filter solutions by status
@@ -250,11 +268,6 @@ public:
      * @brief Write solutions to file
      */
     bool writeToFile(const std::string& filename, const std::string& format = "pos") const;
-    
-    /**
-     * @brief Write solutions in NMEA format
-     */
-    bool writeNMEA(const std::string& filename) const;
     
     /**
      * @brief Write solutions in KML format for visualization.
@@ -321,78 +334,6 @@ public:
     const PositionSolution* getLastSolution() const {
         return solutions.empty() ? nullptr : &solutions.back();
     }
-    
-    /**
-     * @brief Remove solutions older than specified time
-     */
-    void removeOldSolutions(const GNSSTime& cutoff_time);
-    
-    /**
-     * @brief Interpolate position at given time
-     */
-    bool interpolatePosition(const GNSSTime& time, 
-                           Vector3d& position, 
-                           Matrix3d& covariance) const;
-    
-    /**
-     * @brief Smooth solutions using post-processing
-     */
-    void applySmoothingFilter(double process_noise = 1.0, double measurement_noise = 1.0);
-    
-    /**
-     * @brief Detect and remove outliers
-     */
-    void removeOutliers(double threshold_sigma = 3.0);
-};
-
-/**
- * @brief Real-time solution monitor
- */
-class SolutionMonitor {
-public:
-    /**
-     * @brief Quality assessment result
-     */
-    struct QualityAssessment {
-        bool position_valid = false;
-        bool velocity_valid = false;
-        bool clock_valid = false;
-        
-        double position_innovation = 0.0;
-        double velocity_innovation = 0.0;
-        double clock_innovation = 0.0;
-        
-        bool geometry_adequate = false;
-        bool convergence_achieved = false;
-        
-        std::string warning_message;
-    };
-    
-    /**
-     * @brief Assess solution quality
-     */
-    QualityAssessment assessQuality(const PositionSolution& solution,
-                                  const PositionSolution* previous_solution = nullptr) const;
-    
-    /**
-     * @brief Check for position jumps
-     */
-    bool detectPositionJump(const PositionSolution& current,
-                          const PositionSolution& previous,
-                          double threshold_meters = 10.0) const;
-    
-    /**
-     * @brief Monitor convergence for PPP
-     */
-    bool checkConvergence(const std::vector<PositionSolution>& recent_solutions,
-                        double horizontal_threshold = 0.1,
-                        double vertical_threshold = 0.2,
-                        size_t min_epochs = 10) const;
-    
-    /**
-     * @brief Generate quality report
-     */
-    std::string generateQualityReport(const Solution& solution) const;
 };
 
 } // namespace libgnss

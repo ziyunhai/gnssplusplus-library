@@ -7,6 +7,7 @@
 #include "nlos_weights.hpp"
 #include "float_trust_policy.hpp"
 #include "rtk_adaptive_noise.hpp"
+#include "rtk_carrier_prior.hpp"
 #include "rtk_float_stabilizer.hpp"
 #include "rtk_cmc_reference.hpp"
 #include "fixed_quality_gate.hpp"
@@ -106,6 +107,39 @@ public:
         bool prefer_trusted_position_seed = false;
         bool prefer_rover_position_seed = false;
 
+        /// velocity_consistency_v8 (k). When true and the latest kinematic
+        /// position re-seed (resetPositionToSPP) took the rover position from
+        /// the final base_position_ fallback -- no rover-header, SPP, last
+        /// fixed, receiver or last-solution position was available -- the
+        /// epoch that would emit a FLOAT from that seed returns through the
+        /// SPP fallback path instead. The filter stays initialised. The
+        /// condition is re-evaluated at every re-seed, so it clears as soon
+        /// as a real position is available. false (default) keeps the
+        /// previous behavior bit-for-bit.
+        bool reject_float_seeded_at_base = false;
+
+        /// Kinematic epochs need an independent single-point solution. When this
+        /// epoch's SPP is unavailable (too few satellites for the per-system
+        /// clock unknowns, GDOP / formal-sigma gate) the DD filter is seeded
+        /// from the previous solution or even the base coordinates and nothing
+        /// bounds it: its position stays wherever it was seeded (error = the
+        /// base-rover distance after a reset, tens to hundreds of metres after
+        /// a bad previous epoch) for as long as SPP stays unavailable. With
+        /// this option the epoch returns through the SPP fallback (no solution)
+        /// instead, as RTKLIB demo5 relpos() does ("point pos error" returns
+        /// without a solution, rtkpos.c). The filter stays initialised. Not
+        /// applied in static or moving-base mode, with use_external_position_prior, or
+        /// when an INS time update seeded this epoch. false restores the
+        /// previous behavior.
+        bool require_spp_for_kinematic_epoch = true;
+
+        /// velocity_consistency_v8 (m). The SPP fallback blanks an SPP
+        /// solution with <= 5 satellites that is > 25 m from the last trusted
+        /// position. When > 0 that rule applies only if the trusted anchor is
+        /// no older than this many seconds (rover time - last trusted time).
+        /// 0 (default) = no age limit, the previous behavior bit-for-bit.
+        double spp_fallback_blank_max_anchor_age_s = 0.0;
+
         /// Propagate the latest trusted position with the most recent
         /// Doppler-derived rover velocity when reseeding a kinematic epoch.
         /// This mirrors the short FLOAT-gap strategy in Fredeluces et al.
@@ -126,6 +160,36 @@ public:
         double snr_reference_dbhz = 45.0;         // No inflation at or above this SNR
         double snr_max_variance_scale = 25.0;     // Clamp low-SNR variance inflation
         double snr_min_baseline_m = 0.0;          // Optional baseline-length floor for SNR weighting
+        /// Measure the C/N0 deficit against an elevation-dependent expectation
+        /// (open-sky typical C/N0 ~ floor + gain * sin(el), capped by
+        /// snr_reference_dbhz) instead of the constant snr_reference_dbhz.
+        /// With the constant reference a low-elevation satellite is penalised
+        /// by C/N0 although its 1/sin^2(el) term already covers it, while a
+        /// zenith-side satellite whose direct signal is blocked (an overpass:
+        /// 48 -> 33 dB-Hz at 66 deg) is not penalised more than the former.
+        /// Precedent: C/N0-based stochastic models (Brunner et al. 1999
+        /// SIGMA-eps, Hartinger & Brunner 1999) and RTKLIB's elevation-binned
+        /// snrmask. Default off, bit-identical when off.
+        bool snr_elevation_aware = false;
+        double snr_elevation_floor_dbhz = 33.0;   // expected C/N0 at the horizon
+        double snr_elevation_gain_dbhz = 15.0;    // added at zenith
+        /// Apply the C/N0 inflation to the code variance only. NLOS/multipath
+        /// corrupts the code (a 10+ m bias at 12-15 dB loss) long before the
+        /// carrier loses lock, so the phase rows keep their weight and the fix
+        /// rate is not traded for code robustness. Default off.
+        bool snr_inflate_code_only = false;
+
+        /// Carrier-propagated position prior for NLOS canyons (opt-in). In a
+        /// kinematic run the position is re-seeded from SPP every epoch, which
+        /// discards the position/ambiguity cross-covariance. While the code of
+        /// a satellite above 45 deg disagrees (> 3 m) with the position
+        /// advanced from the previous posterior by a validated time-differenced
+        /// carrier displacement (code blocked by an overpass, carrier intact), the
+        /// re-seed is replaced by that propagation so code biases cannot define
+        /// the otherwise unobservable ambiguity/position combinations. See
+        /// rtk_carrier_prior.hpp for the constants. Default off, bit-identical
+        /// when off.
+        bool enable_canyon_carrier_prior = false;
 
         /// Innovation-based adaptive measurement variance (Motooka 2026,
         /// NAVIGATION navi.776): per-satellite EWMA of v^2 - HPH' - ref_var
@@ -288,6 +352,33 @@ public:
         /// 0 (default) disables the check — existing behavior preserved.
         double max_hold_divergence_m = 0.0;
 
+        /// Hold-fix fallback (tryHoldFix) only for an unchanged DD pair set.
+        /// When true, the hold is rejected ("unmatched_pairs") if any candidate
+        /// pair has no held integer, so a satellite that joined or an
+        /// ambiguity that was reset is never rounded to keep a FIX.
+        /// false (default) keeps the legacy behavior bit-for-bit: unmatched
+        /// pairs are rounded to the nearest integer and enter the held set.
+        bool hold_fix_unchanged_set_only = false;
+
+        /// Minimum number of DD pairs that must carry a held integer before the
+        /// hold-fix fallback (tryHoldFix) may fix an epoch. Below it the hold is
+        /// rejected ("matched_pairs_below_min"): a small held set has too little
+        /// redundancy to expose a wrong held integer. 4 (default) equals the
+        /// legacy floor ("matched_pairs_lt4", checked first), so the behavior is
+        /// unchanged bit-for-bit; a smaller value has no effect.
+        int hold_fix_min_matched_pairs = 4;
+
+        /// Minimum number of non-reference satellites in the fixed DD set of an
+        /// ambiguity-resolution FIX (full set, subset or WL/NL fallback). Each such
+        /// satellite adds one double-difference direction; fewer than 3 cannot
+        /// determine a 3D position. Below it the AR fix is rejected like a failed
+        /// LAMBDA ("fixed_satellites_below_min"): the epoch stays FLOAT unless the
+        /// hold-fix fallback (tryHoldFix) applies, which this option does not touch.
+        /// The WL/NL fallback keeps its legacy floor of 3 resolved satellites and
+        /// raises it to this value. 0 (default) disables the check, so the behavior
+        /// is unchanged bit-for-bit.
+        int min_fix_satellites = 0;
+
         /// Max AR fix position jump from last fixed position in meters.
         /// Applied in addition to the history-based exceedsFixHistoryJump check.
         /// Default 5.0m: rejects wrong-FIX with implausible position jumps.
@@ -433,6 +524,22 @@ public:
         /// |WL_float - round(WL_float)| < threshold → fix. 0.25 is the worktree
         /// default; only referenced when enable_wide_lane_ar = true.
         double wide_lane_acceptance_threshold = 0.25;
+
+        /// Causal Melbourne-Wubbena arc smoothing for the WL AR pre-step.
+        /// 0 (default) keeps the legacy single-epoch MW test. When > 0, each
+        /// satellite's single-difference MW is averaged over its continuous
+        /// arc (reset on confirmed L1/L2 slips or a gap longer than
+        /// wide_lane_arc_max_gap_s), and a WL integer is only constrained
+        /// once both the reference and the satellite arc hold at least this
+        /// many samples with a stable rounded value. Single-epoch MW carries
+        /// metre-level code noise in urban canyons, so the legacy test admits
+        /// near-random integers as hard constraints.
+        int wide_lane_min_arc_samples = 0;
+        /// Upper bound on the effective averaging window (samples) of the
+        /// WL MW arc; only referenced when wide_lane_min_arc_samples > 0.
+        int wide_lane_arc_max_effective_samples = 100;
+        /// Maximum gap between MW samples before the WL arc restarts.
+        double wide_lane_arc_max_gap_s = 1.0;
 
         /// Enable MW wide-lane / narrow-lane fallback after ordinary LAMBDA
         /// fails for non-IFLC runs. IFLC keeps its historical fallback path.
@@ -688,6 +795,34 @@ public:
         /// / fit-RMS / disagreement safeguards are identical.
         bool enable_fixed_anchor_single_stabilization = false;
 
+        /// Covariance reported on FLOAT PositionSolution::position_covariance.
+        /// LEGACY_FIXED_SIGMA (default) keeps the historical constant
+        /// 0.01 m^2 * I, which is not derived from the filter and is 10^2-10^3
+        /// times too small in FLOAT epochs (docs/rtk_float_covariance.md).
+        /// FILTER_MARGINAL reports the Kalman position marginal after the last
+        /// measurement iteration (the same rows are applied once per
+        /// iteration, so this is over-confident by up to the iteration count).
+        /// FIRST_PASS_SCALED reports the marginal after the first iteration
+        /// (a single application of the epoch's measurements) times the
+        /// innovation variance factor max(1, NIS_per_observation) of that pass.
+        /// SPP_CONSISTENCY_SCALED additionally multiplies by the smallest
+        /// s >= 1 for which the FLOAT-minus-SPP difference d is consistent
+        /// with its own covariance: d' (s*C + C_spp)^-1 d <= 3 (the expected
+        /// value for 3 degrees of freedom). The SPP solution is the one the
+        /// epoch already computes for its divergence gates.
+        /// Every mode changes only the reported covariance: no filter state,
+        /// position, ambiguity or status is modified. FIXED is not changed.
+        enum class ReportedCovarianceMode {
+            LEGACY_FIXED_SIGMA = 0,
+            FILTER_MARGINAL = 1,
+            FIRST_PASS_SCALED = 2,
+            SPP_CONSISTENCY_SCALED = 3
+        };
+        /// Variance (m^2, per axis) of the historical constant covariance.
+        static constexpr double kLegacyReportedVarianceM2 = 0.01;
+        ReportedCovarianceMode reported_covariance_mode =
+            ReportedCovarianceMode::LEGACY_FIXED_SIGMA;
+
         /// M5 measurement-neutral single-difference TDCP-vs-Doppler
         /// diagnostics. No filter row or state mutation is performed.
         bool enable_tdcp_diagnostics = false;
@@ -698,6 +833,24 @@ public:
         /// regularizer; this explicit floor makes that role independently
         /// tunable without destroying cross-covariance.
         double ins_time_update_position_q_floor_m2 = 25.0;
+
+        /// An INS-time-update-seeded float is emitted only if its measurement
+        /// update retained at least this many double-differenced code rows
+        /// after the prefit outlier test. A float built from fewer rows is
+        /// the propagated prior itself: the prefit test zeroes every row once
+        /// the prior has drifted past the absolute residual threshold, the
+        /// update then moves nothing, and the filter keeps integrating the
+        /// INS increment of its own previous posterior (a self-confirming
+        /// dead-reckoning float, tens to hundreds of metres off, with a
+        /// formal sigma that still reads metres). 4 = the 3 position
+        /// unknowns plus one row of redundancy (carrier rows add no absolute
+        /// position information while ambiguities are float). A rejected
+        /// epoch returns through the SPP fallback and the INS prior is
+        /// dropped for the next epoch, which re-seeds from SPP as an epoch
+        /// without a time update does. 0 disables. Only epochs seeded by an
+        /// INS time update are affected; batch and loose-only RTK are
+        /// bit-identical.
+        int ins_prior_min_code_rows = 4;
 
         /// M2 wrong-fix containment: validate a fixed DD integer candidate
         /// using code-minus-carrier consistency before it can be reported,
@@ -798,6 +951,25 @@ public:
         /// low to be a good DD reference). No effect unless
         /// cmc_aware_reference_selection is true.
         double cmc_ref_switch_min_elev_deg = 30.0;
+
+        /// Honour the RINEX/receiver LLI bit1 ("half-cycle ambiguity not
+        /// resolved", 0x02) the way RTKLIB demo5 does:
+        ///   * a clear->set or set->clear transition of the bit on the
+        ///     rover or base observation of one satellite/frequency is a
+        ///     cycle slip for that satellite/frequency only (ambiguity
+        ///     reset),
+        ///   * while the bit is set on either receiver the satellite's
+        ///     phase variance is inflated by half_cycle_phase_variance_m2,
+        ///   * a satellite/frequency whose rover or base LLI has the bit set
+        ///     is excluded from the ambiguity-resolution candidate set.
+        /// Default true (matches RTKLIB demo5). It is a strict no-op on
+        /// data whose LLI never carries bit1 (all PPC Tokyo/Nagoya and
+        /// UrbanNav Odaiba/Shinjuku RINEX), bit-identical to false there; set
+        /// false to use only LLI bit0 as before on flagged data.
+        bool use_half_cycle_lli = true;
+        /// Extra phase variance (m^2) added per receiver-satellite while the
+        /// half-cycle flag is set (demo5 ddres: 0.01).
+        double half_cycle_phase_variance_m2 = 0.01;
     };
 
     /// Phase 2a diagnostics: RTKConfig::cmc_aware_reference_selection
@@ -851,6 +1023,24 @@ public:
     }
 
     struct EpochDebugTelemetry {
+        // velocity_consistency_v8 diagnostics (telemetry only).
+        // reject_float_seeded_at_base routed this epoch to the SPP fallback.
+        // The epoch's kinematic re-seed took the rover position from the final
+        // base_position_ fallback (tracked regardless of the option).
+        bool rover_seed_from_base_fallback = false;
+        bool float_seeded_at_base_rejected = false;
+        // require_spp_for_kinematic_epoch routed this epoch to the SPP fallback.
+        bool spp_unavailable_rejected = false;
+        // The SPP-fallback blanking rule would have fired but the trusted
+        // anchor was older than spp_fallback_blank_max_anchor_age_s.
+        bool spp_blank_age_limited = false;
+        // ins_prior_min_code_rows routed this INS-seeded epoch to the SPP
+        // fallback and dropped the INS prior for the next epoch.
+        bool ins_prior_unsupported_rejected = false;
+        // DD code / carrier rows that survived the prefit outlier test in the
+        // last float update of the epoch (telemetry only).
+        int retained_code_rows = 0;
+        int retained_phase_rows = 0;
         // Optional per-epoch stage timing. These fields are telemetry only;
         // they do not participate in any RTK decision or state update. SPP
         // time is accumulated from PositionSolution::processing_time_ms so
@@ -1427,6 +1617,16 @@ public:
     void setDopplerVelocitySigma(double sigma_mps) { doppler_velocity_sigma_mps_ = sigma_mps; }
     double getDopplerVelocitySigma() const { return doppler_velocity_sigma_mps_; }
 
+    /**
+     * @brief The raw SPP solution the SPP processor computed for the latest
+     * processRTKEpoch()/processEpoch() call (position, status, velocity and
+     * velocity covariance), before any fallback blanking or stabilisation.
+     * Reset to an invalid default solution at the start of every call, so it
+     * never carries a previous epoch's solution. Read-only; has no effect on
+     * the RTK solution.
+     */
+    const PositionSolution& currentSpp() const { return current_spp_solution_; }
+
     void setBasePosition(const Vector3d& base_position) {
         base_position_ = base_position;
         base_position_known_ = true;
@@ -1542,6 +1742,21 @@ public:
         return stats;
     }
 
+    /// RTKConfig::enable_canyon_carrier_prior counters since construction or
+    /// reset(). All zero while the option is off.
+    struct CarrierPriorStats {
+        std::size_t epochs_evaluated = 0;
+        std::size_t tdcp_valid_epochs = 0;
+        std::size_t tdcp_invalid_epochs = 0;
+        std::size_t bridged_epochs = 0;
+        std::size_t engaged_epochs = 0;
+        std::size_t engagements = 0;
+        std::size_t contradictions = 0;
+        std::size_t phase_initialised_ambiguities = 0;
+        bool engaged_last_epoch = false;
+    };
+    CarrierPriorStats getCarrierPriorStats() const { return carrier_prior_stats_; }
+
     /// Return RTK's current FLOAT posterior antenna position/covariance. The
     /// ambiguity-fixed candidate is intentionally not used as the INS anchor.
     bool getFloatPosteriorPosition(Vector3d& position_ecef,
@@ -1570,6 +1785,9 @@ public:
     static int ionoStateIndex(const SatelliteId& sat) { return II(sat); }
 
 private:
+    // White-box unit-test access (defined in tests/test_rtk_legacy.cpp).
+    friend struct RTKProcessorTestAccess;
+
     RTKConfig rtk_config_;
     SPPProcessor spp_processor_;
     EpochDebugTelemetry debug_telemetry_;
@@ -1635,6 +1853,10 @@ private:
     double position_correction_sum_sq_m2_ = 0.0;
     std::size_t ins_time_update_rejected_count_ = 0;
     bool ins_time_update_applied_last_epoch_ = false;
+    // Set when an INS-seeded float was rejected as unsupported by its own
+    // measurements; consumed by the next resetPositionToSPP(), which then
+    // skips the (stale) time update and re-seeds from SPP.
+    bool drop_ins_prior_next_epoch_ = false;
     int consecutive_cp_pr_gate_rejections_ = 0;
     Vector3d last_ddpr_anchor_position_ecef_ = Vector3d::Zero();
     Matrix3d last_ddpr_anchor_covariance_ecef_ = Matrix3d::Zero();
@@ -1754,6 +1976,21 @@ private:
     bool has_last_fixed_time_ = false;
     Vector3d last_solution_position_ = Vector3d::Zero();
     bool has_last_solution_position_ = false;
+    // This epoch's SPP solution, kept for the reported-covariance consistency
+    // scaling only (RTKConfig::reported_covariance_mode). Reset every epoch.
+    Vector3d epoch_spp_position_ecef_ = Vector3d::Zero();
+    Matrix3d epoch_spp_position_covariance_ = Matrix3d::Zero();
+    bool epoch_spp_valid_ = false;
+    // Raw SPP solution of the latest epoch call (see currentSpp()).
+    PositionSolution current_spp_solution_;
+    // True when the latest kinematic re-seed took rover_pos from the final
+    // base_position_ fallback (RTKConfig::reject_float_seeded_at_base).
+    bool rover_seed_from_base_fallback_ = false;
+    // Position marginal and innovation statistic after the first measurement
+    // iteration of this epoch (single application of its measurements).
+    Matrix3d first_pass_position_covariance_ = Matrix3d::Zero();
+    double first_pass_nis_per_observation_ = 0.0;
+    bool has_first_pass_covariance_ = false;
     Vector3d last_trusted_position_ = Vector3d::Zero();
     bool has_last_trusted_position_ = false;
     Vector3d fixed_update_gate_previous_position_ = Vector3d::Zero();
@@ -1872,6 +2109,8 @@ private:
         bool has_l1 = false;
         bool has_l1_doppler = false;
         int l1_lli = 0;
+        int rover_l1_lli = 0;  // per-receiver LLI (l1_lli is rover|base)
+        int base_l1_lli = 0;
         // L2
         double rover_l2_phase = 0.0;
         double rover_l2_code = 0.0;
@@ -1884,6 +2123,8 @@ private:
         bool has_l2 = false;
         bool has_l2_doppler = false;
         int l2_lli = 0;
+        int rover_l2_lli = 0;
+        int base_l2_lli = 0;
         // L5 (Phase 18 — populated when --enable-l5 set; default off, no effect on L1/L2 path)
         double rover_l5_phase = 0.0;
         double rover_l5_code = 0.0;
@@ -1896,6 +2137,18 @@ private:
         bool has_l5 = false;
         bool has_l5_doppler = false;
         int l5_lli = 0;
+        int rover_l5_lli = 0;
+        int base_l5_lli = 0;
+        // Per-receiver LLI accessors by frequency index (0=L1, 1=L2, 2=L5).
+        int roverLli(int freq) const {
+            return freq == 0 ? rover_l1_lli : (freq == 1 ? rover_l2_lli : rover_l5_lli);
+        }
+        int baseLli(int freq) const {
+            return freq == 0 ? base_l1_lli : (freq == 1 ? base_l2_lli : base_l5_lli);
+        }
+        static constexpr int kLliHalfCycle = 0x02;  // RINEX LLI bit1
+        bool roverHalfCycle(int freq) const { return (roverLli(freq) & kLliHalfCycle) != 0; }
+        bool baseHalfCycle(int freq) const { return (baseLli(freq) & kLliHalfCycle) != 0; }
         // Geometry
         Vector3d sat_pos;          // satellite position for rover (RTKLIB satposs from rover PR)
         Vector3d sat_pos_base;     // satellite position for base (RTKLIB satposs from base PR)
@@ -1924,6 +2177,26 @@ private:
     std::map<SatelliteId, double> doppler_phase_history_l1_m_;
     std::map<SatelliteId, double> doppler_phase_history_l2_m_;
     std::map<SatelliteId, double> doppler_phase_history_l5_m_;  // Phase 18 Step 5
+    // Time of the observations the doppler_phase_history_* maps hold. The
+    // Doppler/phase slip test must use the interval between the stored sample
+    // and the current one; the generic state dt (time since the last
+    // *remembered* solution) is larger whenever the previous epoch was
+    // rejected, which turns the receiver-clock-drift term of the
+    // single-difference range rate into a false slip on every satellite.
+    GNSSTime doppler_history_time_;
+    bool has_doppler_history_time_ = false;
+    // Base-epoch time of the same detector call as doppler_history_time_. The
+    // base epoch does not always advance with the rover epoch (an exact-time
+    // base epoch keeps its own measurement time, an interpolated one takes the
+    // rover time), so the single-difference phase change is predicted with the
+    // base's own span. Set, advanced and cleared together with
+    // doppler_history_time_.
+    GNSSTime doppler_history_base_time_;
+    bool has_doppler_history_base_time_ = false;
+    // RTKConfig::use_half_cycle_lli: previous-epoch LLI bit1 per
+    // (satellite, frequency index), {rover, base}. Kept across observation
+    // gaps like demo5's ssat.slip LLI memory; cleared in reset().
+    std::map<std::pair<SatelliteId, int>, std::pair<bool, bool>> half_cycle_lli_history_;
     std::map<SatelliteId, double> code_phase_history_l1_m_;
     std::map<SatelliteId, double> code_phase_history_l2_m_;
     std::map<SatelliteId, double> code_phase_history_l5_m_;  // Phase 18 Step 5
@@ -1931,6 +2204,8 @@ private:
     std::set<SatelliteId> current_epoch_slips_l2_;
     std::set<SatelliteId> current_epoch_slips_l5_;
     causal_ambiguity_arc::Bank l1_l5_mw_arc_bank_;
+    // Per-satellite L1/L2 MW arcs for the opt-in smoothed WL AR pre-step.
+    causal_ambiguity_arc::Bank wide_lane_mw_arc_bank_;
     causal_ambiguity_arc::Bank ambiguity_arc_bank_;
 
     struct TdcpHistory {
@@ -2061,9 +2336,13 @@ private:
                         const NavigationData& nav);
 
     /**
-     * Update SD biases (RTKLIB udbias): initialize new, reset slipped
+     * Update SD biases (RTKLIB udbias): initialize new, reset slipped.
+     * epoch_time / base_epoch_time are the rover and base epoch times of this
+     * call; the Doppler slip test predicts the single-difference phase change
+     * over the span each of them advanced since the previous call.
      */
-    void updateBias(const std::map<SatelliteId, SatelliteData>& sat_data, double dt_s);
+    void updateBias(const std::map<SatelliteId, SatelliteData>& sat_data, double dt_s,
+                    const GNSSTime& epoch_time, const GNSSTime& base_epoch_time);
     void updateTdcpDiagnostics(const std::map<SatelliteId, SatelliteData>& sat_data,
                                double dt_s);
 
@@ -2076,6 +2355,55 @@ private:
      * Kinematic position reset: SPP position with large variance (RTKLIB udpos)
      */
     void resetPositionToSPP(const ObservationData& rover_obs, const NavigationData& nav);
+
+    /**
+     * RTKConfig::enable_canyon_carrier_prior: capture the previous posterior's
+     * position rows before the re-seed, advance them by a TDCP displacement and
+     * restore them instead of the re-seed while the monitor is engaged.
+     */
+    void captureCarrierPriorSnapshot();
+    void applyCarrierPrior(const ObservationData& rover_obs,
+                           const std::map<SatelliteId, SatelliteData>& sat_data);
+    void finishCarrierPriorEpoch(bool filter_ok);
+    /// Phase-based ambiguity (re)initialisation while the prior is engaged:
+    /// the new single-difference ambiguity is the one that makes the
+    /// double-difference carrier residual against an existing, tight ambiguity
+    /// zero at the carrier-propagated position (instead of b = cp - pr / lambda),
+    /// and enters the filter with its exact linear covariance to position and
+    /// the anchor. Returns false (caller uses the code-based seed) when no
+    /// usable anchor exists.
+    bool initializeAmbiguityFromCarrierPrior(
+        const SatelliteId& sat, int freq,
+        const std::map<SatelliteId, SatelliteData>& sat_data);
+
+    // RTKConfig::enable_canyon_carrier_prior runtime (rtk_carrier_prior_epoch.cpp).
+    struct CarrierPriorRuntime {
+        // Posterior position rows of the previous epoch, captured before the
+        // kinematic re-seed overwrites them.
+        bool snapshot_valid = false;
+        Eigen::Vector3d snapshot_baseline = Eigen::Vector3d::Zero();
+        Eigen::MatrixXd snapshot_rows;  // 3 x n: covariance.topRows<3>()
+        // Previous epoch's satellite data / time for the TDCP difference.
+        bool has_previous = false;
+        GNSSTime previous_time;
+        std::map<SatelliteId, SatelliteData> previous_sat_data;
+        // Last validated TDCP velocity (constant-velocity bridge).
+        bool has_velocity = false;
+        Eigen::Vector3d velocity_ecef = Eigen::Vector3d::Zero();
+        GNSSTime velocity_time;
+        // Previous epoch ended with a code/carrier-consistent update.
+        bool previous_healthy = false;
+        // The filter state now held is the posterior of a completed update.
+        bool posterior_valid = false;
+        // Set by applyCarrierPrior for the epoch being processed and kept
+        // until the next applyCarrierPrior call, so the post-update gates of
+        // the same epoch can see it.
+        bool engaged_this_epoch = false;
+        Eigen::Vector3d prior_position_baseline = Eigen::Vector3d::Zero();
+        rtk_carrier_prior::Monitor monitor;
+    };
+    CarrierPriorRuntime carrier_prior_;
+    CarrierPriorStats carrier_prior_stats_;
 
     /**
      * Reset ambiguity states after N consecutive float epochs (experimental gate).
@@ -2210,14 +2538,14 @@ private:
                                         SatelliteId& ref_sat) const;
     std::vector<rtk_selection::SatelliteSelectionData> buildSelectionSnapshot(
         const std::map<SatelliteId, SatelliteData>& sat_data) const;
+    // exclude_half_cycle: ambiguity-resolution callers pass true so that
+    // satellite/frequencies flagged half-cycle-unresolved (RTKConfig::
+    // use_half_cycle_lli) are dropped from the candidate set and reference
+    // choice. No effect when that option is off.
     std::vector<DDPair> buildDoubleDifferencePairs(
         const std::map<SatelliteId, SatelliteData>& sat_data,
-        int min_lock_count) const;
-
-    /**
-     * Expand state vector to accommodate new states
-     */
-    void expandState(int new_size);
+        int min_lock_count,
+        bool exclude_half_cycle = false) const;
 
     /**
      * Remove satellite from state
@@ -2276,7 +2604,6 @@ private:
                                    const VectorXd& float_ambiguities,
                                    const MatrixXd& covariance,
                                    double ratio);
-    void updateAmbiguityStates(const std::vector<DoubleDifference>& double_diffs);
     Vector3d calculateBaseline() const;
     VectorXd calculateResiduals(const std::vector<DoubleDifference>& measurements,
                               const Vector3d& baseline) const;
@@ -2285,28 +2612,10 @@ private:
                                  const GNSSTime& time) const;
     MatrixXd calculateMeasurementWeights(const std::vector<DoubleDifference>& measurements) const;
     bool hasSufficientSatellites(const std::vector<DoubleDifference>& measurements) const;
-    void resetAmbiguity(const SatelliteId& satellite, SignalType signal);
     bool applyFixedAmbiguities(const VectorXd& fixed_n1,
                                const VectorXd& fixed_n2,
                                const std::map<SatelliteId, SatelliteData>& sat_data);
     void solvePositionWithAmbiguities(const std::map<SatelliteId, SatelliteData>& sat_data);
-    bool trySingleEpochAR(const std::map<SatelliteId, SatelliteData>& sat_data);
-    double elevationWeight(double elevation) const;
 };
-
-namespace rtk_utils {
-    double calculateIonosphereFree(double l1_measurement, double l2_measurement,
-                                 double f1, double f2);
-    double calculateWideLane(double l1_phase, double l2_phase,
-                           double l1_range, double l2_range,
-                           double f1, double f2);
-    double calculateNarrowLane(double l1_phase, double l2_phase, double f1, double f2);
-    MatrixXd decorrelateMatrix(const MatrixXd& covariance);
-    VectorXd integerLeastSquares(const VectorXd& float_solution,
-                               const MatrixXd& covariance_matrix);
-    double calculateBaselineLength(const Vector3d& baseline);
-    bool checkBaselineConstraints(const Vector3d& baseline,
-                                double min_length, double max_length);
-}
 
 } // namespace libgnss

@@ -208,6 +208,10 @@ private:
     bool preserve_additional_frequency_bands_ = false;
     bool source_header_tracking_filter_ = false;
     bool last_rinex4_epoch_was_event_ = false;
+    // Set by parseObservationEpochV2 when the record just consumed was a
+    // RINEX 2.x event/special record (epoch flags 2-6) rather than an
+    // observation epoch; readObservationEpoch then keeps scanning.
+    bool last_rinex2_epoch_was_event_ = false;
     rinex4::SystemData rinex4_system_data_;
 
     // State for parsing RINEX 3/4 "SYS / # / OBS TYPES" records that span
@@ -224,8 +228,17 @@ private:
     
     /**
      * @brief Parse observation epoch (RINEX 2.x)
+     *
+     * Handles the fixed-width 2.x epoch record: continuation satellite lines
+     * (12 satellites per line), the 'G'/'R'/'E'/'S'/'J'/'C' system letters
+     * (blank = GPS; unknown letters are consumed but dropped) and epoch
+     * flags 2-6 (special records / cycle-slip records are consumed and never
+     * emitted as observations).
      */
     bool parseObservationEpochV2(const std::string& line, ObservationData& obs_data);
+
+    /// Read one line and strip a trailing '\r' (RINEX 2.x CRLF files).
+    bool readLineStripCr(std::string& line);
     
     /**
      * @brief Parse observation epoch (RINEX 3.x)
@@ -274,31 +287,56 @@ private:
     SatelliteId parseSatelliteId(const std::string& sat_str, double version);
     
     /**
-     * @brief Parse observation value
-     */
-    bool parseObservationValue(const std::string& obs_str, Observation& obs);
-    
-    /**
-     * @brief Skip to next epoch
-     */
-    bool skipToNextEpoch();
-    
-    /**
      * @brief Read line from file
      */
     bool readLine(std::string& line);
 };
 
 /**
+ * @brief Canonical RINEX 3 tracking code ("1C", "2X", ...) used by the writer
+ * when an observation does not carry its own tracking code.
+ *
+ * The result is the inverse of the reader's SignalType mapping, so the code
+ * written for a signal reads back as the same SignalType wherever the
+ * reader can tell the signals apart.  Per band the attribute follows the
+ * RTKLIB/convbin convention for a signal whose exact tracking mode is not
+ * known: "C" for civil C/A codes, "X" for combined data+pilot signals and
+ * "I" for BeiDou B1I/B2I/B3I.  Returns an empty string when the
+ * (system, signal) pair has no RINEX representation.
+ */
+std::string defaultRinexTrackingCode(GNSSSystem system, SignalType signal);
+
+/**
  * @brief RINEX file writer
+ *
+ * Observation files are written as RINEX 3.04 mixed ("M") files.  The
+ * SYS / # / OBS TYPES header, TIME OF FIRST OBS and GLONASS SLOT / FRQ # can
+ * only be known once all epochs have been seen, so createObservationFile()
+ * opens (and truncates) the file but writeObservationEpoch() only buffers a
+ * compact copy of each epoch.  The complete file - header followed by the
+ * epochs, sorted by time - is written by close() (also called by the
+ * destructor) and, for long or live recordings, snapshotted periodically
+ * (see setCheckpointInterval()).  Epochs with identical timestamps are
+ * merged, so the per-system epochs of an RTCM MSM stream end up as one RINEX
+ * epoch.
+ *
+ * Navigation files are written immediately, message by message.
  */
 class RINEXWriter {
 public:
-    RINEXWriter() = default;
-    ~RINEXWriter() = default;
+    RINEXWriter();
+    ~RINEXWriter();
+    RINEXWriter(const RINEXWriter&) = delete;
+    RINEXWriter& operator=(const RINEXWriter&) = delete;
     
     /**
      * @brief Create observation file
+     *
+     * Only descriptive header fields are used (program, run_by, date,
+     * marker, observer, agency, receiver, antenna, approximate position,
+     * antenna delta, interval and GLONASS frequency channels).  Observation
+     * types and the time of the first observation are derived from the
+     * epochs passed to writeObservationEpoch().
      */
     bool createObservationFile(const std::string& filename,
                              const RINEXReader::RINEXHeader& header);
@@ -308,9 +346,21 @@ public:
      */
     bool createNavigationFile(const std::string& filename,
                             const RINEXReader::RINEXHeader& header);
+
+    /**
+     * @brief Create navigation file with a GPS Klobuchar set in the header
+     *
+     * Writes the `GPSA` / `GPSB` IONOSPHERIC CORR lines (RINEX 3, 4 x E12.4)
+     * when `klobuchar.valid`; otherwise identical to the two-argument overload.
+     */
+    bool createNavigationFile(const std::string& filename,
+                            const RINEXReader::RINEXHeader& header,
+                            const IonosphereModel& klobuchar);
     
     /**
      * @brief Write observation epoch
+     *
+     * Buffers the epoch; nothing reaches the file until close().
      */
     bool writeObservationEpoch(const ObservationData& obs_data);
     
@@ -320,13 +370,32 @@ public:
     bool writeNavigationMessage(const Ephemeris& eph);
     
     /**
-     * @brief Close file
+     * @brief Seconds between on-disk snapshots of the buffered observation file
+     * (default 5; negative disables; 0 snapshots after every epoch).
+     *
+     * A snapshot rewrites the complete file atomically (<file>.tmp then
+     * rename), so an interrupted live conversion still leaves a valid RINEX
+     * file holding everything up to the last snapshot.  The effective
+     * interval backs off to at least 20x the time a snapshot takes, which
+     * bounds the overhead for long recordings.  Call before
+     * createObservationFile() or at any time afterwards.
      */
-    void close();
+    void setCheckpointInterval(double seconds);
+
+    /**
+     * @brief Finish the file (writes the buffered observation file) and
+     * close it.  Returns false if the file could not be written completely.
+     */
+    bool close();
 
 private:
+    struct ObservationBuffer;
+
     std::ofstream file_;
     RINEXReader::RINEXHeader header_;
+    IonosphereModel header_klobuchar_;
+    std::unique_ptr<ObservationBuffer> observation_buffer_;
+    double checkpoint_interval_s_ = 5.0;
     
     /**
      * @brief Write header
@@ -342,80 +411,7 @@ private:
      * @brief Format satellite ID
      */
     std::string formatSatelliteId(const SatelliteId& sat, double version);
-    
-    /**
-     * @brief Format observation value
-     */
-    std::string formatObservationValue(const Observation& obs);
 };
-
-/**
- * @brief RINEX utility functions
- */
-namespace rinex_utils {
-    
-    /**
-     * @brief Detect RINEX file type
-     */
-    RINEXReader::FileType detectFileType(const std::string& filename);
-    
-    /**
-     * @brief Get RINEX version from file
-     */
-    double getVersion(const std::string& filename);
-    
-    /**
-     * @brief Convert observation type string to SignalType
-     */
-    SignalType stringToSignalType(const std::string& obs_type, GNSSSystem system);
-    
-    /**
-     * @brief Convert SignalType to observation type string
-     */
-    std::string signalTypeToString(SignalType signal, GNSSSystem system, double version);
-    
-    /**
-     * @brief Validate RINEX filename
-     */
-    bool validateFilename(const std::string& filename);
-    
-    /**
-     * @brief Generate RINEX filename
-     */
-    std::string generateFilename(const std::string& station,
-                               const GNSSTime& time,
-                               RINEXReader::FileType type,
-                               double version = 3.0);
-    
-    /**
-     * @brief Merge RINEX observation files
-     */
-    bool mergeObservationFiles(const std::vector<std::string>& input_files,
-                             const std::string& output_file);
-    
-    /**
-     * @brief Split RINEX file by time
-     */
-    bool splitFileByTime(const std::string& input_file,
-                       const std::string& output_prefix,
-                       double interval_hours);
-    
-    /**
-     * @brief Quality check RINEX file
-     */
-    struct QualityReport {
-        bool valid_header = false;
-        bool valid_data = false;
-        size_t total_epochs = 0;
-        size_t valid_epochs = 0;
-        size_t total_observations = 0;
-        size_t valid_observations = 0;
-        std::vector<std::string> warnings;
-        std::vector<std::string> errors;
-    };
-    
-    QualityReport checkQuality(const std::string& filename);
-}
 
 } // namespace io
 } // namespace libgnss

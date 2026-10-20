@@ -1,9 +1,11 @@
 #pragma once
 
+#include <atomic>
 #include <string>
 #include <vector>
 #include <map>
 #include <memory>
+#include <optional>
 #include "../core/observation.hpp"
 #include "../core/navigation.hpp"
 
@@ -33,6 +35,10 @@ enum class RTCMMessageType : uint16_t {
     RTCM_1019 = 1019,  ///< GPS ephemeris
     RTCM_1020 = 1020,  ///< GLONASS ephemeris
     RTCM_1033 = 1033,  ///< Receiver and antenna descriptors
+    RTCM_1042 = 1042,  ///< BeiDou ephemeris
+    RTCM_1044 = 1044,  ///< QZSS ephemeris
+    RTCM_1045 = 1045,  ///< Galileo F/NAV ephemeris
+    RTCM_1046 = 1046,  ///< Galileo I/NAV ephemeris
     RTCM_1057 = 1057,  ///< GPS SSR orbit correction
     RTCM_1058 = 1058,  ///< GPS SSR clock correction
     RTCM_1059 = 1059,  ///< GPS SSR code bias
@@ -57,6 +63,10 @@ enum class RTCMMessageType : uint16_t {
     RTCM_1095 = 1095,  ///< Galileo MSM5
     RTCM_1096 = 1096,  ///< Galileo MSM6
     RTCM_1097 = 1097,  ///< Galileo MSM7
+    RTCM_1114 = 1114,  ///< QZSS MSM4
+    RTCM_1115 = 1115,  ///< QZSS MSM5
+    RTCM_1116 = 1116,  ///< QZSS MSM6
+    RTCM_1117 = 1117,  ///< QZSS MSM7
     RTCM_1240 = 1240,  ///< Galileo SSR orbit correction
     RTCM_1241 = 1241,  ///< Galileo SSR clock correction
     RTCM_1242 = 1242,  ///< Galileo SSR code bias
@@ -78,7 +88,11 @@ enum class RTCMMessageType : uint16_t {
     RTCM_1124 = 1124,  ///< BeiDou MSM4
     RTCM_1125 = 1125,  ///< BeiDou MSM5
     RTCM_1126 = 1126,  ///< BeiDou MSM6
-    RTCM_1127 = 1127   ///< BeiDou MSM7
+    RTCM_1127 = 1127,  ///< BeiDou MSM7
+    RTCM_1134 = 1134,  ///< NavIC (IRNSS) MSM4
+    RTCM_1135 = 1135,  ///< NavIC (IRNSS) MSM5
+    RTCM_1136 = 1136,  ///< NavIC (IRNSS) MSM6
+    RTCM_1137 = 1137   ///< NavIC (IRNSS) MSM7
 };
 
 /**
@@ -139,6 +153,10 @@ public:
      * @brief Clear internal state like reference position
      */
     void clear();
+
+    /** Explicit GPST context for truncated RTCM week/day fields. When unset,
+     * legacy decoding continues to use the host clock. */
+    void setReferenceTime(const GNSSTime& time);
     
     /**
      * @brief Decode RTCM data stream
@@ -153,15 +171,25 @@ public:
      * @brief Encode observation data to RTCM
      * @param obs_data Observation data to encode
      * @param message_type RTCM message type to use
+     * @param more_follows Value of the MSM multiple-message bit (legacy 1003/1004:
+     *        synchronous GNSS flag): true when further observation messages of the
+     *        same epoch follow. Default false keeps the historical output.
      * @return Encoded RTCM message
      */
     RTCMMessage encodeObservations(const ObservationData& obs_data,
-                                 RTCMMessageType message_type = RTCMMessageType::RTCM_1004);
+                                 RTCMMessageType message_type = RTCMMessageType::RTCM_1004,
+                                 bool more_follows = false);
     
     /**
      * @brief Encode ephemeris to RTCM
+     *
+     * GPS -> 1019, GLONASS -> 1020, Galileo -> 1045 (F/NAV) or 1046 (I/NAV),
+     * BeiDou -> 1042, QZSS -> 1044. The Galileo message follows the record's
+     * navigation message type, or its RINEX data-source word; a record whose
+     * type cannot be determined is not encoded.
      * @param ephemeris Ephemeris data to encode
-     * @return Encoded RTCM message
+     * @return Encoded RTCM message; an invalid (default) message when the
+     *         record is unsupported or a field does not fit its RTCM range
      */
     RTCMMessage encodeEphemeris(const Ephemeris& ephemeris);
     
@@ -204,6 +232,14 @@ public:
     bool decodeObservationData(const RTCMMessage& message, ObservationData& obs_data);
 
     /**
+     * @brief Multiple-message bit of the last observation message passed to
+     *        decodeObservationData (MSM multiple message bit; legacy 1003/1004
+     *        synchronous GNSS flag). True means more messages of the same epoch
+     *        follow. Reset to false at the start of every decode call.
+     */
+    bool lastObservationMoreFollows() const { return last_observation_more_follows_; }
+
+    /**
      * @brief Decode an RTCM ephemeris payload into NavigationData
      */
     bool decodeNavigationData(const RTCMMessage& message, NavigationData& nav_data);
@@ -234,10 +270,12 @@ public:
     void resetStats() { stats_ = RTCMStats{}; }
 
 private:
+    std::optional<GNSSTime> reference_time_;
     Vector3d reference_position_;
     bool has_reference_position_ = false;
     RTCMStats stats_;
     std::map<SatelliteId, int> glonass_frequency_channels_;
+    bool last_observation_more_follows_ = false;
     
     // Internal decoding functions
     bool decodeObservationMessage(const RTCMMessage& message, ObservationData& obs_data);
@@ -248,7 +286,6 @@ private:
     
     // Bit manipulation utilities
     int64_t getBits(const uint8_t* data, size_t data_size, int bit_pos, int num_bits);
-    void setBits(uint8_t* data, int pos, int len, uint32_t value);
     
     // Message parsing utilities
     bool parseHeader(const uint8_t* data, RTCMMessageType& type, uint16_t& length);
@@ -293,11 +330,48 @@ public:
     RTCMProcessor::RTCMStats getStats() const;
 
     bool isNtripSource() const { return ntrip_client_ != nullptr; }
+    /// True when the source was opened as tcp://host:port.
+    bool isTcpStream() const;
+    /**
+     * @brief Re-establish dropped NTRIP or tcp:// connections.
+     *
+     * NTRIP reconnects inside NTRIPClient (one attempt per readMessage call). For tcp:// the
+     * reader closes the dead socket, waits @p delay_ms and connects again; readMessage()
+     * returns false while the peer is unreachable, and the caller keeps calling it. Has no
+     * effect on file and serial sources.
+     */
     void setAutoReconnect(bool enabled, int delay_ms = 2000);
     int reconnectCount() const;
+    /**
+     * @brief Opt-in stall watchdog for tcp:// and serial/device sources (0 = off, the default).
+     *
+     * With @p timeout_ms > 0 readMessage() polls the descriptor for readability before each
+     * read(). If no byte arrives for @p timeout_ms the source is stalled: stallCount() is
+     * incremented, lastReadStalled() is true, and readMessage() returns false. A tcp:// source
+     * with setAutoReconnect(true) also closes the socket and reconnects (the stall counts as a
+     * failed read for the caller); otherwise the caller sees an end of stream. NTRIP sources
+     * keep their own select() timeout and file sources are unaffected.
+     */
+    void setStallTimeoutMs(int timeout_ms);
+    int stallCount() const { return stall_count_; }
+    /// True when the most recent readMessage() call returned false because of a stall.
+    bool lastReadStalled() const { return last_read_stalled_; }
     bool isConnected() const;
     std::string lastError() const;
     const std::string& source() const { return source_; }
+    /// True for a tcp://, ntrip:// or serial/device source (a live stream that can go quiet).
+    bool isLiveStream() const;
+    /**
+     * @brief Let another thread end a blocking readMessage() (opt-in, default off).
+     *
+     * With @p enabled the tcp:// and serial/device waits for data (and the reconnect delay)
+     * are done in short poll() slices that check requestAbort(). Once an abort is requested
+     * readMessage() returns false without touching the stall counters. NTRIP sources keep
+     * their own bounded select() timeout. Only the thread that calls readMessage() may use
+     * the other members; requestAbort() is the one call that is safe from any thread.
+     */
+    void setAbortable(bool enabled) { abortable_ = enabled; }
+    void requestAbort() { abort_requested_.store(true); }
 
 private:
     RTCMProcessor processor_;
@@ -308,6 +382,16 @@ private:
     NTRIPClient* ntrip_client_ = nullptr;
     int serial_fd_ = -1;
     int tcp_fd_ = -1;
+    bool auto_reconnect_ = false;
+    int reconnect_delay_ms_ = 2000;
+    int tcp_reconnect_count_ = 0;
+    int stall_timeout_ms_ = 0;
+    int stall_count_ = 0;
+    bool last_read_stalled_ = false;
+    bool abortable_ = false;
+    std::atomic<bool> abort_requested_{false};
+    std::string tcp_last_error_;
+    bool reconnectTcp();
     
     // Stream-specific implementations would go here
     bool readFromFile(const std::string& filename);
@@ -315,6 +399,25 @@ private:
     bool readFromSerial(const std::string& source);
     bool readFromTcp(const std::string& source);
 };
+
+/**
+ * @brief Wait up to @p timeout_ms for @p fd to become readable (poll(2), EINTR-safe).
+ * @return 1 when readable (or hung up / errored, so the next read() reports it), 0 on timeout,
+ *         -1 on a poll failure. Always 1 on platforms without poll().
+ */
+int waitForReadable(int fd, int timeout_ms);
+
+/**
+ * @brief Merge the GPS (1019) and Galileo (1045/1046) broadcast ephemerides
+ * carried in an RTCM source into @p nav, skipping records already present.
+ *
+ * SSR streams such as the Galileo HAS IDD interleave the ephemerides their
+ * corrections refer to; a RINEX navigation file converted from the same
+ * stream usually keeps only the last record per satellite. GLONASS 1020 is
+ * not merged because its time tag is resolved against the wall clock.
+ * @return number of ephemerides added
+ */
+size_t mergeRTCMEphemerides(const std::string& source, NavigationData& nav);
 
 /**
  * @brief RTCM utility functions

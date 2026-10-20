@@ -181,7 +181,7 @@ bool RTKProcessor::resolveAmbiguities() {
     const auto& sat_data = current_sat_data_;
 
     const int min_lock = std::max(1, rtk_config_.min_lock_count);
-    return resolveAmbiguities(buildDoubleDifferencePairs(sat_data, min_lock));
+    return resolveAmbiguities(buildDoubleDifferencePairs(sat_data, min_lock, true));
 }
 
 void RTKProcessor::tryWlNlFallback(int na,
@@ -259,7 +259,9 @@ void RTKProcessor::tryWlNlFallback(int na,
             wl_ok++;
         }
 
-        if (wl_ok >= 3) {
+        // 3 is the legacy floor; min_fix_satellites can only raise it. The check
+        // runs before any state is written, so a refused fallback leaves no trace.
+        if (wl_ok >= std::max(3, rtk_config_.min_fix_satellites)) {
             // Use resolved pairs for position
             std::vector<int> resolved(
                 wlnl_fixed_indices.begin(), wlnl_fixed_indices.end());
@@ -1198,6 +1200,42 @@ bool RTKProcessor::resolveAmbiguities(std::vector<DDPair> dd_pairs) {
     if (rtk_config_.enable_wide_lane_ar) {
         const double wide_lane_threshold =
             std::max(0.0, rtk_config_.wide_lane_acceptance_threshold);
+        // Opt-in causal MW arc smoothing: update every dual-frequency
+        // satellite's single-difference MW arc once per epoch, then form the
+        // DD WL float from the smoothed arcs instead of one noisy epoch.
+        const bool smooth_wide_lane = rtk_config_.wide_lane_min_arc_samples > 0;
+        std::map<SatelliteId, causal_ambiguity_arc::Result> wide_lane_arcs;
+        if (smooth_wide_lane) {
+            constexpr int kL1L2WideLaneArcId = 12;
+            const double time_s =
+                static_cast<double>(current_epoch_time_.week) * 604800.0 +
+                current_epoch_time_.tow;
+            for (const auto& [sat, data] : sat_data) {
+                if (sat.system == GNSSSystem::GLONASS ||
+                    !data.has_l1 || !data.has_l2) {
+                    continue;
+                }
+                const double f1 = data.l1_frequency_hz;
+                const double f2 = data.l2_frequency_hz;
+                const double lambda_wl_m = wideLaneWavelength(f1, f2);
+                if (f1 <= 0.0 || f2 <= 0.0 || lambda_wl_m <= 0.0) {
+                    continue;
+                }
+                const double phi1_m =
+                    (data.rover_l1_phase - data.base_l1_phase) * data.l1_wavelength;
+                const double phi2_m =
+                    (data.rover_l2_phase - data.base_l2_phase) * data.l2_wavelength;
+                const double code_term =
+                    (f1 * (data.rover_l1_code - data.base_l1_code) +
+                     f2 * (data.rover_l2_code - data.base_l2_code)) / (f1 + f2);
+                const double sd_mw =
+                    ((f1 * phi1_m - f2 * phi2_m) / (f1 - f2) - code_term) / lambda_wl_m;
+                const bool slip = current_epoch_slips_l1_.count(sat) > 0 ||
+                                  current_epoch_slips_l2_.count(sat) > 0;
+                wide_lane_arcs[sat] = wide_lane_mw_arc_bank_.updateSignal(
+                    sat, kL1L2WideLaneArcId, time_s, sd_mw, slip);
+            }
+        }
         for (int i = 0; i < nb; ++i) {
             if (dd_pairs[i].freq != 0 || dd_pairs[i].ref_sat.system == GNSSSystem::GLONASS) {
                 continue;
@@ -1219,6 +1257,23 @@ bool RTKProcessor::resolveAmbiguities(std::vector<DDPair> dd_pairs) {
             double wide_lane_float = 0.0;
             if (!compute_wide_lane_float(i, l2_pair, wide_lane_float)) {
                 continue;
+            }
+            if (smooth_wide_lane) {
+                const auto ref_arc = wide_lane_arcs.find(dd_pairs[i].ref_sat);
+                const auto sat_arc = wide_lane_arcs.find(dd_pairs[i].sat);
+                // Arc length only: the SD MW carries a non-integer receiver
+                // WL bias, so the bank's SD rounding-stability flag is not
+                // meaningful here; integer closeness is tested on the DD.
+                const int min_samples = rtk_config_.wide_lane_min_arc_samples;
+                if (ref_arc == wide_lane_arcs.end() || sat_arc == wide_lane_arcs.end() ||
+                    !ref_arc->second.valid || !sat_arc->second.valid ||
+                    ref_arc->second.samples < min_samples ||
+                    sat_arc->second.samples < min_samples) {
+                    wide_lane_rejected++;
+                    continue;
+                }
+                wide_lane_float =
+                    ref_arc->second.smoothed_value - sat_arc->second.smoothed_value;
             }
             const double fixed_integer = std::round(wide_lane_float);
             const double wl_distance = distanceToNearestInteger(wide_lane_float);
@@ -2385,6 +2440,16 @@ bool RTKProcessor::finishAmbiguityResolution(
         if (debug_telemetry_.ar_skip_reason == ARSkipReason::NONE) {
             debug_telemetry_.ar_skip_reason = ARSkipReason::LAMBDA_FAILED;
         }
+        return false;
+    }
+    if (rtk_config_.min_fix_satellites > 0 &&
+        selected_diversity.distinct_sats < rtk_config_.min_fix_satellites) {
+        // Opt-in: too few double-difference directions to trust the fixed position.
+        // distinct_sats counts the non-reference satellites of the selected pairs
+        // (all frequencies of a satellite count once).
+        debug_telemetry_.selected_fixed = false;
+        debug_telemetry_.reject_reason = "fixed_satellites_below_min";
+        has_fixed_solution_ = false;
         return false;
     }
     debug_telemetry_.selected_fixed = true;

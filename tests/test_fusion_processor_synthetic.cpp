@@ -2,8 +2,10 @@
 
 #include <libgnss++/fusion/fusion_processor.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
+#include <memory>
 #include <vector>
 
 #include <libgnss++/core/coordinates.hpp>
@@ -961,6 +963,672 @@ TEST(FusionProcessorSyntheticTest, DetectsAndFlagsAConsistentButWrongInitialHead
         << "isHeadingConverged() never flagged the wrong latch as unhealthy -- the replacement for "
            "the old always-yes 'Heading aligned' printout is not doing its job";
     EXPECT_TRUE(recovered_once) << "processor never re-inflated yaw covariance via velocity NIS";
+}
+
+// velocity_consistency_v2: lockout-proof recovery of the precise-class
+// position gate. Shared harness: zero lever arm so antenna == IMU position.
+class FloatGateRecoveryHarness {
+public:
+    explicit FloatGateRecoveryHarness(int reanchor_after, double gap_reanchor_s = 0.0,
+                                      bool require_prefit_gate_pass = false) {
+        config_.align_static_window_s = 0.1;
+        config_.zupt_enable = false;
+        config_.nhc_enable = false;
+        config_.lever_arm_body.setZero();
+        config_.max_position_update_nis_per_observation = 9.0;
+        config_.max_consecutive_gate_rejections = 0;  // existing FIXED path off
+        config_.float_position_reanchor_after_rejections = reanchor_after;
+        config_.position_reanchor_after_gnss_gap_s = gap_reanchor_s;
+        config_.reanchor_requires_prefit_gate_pass = require_prefit_gate_pass;
+        processor_ = std::make_unique<LooseCouplingProcessor>(config_);
+        for (int i = 0; i < 20; ++i) {
+            ImuSample sample;
+            sample.time = time_;
+            sample.accel_raw = Eigen::Vector3d(0.0, 0.0, kGravity);
+            sample.gyro_raw_radps.setZero();
+            processor_->processImuSample(sample);
+            time_ = time_ + kDt;
+        }
+        origin_ecef_ = geodetic2ecef(35.6 * M_PI / 180.0, 139.7 * M_PI / 180.0, 50.0);
+        // Origin-setting coarse epoch at the state position.
+        send(SolutionStatus::SPP, Eigen::Vector3d::Zero(), 5.0);
+    }
+    // ENU antenna offset from the origin -> solution of the given class.
+    void send(SolutionStatus status, const Eigen::Vector3d& enu, double sigma_m,
+              bool prefit_gate_exceeded = false) {
+        time_ = time_ + 0.2;
+        PositionSolution solution;
+        solution.float_prefit_gate_exceeded = prefit_gate_exceeded;
+        solution.time = time_;
+        solution.status = status;
+        solution.num_satellites = 10;
+        solution.position_covariance = sigma_m * sigma_m * Eigen::Matrix3d::Identity();
+        const Eigen::Matrix3d enu_to_ecef = rotationOrIdentity().transpose();
+        solution.position_ecef = origin_ecef_ + enu_to_ecef * enu;
+        processor_->processGnssSolution(solution);
+    }
+    void skip(double seconds) { time_ = time_ + seconds; }
+    LooseCouplingProcessor& processor() { return *processor_; }
+    Eigen::Vector3d antennaEnu() const { return processor_->state().nominal.position_enu; }
+
+private:
+    Eigen::Matrix3d rotationOrIdentity() const {
+        return processor_ ? processor_->ecefToLocalEnuRotation() : Eigen::Matrix3d::Identity();
+    }
+    LooseCouplingProcessor::Config config_;
+    std::unique_ptr<LooseCouplingProcessor> processor_;
+    GNSSTime time_{2200, 100000.0};
+    Eigen::Vector3d origin_ecef_ = Eigen::Vector3d::Zero();
+};
+
+TEST(FusionProcessorSyntheticTest, FloatGateRecoveryDefaultsOffAndKeepsFloatRejected) {
+    EXPECT_EQ(LooseCouplingProcessor::Config().float_position_reanchor_after_rejections, 0);
+    FloatGateRecoveryHarness h(0);
+    ASSERT_TRUE(h.processor().isOriginSet());
+    for (int i = 0; i < 8; ++i) {
+        h.send(SolutionStatus::SPP, Eigen::Vector3d(12.0, 0.0, 0.0), 5.0);
+        h.send(SolutionStatus::FLOAT, Eigen::Vector3d(25.0, 0.0, 0.0), 0.1);
+        EXPECT_FALSE(h.processor().lastGnssPositionUpdateApplied()) << i;
+        EXPECT_FALSE(h.processor().lastGnssPositionReanchored()) << i;
+    }
+}
+
+TEST(FusionProcessorSyntheticTest, FloatGateRecoveryReanchorsDespiteInterleavedCoarseAcceptance) {
+    FloatGateRecoveryHarness h(3);
+    ASSERT_TRUE(h.processor().isOriginSet());
+    const Eigen::Vector3d float_enu(25.0, 0.0, 0.0);
+    for (int i = 0; i < 2; ++i) {
+        h.send(SolutionStatus::SPP, Eigen::Vector3d(12.0, 0.0, 0.0), 5.0);
+        // The coarse update is accepted and resets the shared streak counter,
+        // which is exactly what starves the existing recovery.
+        EXPECT_TRUE(h.processor().lastGnssPositionUpdateApplied());
+        h.send(SolutionStatus::FLOAT, float_enu, 0.1);
+        EXPECT_FALSE(h.processor().lastGnssPositionUpdateApplied()) << i;
+        EXPECT_FALSE(h.processor().lastGnssPositionReanchored()) << i;
+    }
+    const auto before = h.processor().state();
+    h.send(SolutionStatus::SPP, Eigen::Vector3d(12.0, 0.0, 0.0), 5.0);
+    const Eigen::Vector3d attitude_before_vel = h.processor().state().nominal.velocity_enu;
+    const Eigen::Quaterniond attitude_before = h.processor().state().nominal.attitude_body_to_enu;
+    const Eigen::Vector3d gyro_before = h.processor().state().nominal.gyro_bias;
+    h.send(SolutionStatus::FLOAT, float_enu, 0.1);
+    EXPECT_TRUE(h.processor().lastGnssPositionReanchored());
+    EXPECT_TRUE(h.processor().lastGnssPositionUpdateApplied());
+    EXPECT_NEAR((h.antennaEnu() - float_enu).norm(), 0.0, 1e-6);
+    // Position only: velocity, attitude and biases untouched, position
+    // cross-covariances cleared, position covariance = GNSS covariance.
+    EXPECT_TRUE(h.processor().state().nominal.velocity_enu.isApprox(attitude_before_vel, 1e-12));
+    EXPECT_TRUE(h.processor().state().nominal.attitude_body_to_enu.isApprox(attitude_before, 1e-12));
+    EXPECT_TRUE(h.processor().state().nominal.gyro_bias.isApprox(gyro_before, 1e-12));
+    const auto& cov = h.processor().state().covariance;
+    constexpr int p = fusion_index::POSITION;
+    const double cross_norm = cov.block<3, 12>(p, 3).norm();
+    const double position_variance = cov(p, p);
+    EXPECT_NEAR(cross_norm, 0.0, 1e-12);
+    EXPECT_NEAR(position_variance, 0.01, 0.01);
+    (void)before;
+    // Counter restarted: the next rejected FLOAT does not re-anchor again
+    // (state is now at the FLOAT position, so move the FLOAT away again).
+    h.send(SolutionStatus::SPP, float_enu, 5.0);
+    h.send(SolutionStatus::FLOAT, float_enu + Eigen::Vector3d(30.0, 0.0, 0.0), 0.1);
+    EXPECT_FALSE(h.processor().lastGnssPositionReanchored());
+}
+
+TEST(FusionProcessorSyntheticTest, FloatGateRecoveryRefusesFloatInconsistentWithCoarse) {
+    FloatGateRecoveryHarness h(3);
+    // A drifting float, 140 m from both the state and the coarse position.
+    for (int i = 0; i < 8; ++i) {
+        h.send(SolutionStatus::SPP, Eigen::Vector3d(2.0, 0.0, 0.0), 5.0);
+        h.send(SolutionStatus::FLOAT, Eigen::Vector3d(140.0, 0.0, 0.0), 0.1);
+        EXPECT_FALSE(h.processor().lastGnssPositionReanchored()) << i;
+        EXPECT_FALSE(h.processor().lastGnssPositionUpdateApplied()) << i;
+    }
+    EXPECT_LT(h.antennaEnu().norm(), 20.0);
+}
+
+TEST(FusionProcessorSyntheticTest, FloatGateRecoveryNeedsRecentCoarseAndAcceptedFloatResetsStreak) {
+    FloatGateRecoveryHarness stale(2);
+    stale.skip(5.0);  // coarse origin epoch is now stale (> 1 s)
+    for (int i = 0; i < 6; ++i) {
+        stale.send(SolutionStatus::FLOAT, Eigen::Vector3d(25.0, 0.0, 0.0), 0.1);
+        stale.skip(0.8);  // 1 s cadence, never a fresh coarse epoch
+        EXPECT_FALSE(stale.processor().lastGnssPositionReanchored()) << i;
+    }
+    FloatGateRecoveryHarness reset(3);
+    for (int round = 0; round < 3; ++round) {
+        reset.send(SolutionStatus::SPP, Eigen::Vector3d(12.0, 0.0, 0.0), 5.0);
+        reset.send(SolutionStatus::FLOAT, Eigen::Vector3d(25.0, 0.0, 0.0), 0.1);
+        EXPECT_FALSE(reset.processor().lastGnssPositionReanchored());
+        reset.send(SolutionStatus::SPP, Eigen::Vector3d(12.0, 0.0, 0.0), 5.0);
+        reset.send(SolutionStatus::FLOAT, Eigen::Vector3d(25.0, 0.0, 0.0), 0.1);
+        EXPECT_FALSE(reset.processor().lastGnssPositionReanchored());
+        // A FLOAT the gate accepts (consistent with the state) resets the streak.
+        reset.send(SolutionStatus::FLOAT, reset.antennaEnu(), 1.0);
+        EXPECT_TRUE(reset.processor().lastGnssPositionUpdateApplied());
+        EXPECT_FALSE(reset.processor().lastGnssPositionReanchored());
+    }
+}
+
+// velocity_consistency_v4: a FLOAT/FIXED position rejected by the NIS gate after
+// a GNSS-absence longer than the configured horizon re-anchors at once; the
+// same rejection in steady state does not.
+TEST(FusionProcessorSyntheticTest, PostGapReanchorDefaultsOff) {
+    EXPECT_EQ(LooseCouplingProcessor::Config().position_reanchor_after_gnss_gap_s, 0.0);
+    FloatGateRecoveryHarness h(0);
+    h.send(SolutionStatus::SPP, Eigen::Vector3d(0.0, 0.0, 0.0), 5.0);
+    h.skip(10.0);
+    h.send(SolutionStatus::FLOAT, Eigen::Vector3d(25.0, 0.0, 0.0), 0.1);
+    EXPECT_FALSE(h.processor().lastGnssPositionUpdateApplied());
+    EXPECT_FALSE(h.processor().lastGnssPositionReanchored());
+}
+
+TEST(FusionProcessorSyntheticTest, PostGapReanchorAppliesOnlyAfterTheHorizon) {
+    FloatGateRecoveryHarness h(0, 1.0);
+    // Steady state: SPP updates every 0.2 s keep the prior verified, so a
+    // rejected FLOAT is not re-anchored (the existing NIS gate stays in force).
+    for (int i = 0; i < 4; ++i) {
+        h.send(SolutionStatus::SPP, Eigen::Vector3d(0.0, 0.0, 0.0), 5.0);
+        EXPECT_TRUE(h.processor().lastGnssPositionUpdateApplied());
+        h.send(SolutionStatus::FLOAT, Eigen::Vector3d(25.0, 0.0, 0.0), 0.1);
+        EXPECT_FALSE(h.processor().lastGnssPositionUpdateApplied()) << i;
+        EXPECT_FALSE(h.processor().lastGnssPositionReanchored()) << i;
+    }
+    // A silence shorter than the horizon (0.4 s + two 0.2 s send steps = 0.8 s
+    // since the last accepted update) is not a gap.
+    h.skip(0.4);
+    h.send(SolutionStatus::FLOAT, Eigen::Vector3d(25.0, 0.0, 0.0), 0.1);
+    EXPECT_FALSE(h.processor().lastGnssPositionReanchored());
+    // A 10 s GNSS absence: the rejected FLOAT is trusted over the prior.
+    h.skip(10.0);
+    const Eigen::Vector3d velocity_before = h.processor().state().nominal.velocity_enu;
+    const Eigen::Quaterniond attitude_before = h.processor().state().nominal.attitude_body_to_enu;
+    h.send(SolutionStatus::FLOAT, Eigen::Vector3d(25.0, 0.0, 0.0), 0.1);
+    EXPECT_TRUE(h.processor().lastGnssPositionReanchored());
+    EXPECT_TRUE(h.processor().lastGnssPositionUpdateApplied());
+    EXPECT_NEAR((h.antennaEnu() - Eigen::Vector3d(25.0, 0.0, 0.0)).norm(), 0.0, 1e-6);
+    // Position only, covariance = the measurement's, cross terms cleared.
+    EXPECT_TRUE(h.processor().state().nominal.velocity_enu.isApprox(velocity_before, 1e-12));
+    EXPECT_TRUE(h.processor().state().nominal.attitude_body_to_enu.isApprox(attitude_before, 1e-12));
+    const auto& cov = h.processor().state().covariance;
+    constexpr int p = fusion_index::POSITION;
+    const double cross_norm = cov.block<3, 12>(p, 3).norm();
+    EXPECT_NEAR(cross_norm, 0.0, 1e-12);
+    EXPECT_NEAR(cov(p, p), 0.01, 0.01);
+    // The reference clock restarted: an immediate further rejected FLOAT is
+    // steady state again and is not re-anchored.
+    h.send(SolutionStatus::FLOAT, Eigen::Vector3d(60.0, 0.0, 0.0), 0.1);
+    EXPECT_FALSE(h.processor().lastGnssPositionReanchored());
+}
+
+TEST(FusionProcessorSyntheticTest, PostGapReanchorIgnoresCoarseClassAndAcceptedUpdates) {
+    FloatGateRecoveryHarness h(0, 1.0);
+    h.skip(10.0);
+    // A consistent FLOAT after the gap is an ordinary accepted update.
+    h.send(SolutionStatus::FLOAT, h.antennaEnu(), 1.0);
+    EXPECT_TRUE(h.processor().lastGnssPositionUpdateApplied());
+    EXPECT_FALSE(h.processor().lastGnssPositionReanchored());
+    // A rejected coarse (SPP) update after a gap is never re-anchored.
+    h.skip(10.0);
+    h.send(SolutionStatus::SPP, Eigen::Vector3d(500.0, 0.0, 0.0), 1.0);
+    EXPECT_FALSE(h.processor().lastGnssPositionReanchored());
+}
+
+// velocity_consistency_v8 (l): reanchor_requires_prefit_gate_pass. Both
+// re-anchors refuse a solution flagged float_prefit_gate_exceeded.
+TEST(FusionProcessorSyntheticTest, ReanchorPrefitGateDefaultsOffAndFlagIsIgnored) {
+    EXPECT_FALSE(LooseCouplingProcessor::Config().reanchor_requires_prefit_gate_pass);
+    EXPECT_FALSE(PositionSolution{}.float_prefit_gate_exceeded);
+    FloatGateRecoveryHarness h(0, 1.0);  // option off
+    h.send(SolutionStatus::SPP, Eigen::Vector3d(0.0, 0.0, 0.0), 5.0);
+    h.skip(10.0);
+    h.send(SolutionStatus::FLOAT, Eigen::Vector3d(25.0, 0.0, 0.0), 0.1, /*prefit_gate_exceeded=*/true);
+    EXPECT_TRUE(h.processor().lastGnssPositionReanchored());
+    EXPECT_FALSE(h.processor().lastGnssPositionReanchorRefusedByPrefitGate());
+    EXPECT_NEAR((h.antennaEnu() - Eigen::Vector3d(25.0, 0.0, 0.0)).norm(), 0.0, 1e-6);
+}
+
+TEST(FusionProcessorSyntheticTest, PostGapReanchorRefusesFlaggedSolutionOnlyWhenRequired) {
+    FloatGateRecoveryHarness h(0, 1.0, /*require_prefit_gate_pass=*/true);
+    h.send(SolutionStatus::SPP, Eigen::Vector3d(0.0, 0.0, 0.0), 5.0);
+    h.skip(10.0);
+    const Eigen::Vector3d before = h.antennaEnu();
+    h.send(SolutionStatus::FLOAT, Eigen::Vector3d(25.0, 0.0, 0.0), 0.1, true);
+    EXPECT_FALSE(h.processor().lastGnssPositionReanchored());
+    EXPECT_FALSE(h.processor().lastGnssPositionUpdateApplied());
+    EXPECT_TRUE(h.processor().lastGnssPositionReanchorRefusedByPrefitGate());
+    EXPECT_LT((h.antennaEnu() - before).norm(), 1.0);
+    // The gap is still open: an unflagged solution is re-anchored at once.
+    h.send(SolutionStatus::FLOAT, Eigen::Vector3d(25.0, 0.0, 0.0), 0.1, false);
+    EXPECT_TRUE(h.processor().lastGnssPositionReanchored());
+    EXPECT_FALSE(h.processor().lastGnssPositionReanchorRefusedByPrefitGate());
+    EXPECT_NEAR((h.antennaEnu() - Eigen::Vector3d(25.0, 0.0, 0.0)).norm(), 0.0, 1e-6);
+}
+
+TEST(FusionProcessorSyntheticTest, RejectionPatienceReanchorRefusesFlaggedSolutionOnlyWhenRequired) {
+    for (const bool required : {false, true}) {
+        FloatGateRecoveryHarness h(3, 0.0, required);
+        const Eigen::Vector3d float_enu(25.0, 0.0, 0.0);
+        for (int i = 0; i < 2; ++i) {
+            h.send(SolutionStatus::SPP, Eigen::Vector3d(12.0, 0.0, 0.0), 5.0);
+            h.send(SolutionStatus::FLOAT, float_enu, 0.1, true);
+        }
+        h.send(SolutionStatus::SPP, Eigen::Vector3d(12.0, 0.0, 0.0), 5.0);
+        h.send(SolutionStatus::FLOAT, float_enu, 0.1, true);
+        EXPECT_EQ(h.processor().lastGnssPositionReanchored(), !required) << required;
+        EXPECT_EQ(h.processor().lastGnssPositionReanchorRefusedByPrefitGate(), required) << required;
+        if (required) {
+            // The streak is not consumed: the next unflagged solution re-anchors.
+            h.send(SolutionStatus::SPP, Eigen::Vector3d(12.0, 0.0, 0.0), 5.0);
+            h.send(SolutionStatus::FLOAT, float_enu, 0.1, false);
+            EXPECT_TRUE(h.processor().lastGnssPositionReanchored());
+            EXPECT_NEAR((h.antennaEnu() - float_enu).norm(), 0.0, 1e-6);
+        }
+    }
+}
+
+// velocity_consistency_v5: direction test at the heading latch. A paired
+// "off"/"on" processor sees identical input; the body moves along +X
+// (body_accel_x > 0) or -X (< 0) of the filter's own pre-motion attitude R0,
+// so the GNSS course is the direction of travel and the true body +X course
+// is the course of R0 * UnitX.
+class LatchDirectionHarness {
+public:
+    LatchDirectionHarness(double body_accel_x, bool vibrate, bool zupt_enable)
+        : body_accel_x_(body_accel_x), vibrate_(vibrate) {
+        LooseCouplingProcessor::Config config;
+        config.align_static_window_s = 0.5;
+        config.zupt_enable = zupt_enable;
+        config.lever_arm_body.setZero();
+        off_ = std::make_unique<LooseCouplingProcessor>(config);
+        config.heading_latch_direction_test = true;
+        on_ = std::make_unique<LooseCouplingProcessor>(config);
+    }
+
+    // Runs until both processors latched (or 10 s) and records the body +X
+    // course at each processor's own latch epoch.
+    void run() {
+        const double t0 = 100000.0;
+        Eigen::Matrix3d r0 = Eigen::Matrix3d::Identity();
+        for (int i = 0; i <= 1000; ++i) {
+            const double t = i * kDt;
+            const bool moving = t > 3.0 + 1e-9;
+            if (!moving && i == 300) r0 = on_->state().nominal.attitude_body_to_enu.toRotationMatrix();
+            const double a_x = moving ? body_accel_x_ : 0.0;
+            ImuSample sample;
+            sample.time = GNSSTime(2200, t0 + t);
+            const double vib = vibrate_ ? ((i % 2 == 0) ? 1.5 : -1.5) : 0.0;
+            sample.accel_raw = Eigen::Vector3d(a_x, 0.0, kGravity + vib);
+            off_->processImuSample(sample);
+            on_->processImuSample(sample);
+            if (i % 10 != 0 || !on_->isInitialized()) continue;
+            const double age = moving ? t - 3.0 : 0.0;
+            const Eigen::Vector3d velocity_enu = r0 * Eigen::Vector3d(body_accel_x_ * age, 0.0, 0.0);
+            const Eigen::Vector3d position_enu =
+                r0 * Eigen::Vector3d(0.5 * body_accel_x_ * age * age, 0.0, 0.0);
+            PositionSolution fix;
+            fix.time = sample.time;
+            fix.status = SolutionStatus::SPP;
+            fix.num_satellites = 8;
+            // ENU -> ECEF at lat 0, lon 0: east = y, north = z, up = x.
+            fix.position_ecef = Eigen::Vector3d(6378137.0 + position_enu.z(), position_enu.x(), position_enu.y());
+            fix.position_covariance = Eigen::Matrix3d::Identity();
+            fix.has_velocity = true;
+            fix.velocity_ecef = Eigen::Vector3d(velocity_enu.z(), velocity_enu.x(), velocity_enu.y());
+            fix.velocity_covariance = 0.04 * Eigen::Matrix3d::Identity();
+            const bool off_before = off_->isHeadingAligned();
+            const bool on_before = on_->isHeadingAligned();
+            off_->processGnssSolution(fix);
+            on_->processGnssSolution(fix);
+            if (!off_before && off_->isHeadingAligned()) {
+                off_latch_time_ = sample.time.tow;
+                off_course_deg_ = bodyXCourseDeg(*off_);
+            }
+            if (!on_before && on_->isHeadingAligned()) {
+                on_latch_time_ = sample.time.tow;
+                on_course_deg_ = bodyXCourseDeg(*on_);
+            }
+            if (!off_->isHeadingAligned() && !on_->isHeadingAligned()) {
+                // Before the latch the option is observationally inert.
+                EXPECT_EQ((off_->state().covariance - on_->state().covariance).norm(), 0.0);
+                EXPECT_EQ((off_->state().nominal.velocity_enu - on_->state().nominal.velocity_enu).norm(), 0.0);
+                EXPECT_EQ(off_->state().nominal.attitude_body_to_enu.coeffs(),
+                          on_->state().nominal.attitude_body_to_enu.coeffs());
+            }
+            if (off_->isHeadingAligned() && on_->isHeadingAligned()) break;
+        }
+        true_body_x_course_deg_ = courseDeg(r0.col(0));
+        travel_course_deg_ = courseDeg(body_accel_x_ >= 0.0 ? r0.col(0) : Eigen::Vector3d(-r0.col(0)));
+    }
+
+    static double courseDeg(const Eigen::Vector3d& enu) {
+        return std::atan2(enu.x(), enu.y()) * 180.0 / M_PI;
+    }
+    static double bodyXCourseDeg(const LooseCouplingProcessor& processor) {
+        return courseDeg(processor.state().nominal.attitude_body_to_enu.toRotationMatrix().col(0));
+    }
+    static double angleDiffDeg(double a, double b) { return std::remainder(a - b, 360.0); }
+
+    LooseCouplingProcessor& off() { return *off_; }
+    LooseCouplingProcessor& on() { return *on_; }
+    double offCourseDeg() const { return off_course_deg_; }
+    double onCourseDeg() const { return on_course_deg_; }
+    double offLatchTime() const { return off_latch_time_; }
+    double onLatchTime() const { return on_latch_time_; }
+    double trueBodyXCourseDeg() const { return true_body_x_course_deg_; }
+    double travelCourseDeg() const { return travel_course_deg_; }
+
+private:
+    double body_accel_x_;
+    bool vibrate_;
+    std::unique_ptr<LooseCouplingProcessor> off_, on_;
+    double off_course_deg_ = std::numeric_limits<double>::quiet_NaN();
+    double on_course_deg_ = std::numeric_limits<double>::quiet_NaN();
+    double off_latch_time_ = -1.0, on_latch_time_ = -1.0;
+    double true_body_x_course_deg_ = 0.0, travel_course_deg_ = 0.0;
+};
+
+TEST(FusionProcessorSyntheticTest, HeadingLatchDirectionTestDefaultsOff) {
+    EXPECT_FALSE(LooseCouplingProcessor::Config().heading_latch_direction_test);
+    LooseCouplingProcessor processor{LooseCouplingProcessor::Config()};
+    EXPECT_FALSE(processor.longitudinalVelocityValid());
+    EXPECT_EQ(processor.longitudinalVelocityMps(), 0.0);
+    EXPECT_FALSE(processor.lastLatchDirectionFlipped());
+    EXPECT_EQ(processor.latchDirectionFlipCount(), 0U);
+}
+
+TEST(FusionProcessorSyntheticTest, HeadingLatchDirectionTestFlipsAReverseStart) {
+    for (const bool zupt_enable : {true, false}) {
+        LatchDirectionHarness h(-1.0, /*vibrate=*/false, zupt_enable);
+        h.run();
+        ASSERT_TRUE(h.off().isHeadingAligned()) << zupt_enable;
+        ASSERT_TRUE(h.on().isHeadingAligned()) << zupt_enable;
+        // Latch time is unchanged by the option.
+        EXPECT_EQ(h.offLatchTime(), h.onLatchTime());
+        // Option off: heading = course of travel, 180 deg from the true heading.
+        EXPECT_NEAR(LatchDirectionHarness::angleDiffDeg(h.offCourseDeg(), h.travelCourseDeg()), 0.0, 0.1);
+        EXPECT_NEAR(std::abs(LatchDirectionHarness::angleDiffDeg(h.offCourseDeg(), h.trueBodyXCourseDeg())),
+                    180.0, 0.1);
+        // Option on: course + 180 deg, i.e. the true body +X direction.
+        EXPECT_NEAR(LatchDirectionHarness::angleDiffDeg(h.onCourseDeg(), h.trueBodyXCourseDeg()), 0.0, 0.1);
+        EXPECT_NEAR(std::abs(LatchDirectionHarness::angleDiffDeg(h.onCourseDeg(), h.offCourseDeg())), 180.0, 0.1);
+        EXPECT_TRUE(h.on().longitudinalVelocityValid());
+        EXPECT_LT(h.on().lastLatchLongitudinalVelocityMps(), -0.3);
+        EXPECT_TRUE(h.on().lastLatchDirectionFlipped());
+        EXPECT_EQ(h.on().latchDirectionFlipCount(), 1U);
+        EXPECT_FALSE(h.off().lastLatchDirectionFlipped());
+        EXPECT_EQ(h.off().latchDirectionFlipCount(), 0U);
+        EXPECT_FALSE(h.off().longitudinalVelocityValid());
+    }
+}
+
+TEST(FusionProcessorSyntheticTest, HeadingLatchDirectionTestKeepsAForwardStart) {
+    LatchDirectionHarness h(1.0, /*vibrate=*/false, /*zupt_enable=*/true);
+    h.run();
+    ASSERT_TRUE(h.off().isHeadingAligned());
+    ASSERT_TRUE(h.on().isHeadingAligned());
+    EXPECT_EQ(h.offLatchTime(), h.onLatchTime());
+    EXPECT_NEAR(LatchDirectionHarness::angleDiffDeg(h.offCourseDeg(), h.trueBodyXCourseDeg()), 0.0, 0.1);
+    EXPECT_NEAR(LatchDirectionHarness::angleDiffDeg(h.onCourseDeg(), h.trueBodyXCourseDeg()), 0.0, 0.1);
+    EXPECT_TRUE(h.on().longitudinalVelocityValid());
+    EXPECT_GT(h.on().lastLatchLongitudinalVelocityMps(), 0.3);
+    EXPECT_FALSE(h.on().lastLatchDirectionFlipped());
+    EXPECT_EQ(h.on().latchDirectionFlipCount(), 0U);
+    // With nothing flipped, the whole state is identical to the option off.
+    EXPECT_EQ(h.off().state().nominal.attitude_body_to_enu.coeffs(),
+              h.on().state().nominal.attitude_body_to_enu.coeffs());
+    EXPECT_EQ((h.off().state().covariance - h.on().state().covariance).norm(), 0.0);
+}
+
+TEST(FusionProcessorSyntheticTest, HeadingLatchDirectionTestNeedsAStationarySampleAfterInitialization) {
+    // Constant vibration keeps the ZUPT stationarity condition from ever
+    // holding after initialization, so v_long is never validated and the
+    // (otherwise negative) integral is not trusted: no flip.
+    LatchDirectionHarness h(-1.0, /*vibrate=*/true, /*zupt_enable=*/true);
+    h.run();
+    ASSERT_TRUE(h.off().isHeadingAligned());
+    ASSERT_TRUE(h.on().isHeadingAligned());
+    EXPECT_FALSE(h.on().longitudinalVelocityValid());
+    EXPECT_LT(h.on().longitudinalVelocityMps(), 0.0);
+    EXPECT_FALSE(h.on().lastLatchDirectionFlipped());
+    EXPECT_EQ(h.on().latchDirectionFlipCount(), 0U);
+    EXPECT_TRUE(std::isnan(h.on().lastLatchLongitudinalVelocityMps()));
+    EXPECT_NEAR(LatchDirectionHarness::angleDiffDeg(h.onCourseDeg(), h.offCourseDeg()), 0.0, 1e-9);
+    EXPECT_EQ(h.offLatchTime(), h.onLatchTime());
+}
+
+// velocity_consistency_v10: consider_attitude_and_biases_before_heading_latch.
+// The body accelerates along its +X axis (from rest, after a 3 s static
+// window) with a constant 0.3 m/s^2 accelerometer bias along +Y that the
+// filter does not know, so every GNSS velocity/position update has a
+// nonzero innovation that the plain update spreads into roll/pitch and the
+// biases. GNSS is exact; one fix per 0.1 s.
+class ConsiderBeforeLatchHarness {
+public:
+    explicit ConsiderBeforeLatchHarness(bool consider) {
+        LooseCouplingProcessor::Config config;
+        config.align_static_window_s = 0.5;
+        config.lever_arm_body.setZero();
+        config.consider_attitude_and_biases_before_heading_latch = consider;
+        processor_ = std::make_unique<LooseCouplingProcessor>(config);
+    }
+
+    // Runs 10 s. For each GNSS call, the change of attitude / accel bias /
+    // gyro bias across the call is recorded, split by whether the heading was
+    // already latched before the call.
+    void run() {
+        const double t0 = 100000.0;
+        Eigen::Matrix3d r0 = Eigen::Matrix3d::Identity();
+        for (int i = 0; i <= 1000; ++i) {
+            const double t = i * kDt;
+            const bool moving = t > 3.0 + 1e-9;
+            if (!moving && i == 300) r0 = processor_->state().nominal.attitude_body_to_enu.toRotationMatrix();
+            ImuSample sample;
+            sample.time = GNSSTime(2200, t0 + t);
+            sample.accel_raw = Eigen::Vector3d(moving ? 1.0 : 0.0, 0.3, kGravity);
+            processor_->processImuSample(sample);
+            if (i % 10 != 0 || !processor_->isInitialized()) continue;
+            const double age = moving ? t - 3.0 : 0.0;
+            const Eigen::Vector3d velocity_enu = r0 * Eigen::Vector3d(age, 0.0, 0.0);
+            const Eigen::Vector3d position_enu = r0 * Eigen::Vector3d(0.5 * age * age, 0.0, 0.0);
+            PositionSolution fix;
+            fix.time = sample.time;
+            fix.status = SolutionStatus::SPP;
+            fix.num_satellites = 8;
+            fix.position_ecef = Eigen::Vector3d(6378137.0 + position_enu.z(), position_enu.x(), position_enu.y());
+            fix.position_covariance = Eigen::Matrix3d::Identity();
+            fix.has_velocity = true;
+            fix.velocity_ecef = Eigen::Vector3d(velocity_enu.z(), velocity_enu.x(), velocity_enu.y());
+            fix.velocity_covariance = 0.04 * Eigen::Matrix3d::Identity();
+            const bool aligned_before = processor_->isHeadingAligned();
+            const auto before = processor_->state().nominal;
+            const Eigen::Matrix<double, 15, 15> covariance_before = processor_->state().covariance;
+            processor_->processGnssSolution(fix);
+            if (!processor_->lastGnssPositionUpdateApplied()) continue;
+            const auto& after = processor_->state().nominal;
+            const double change = (after.accel_bias - before.accel_bias).norm() +
+                                  (after.gyro_bias - before.gyro_bias).norm() +
+                                  (after.attitude_body_to_enu.coeffs() - before.attitude_body_to_enu.coeffs()).norm();
+            const bool latched_in_call = !aligned_before && processor_->isHeadingAligned();
+            if (!aligned_before && !latched_in_call) {
+                ++updates_before_latch_;
+                max_change_before_latch_ = std::max(max_change_before_latch_, change);
+                // The consider states must keep their prior variance, and the
+                // covariance must stay symmetric positive definite.
+                const Eigen::Matrix<double, 15, 15>& covariance = processor_->state().covariance;
+                EXPECT_LT((covariance - covariance.transpose()).norm(), 1e-9);
+                Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 15, 15>> eig(covariance);
+                EXPECT_GT(eig.eigenvalues().minCoeff(), 0.0);
+                max_consider_variance_gain_ =
+                    std::max(max_consider_variance_gain_,
+                             (covariance.diagonal().tail<9>() - covariance_before.diagonal().tail<9>())
+                                 .cwiseAbs().maxCoeff());
+            } else if (aligned_before) {
+                ++updates_after_latch_;
+                max_change_after_latch_ = std::max(max_change_after_latch_, change);
+            }
+        }
+    }
+
+    LooseCouplingProcessor& processor() { return *processor_; }
+    int updatesBeforeLatch() const { return updates_before_latch_; }
+    int updatesAfterLatch() const { return updates_after_latch_; }
+    double maxChangeBeforeLatch() const { return max_change_before_latch_; }
+    double maxChangeAfterLatch() const { return max_change_after_latch_; }
+
+private:
+    std::unique_ptr<LooseCouplingProcessor> processor_;
+    int updates_before_latch_ = 0, updates_after_latch_ = 0;
+    double max_change_before_latch_ = 0.0, max_change_after_latch_ = 0.0;
+    double max_consider_variance_gain_ = 0.0;
+};
+
+TEST(FusionProcessorSyntheticTest, ConsiderBeforeHeadingLatchDefaultsOff) {
+    EXPECT_FALSE(LooseCouplingProcessor::Config().consider_attitude_and_biases_before_heading_latch);
+}
+
+TEST(FusionProcessorSyntheticTest, PlainUpdatesBeforeTheLatchCorrectAttitudeAndBiases) {
+    // Guards the premise of the next test: with the option off the same input
+    // does move the attitude / bias states before the latch.
+    ConsiderBeforeLatchHarness off(false);
+    off.run();
+    ASSERT_TRUE(off.processor().isHeadingAligned());
+    ASSERT_GT(off.updatesBeforeLatch(), 0);
+    EXPECT_GT(off.maxChangeBeforeLatch(), 1e-6);
+}
+
+TEST(FusionProcessorSyntheticTest, ConsiderBeforeHeadingLatchLeavesAttitudeAndBiasesUnchangedUntilTheLatch) {
+    ConsiderBeforeLatchHarness on(true);
+    on.run();
+    ASSERT_TRUE(on.processor().isHeadingAligned());
+    ASSERT_GT(on.updatesBeforeLatch(), 0);
+    // Zero gain rows: bit-exact, not approximately, unchanged.
+    EXPECT_EQ(on.maxChangeBeforeLatch(), 0.0);
+    // After the latch the same updates correct them again.
+    ASSERT_GT(on.updatesAfterLatch(), 0);
+    EXPECT_GT(on.maxChangeAfterLatch(), 1e-6);
+}
+
+TEST(FusionProcessorSyntheticTest, ConsiderBeforeHeadingLatchStillCorrectsPositionAndVelocity) {
+    ConsiderBeforeLatchHarness off(false), on(true);
+    off.run();
+    on.run();
+    // Position/velocity are corrected by the GNSS fixes in both: the final
+    // states agree with the truth to within a few metres / decimetres per second.
+    const double expected_age = 7.0;
+    for (auto* h : {&off, &on}) {
+        EXPECT_NEAR(h->processor().state().nominal.velocity_enu.head<2>().norm(), expected_age, 1.0);
+    }
+}
+
+TEST(FusionProcessorSyntheticTest, LongitudinalVelocityRemovesGravityOfATiltedMount) {
+    // A constant tilted specific force (|f| = g) is gravity only: the
+    // body-forward kinematic acceleration is 0, whatever the pitch. The
+    // z-axis vibration keeps the stationarity condition from resetting v_long.
+    LooseCouplingProcessor::Config config;
+    config.align_static_window_s = 0.5;
+    config.heading_latch_direction_test = true;
+    LooseCouplingProcessor processor(config);
+    const double pitch = 10.0 * M_PI / 180.0;
+    for (int i = 0; i <= 500; ++i) {
+        ImuSample sample;
+        sample.time = GNSSTime(2200, 100000.0 + i * kDt);
+        const double vib = (i % 2 == 0) ? 1.5 : -1.5;
+        sample.accel_raw = Eigen::Vector3d(-kGravity * std::sin(pitch), 0.0, kGravity * std::cos(pitch) + vib);
+        processor.processImuSample(sample);
+    }
+    ASSERT_TRUE(processor.isInitialized());
+    EXPECT_FALSE(processor.longitudinalVelocityValid());
+    EXPECT_NEAR(processor.longitudinalVelocityMps(), 0.0, 0.05);
+}
+
+// velocity_consistency_v6: the gyro-bias seed replaces only the window-mean
+// gyro bias of the next static-window initialization.
+namespace {
+const Eigen::Vector3d kWindowGyro(0.012, -0.021, 0.0875);
+// Stops at the initializing sample (stop_at_init) so the state compared is the
+// initialization itself, before any propagation with the differing bias.
+void feedTiltedWindow(LooseCouplingProcessor& processor, double t0, int samples,
+                      const Eigen::Vector3d& gyro, bool stop_at_init = true) {
+    // Tilted (roll ~ 5 deg, pitch ~ 3 deg) specific force with a nonzero
+    // accel bias so attitude and accel bias are both nontrivial.
+    const Eigen::Vector3d accel(-0.51, 0.86, 9.76);
+    for (int i = 0; i < samples; ++i) {
+        ImuSample sample;
+        sample.time = GNSSTime(2200, t0 + i * kDt);
+        sample.accel_raw = accel;
+        sample.gyro_raw_radps = gyro;
+        processor.processImuSample(sample);
+        if (stop_at_init && processor.isInitialized()) return;
+    }
+}
+LooseCouplingProcessor::Config seedConfig() {
+    LooseCouplingProcessor::Config config;
+    config.align_static_window_s = 0.5;
+    config.zupt_enable = false;
+    return config;
+}
+}  // namespace
+
+TEST(FusionProcessorSyntheticTest, GyroBiasSeedIsOffByDefault) {
+    LooseCouplingProcessor processor(seedConfig());
+    EXPECT_FALSE(processor.hasPendingGyroBiasSeed());
+    EXPECT_FALSE(processor.lastInitializationGyroBiasSeeded());
+    EXPECT_FALSE(processor.lastInitializationWindowGyroBias().allFinite());
+    feedTiltedWindow(processor, 100000.0, 60, kWindowGyro);
+    ASSERT_TRUE(processor.isInitialized());
+    EXPECT_FALSE(processor.lastInitializationGyroBiasSeeded());
+    EXPECT_FALSE(processor.lastInitializationWindowGyroBias().allFinite());
+    EXPECT_NEAR((processor.state().nominal.gyro_bias - kWindowGyro).norm(), 0.0, 1e-12);
+}
+
+TEST(FusionProcessorSyntheticTest, GyroBiasSeedReplacesWindowMeanOnly) {
+    LooseCouplingProcessor control(seedConfig());
+    LooseCouplingProcessor seeded(seedConfig());
+    const Eigen::Vector3d seed(-0.0004, 0.0031, -0.0114);
+    seeded.seedGyroBiasForNextInitialization(seed);
+    EXPECT_TRUE(seeded.hasPendingGyroBiasSeed());
+    EXPECT_FALSE(seeded.isInitialized());
+    feedTiltedWindow(control, 100000.0, 60, kWindowGyro);
+    feedTiltedWindow(seeded, 100000.0, 60, kWindowGyro);
+    ASSERT_TRUE(control.isInitialized());
+    ASSERT_TRUE(seeded.isInitialized());
+    const auto& c = control.state().nominal;
+    const auto& n = seeded.state().nominal;
+    EXPECT_NEAR((c.gyro_bias - kWindowGyro).norm(), 0.0, 1e-12);
+    EXPECT_EQ(n.gyro_bias, seed);
+    // Everything else equals the unseeded initialization exactly.
+    EXPECT_EQ(n.attitude_body_to_enu.coeffs(), c.attitude_body_to_enu.coeffs());
+    EXPECT_EQ(n.accel_bias, c.accel_bias);
+    EXPECT_GT(c.accel_bias.norm(), 1e-3);
+    EXPECT_EQ(n.velocity_enu, c.velocity_enu);
+    EXPECT_EQ(n.position_enu, c.position_enu);
+    EXPECT_EQ(n.time.tow, c.time.tow);
+    EXPECT_EQ(seeded.state().covariance, control.state().covariance);
+    // Diagnostics: seeded, with the replaced window mean recorded.
+    EXPECT_TRUE(seeded.lastInitializationGyroBiasSeeded());
+    EXPECT_NEAR((seeded.lastInitializationWindowGyroBias() - kWindowGyro).norm(), 0.0, 1e-12);
+    EXPECT_FALSE(control.lastInitializationGyroBiasSeeded());
+}
+
+TEST(FusionProcessorSyntheticTest, GyroBiasSeedIsConsumedByTheInitialization) {
+    LooseCouplingProcessor processor(seedConfig());
+    const Eigen::Vector3d seed(0.001, 0.002, 0.003);
+    processor.seedGyroBiasForNextInitialization(seed);
+    feedTiltedWindow(processor, 100000.0, 60, kWindowGyro);
+    ASSERT_TRUE(processor.isInitialized());
+    EXPECT_FALSE(processor.hasPendingGyroBiasSeed());
+    EXPECT_EQ(processor.state().nominal.gyro_bias, seed);
+    // A seed set after initialization is never applied to the running filter.
+    const auto before = processor.state().nominal.gyro_bias;
+    processor.seedGyroBiasForNextInitialization(Eigen::Vector3d(9.0, 9.0, 9.0));
+    feedTiltedWindow(processor, 100001.0, 20, kWindowGyro, false);
+    EXPECT_LT((processor.state().nominal.gyro_bias - before).norm(), 1e-3);
+    // The next initialization of a fresh processor without a seed uses the
+    // window mean (initialization is once per instance; a reset builds a new one).
+    LooseCouplingProcessor next(seedConfig());
+    feedTiltedWindow(next, 100000.0, 60, kWindowGyro);
+    EXPECT_NEAR((next.state().nominal.gyro_bias - kWindowGyro).norm(), 0.0, 1e-12);
+    EXPECT_FALSE(next.lastInitializationGyroBiasSeeded());
 }
 
 }  // namespace

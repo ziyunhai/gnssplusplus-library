@@ -73,17 +73,132 @@ double Ephemeris::getAge(const GNSSTime& time) const {
     return std::abs(time - toe);
 }
 
+namespace {
+// Three-way compare of doubles with a defined place for NaN (last), so the
+// ordering below is a strict weak ordering for every input.
+inline int compareDouble(double a, double b) {
+    const bool a_nan = std::isnan(a);
+    const bool b_nan = std::isnan(b);
+    if (a_nan || b_nan) {
+        return a_nan == b_nan ? 0 : (a_nan ? 1 : -1);
+    }
+    return a < b ? -1 : (a > b ? 1 : 0);
+}
+
+inline int compareTime(const GNSSTime& a, const GNSSTime& b) {
+    if (a.week != b.week) {
+        return a.week < b.week ? -1 : 1;
+    }
+    return compareDouble(a.tow, b.tow);
+}
+
+template <typename T>
+inline int compareValue(const T& a, const T& b) {
+    return a < b ? -1 : (b < a ? 1 : 0);
+}
+
+// Galileo only: I/NAV records (data-source bit 9, clock referenced to E5b/E1)
+// rank before records without it (F/NAV). Other systems all rank equal because
+// the data-source word means other things there.
+inline int ephemerisSourceRank(const Ephemeris& eph) {
+    if (eph.satellite.system != GNSSSystem::Galileo) {
+        return 0;
+    }
+    return (eph.data_source_code & galileo_data_source::kClockE5bE1) ? 0 : 1;
+}
+
+// Total order over the records of one satellite, independent of insertion
+// order. Primary key is toe (as before); the remaining keys only break ties,
+// and run through every field that affects position/clock so that two records
+// compare equal only when they are interchangeable.
+int compareEphemerisOrder(const Ephemeris& a, const Ephemeris& b) {
+    int c;
+#define LIBGNSS_EPH_KEY(expr) \
+    if ((c = (expr)) != 0) return c
+    LIBGNSS_EPH_KEY(compareTime(a.toe, b.toe));
+    LIBGNSS_EPH_KEY(compareValue(ephemerisSourceRank(a), ephemerisSourceRank(b)));
+    LIBGNSS_EPH_KEY(compareValue(a.data_source_code, b.data_source_code));
+    LIBGNSS_EPH_KEY(compareValue(a.iode, b.iode));
+    LIBGNSS_EPH_KEY(compareValue(a.iodc, b.iodc));
+    LIBGNSS_EPH_KEY(compareTime(a.toc, b.toc));
+    LIBGNSS_EPH_KEY(compareDouble(a.af0, b.af0));
+    LIBGNSS_EPH_KEY(compareDouble(a.af1, b.af1));
+    LIBGNSS_EPH_KEY(compareDouble(a.af2, b.af2));
+    // Remaining fields: only reached for records identical in every key above.
+    LIBGNSS_EPH_KEY(compareTime(a.tof, b.tof));
+    LIBGNSS_EPH_KEY(compareDouble(a.toes, b.toes));
+    LIBGNSS_EPH_KEY(compareValue(a.week, b.week));
+    LIBGNSS_EPH_KEY(compareValue(a.health, b.health));
+    LIBGNSS_EPH_KEY(compareDouble(a.sv_health, b.sv_health));
+    LIBGNSS_EPH_KEY(compareDouble(a.sv_accuracy, b.sv_accuracy));
+    LIBGNSS_EPH_KEY(compareValue(a.ura, b.ura));
+    LIBGNSS_EPH_KEY(compareDouble(a.sqrt_a, b.sqrt_a));
+    LIBGNSS_EPH_KEY(compareDouble(a.e, b.e));
+    LIBGNSS_EPH_KEY(compareDouble(a.i0, b.i0));
+    LIBGNSS_EPH_KEY(compareDouble(a.omega0, b.omega0));
+    LIBGNSS_EPH_KEY(compareDouble(a.omega, b.omega));
+    LIBGNSS_EPH_KEY(compareDouble(a.m0, b.m0));
+    LIBGNSS_EPH_KEY(compareDouble(a.delta_n, b.delta_n));
+    LIBGNSS_EPH_KEY(compareDouble(a.idot, b.idot));
+    LIBGNSS_EPH_KEY(compareDouble(a.i_dot, b.i_dot));
+    LIBGNSS_EPH_KEY(compareDouble(a.omega_dot, b.omega_dot));
+    LIBGNSS_EPH_KEY(compareDouble(a.cuc, b.cuc));
+    LIBGNSS_EPH_KEY(compareDouble(a.cus, b.cus));
+    LIBGNSS_EPH_KEY(compareDouble(a.crc, b.crc));
+    LIBGNSS_EPH_KEY(compareDouble(a.crs, b.crs));
+    LIBGNSS_EPH_KEY(compareDouble(a.cic, b.cic));
+    LIBGNSS_EPH_KEY(compareDouble(a.cis, b.cis));
+    LIBGNSS_EPH_KEY(compareDouble(a.tgd, b.tgd));
+    LIBGNSS_EPH_KEY(compareDouble(a.tgd_secondary, b.tgd_secondary));
+    LIBGNSS_EPH_KEY(compareDouble(a.glonass_taun, b.glonass_taun));
+    LIBGNSS_EPH_KEY(compareDouble(a.glonass_gamn, b.glonass_gamn));
+    for (int i = 0; i < 3; ++i) {
+        LIBGNSS_EPH_KEY(compareDouble(a.glonass_position[i], b.glonass_position[i]));
+        LIBGNSS_EPH_KEY(compareDouble(a.glonass_velocity[i], b.glonass_velocity[i]));
+        LIBGNSS_EPH_KEY(compareDouble(a.glonass_acceleration[i], b.glonass_acceleration[i]));
+    }
+    LIBGNSS_EPH_KEY(compareValue(a.glonass_frequency_channel, b.glonass_frequency_channel));
+    LIBGNSS_EPH_KEY(compareValue(a.glonass_frequency_channel_present,
+                                 b.glonass_frequency_channel_present));
+    LIBGNSS_EPH_KEY(compareValue(a.glonass_canonical_geph_data_valid,
+                                 b.glonass_canonical_geph_data_valid));
+    LIBGNSS_EPH_KEY(compareValue(a.glonass_canonical_geph_reject_reason,
+                                 b.glonass_canonical_geph_reject_reason));
+    LIBGNSS_EPH_KEY(compareValue(a.glonass_age, b.glonass_age));
+    LIBGNSS_EPH_KEY(compareValue(static_cast<int>(a.navigation_message_type),
+                                 static_cast<int>(b.navigation_message_type)));
+    LIBGNSS_EPH_KEY(compareValue(a.valid, b.valid));
+    LIBGNSS_EPH_KEY(compareValue(a.glonass_cdma_data.has_value(),
+                                 b.glonass_cdma_data.has_value()));
+    if (a.glonass_cdma_data && b.glonass_cdma_data) {
+        LIBGNSS_EPH_KEY(compareDouble(a.glonass_cdma_data->beta, b.glonass_cdma_data->beta));
+        LIBGNSS_EPH_KEY(compareValue(a.glonass_cdma_data->data_validity,
+                                     b.glonass_cdma_data->data_validity));
+        LIBGNSS_EPH_KEY(compareValue(a.glonass_cdma_data->satellite_type,
+                                     b.glonass_cdma_data->satellite_type));
+        LIBGNSS_EPH_KEY(compareValue(a.glonass_cdma_data->source_flags,
+                                     b.glonass_cdma_data->source_flags));
+    }
+#undef LIBGNSS_EPH_KEY
+    return 0;
+}
+}  // namespace
+
 void NavigationData::addEphemeris(const Ephemeris& eph) {
     ephemeris_data[eph.satellite].push_back(eph);
     satellite_state_cache_.clear();
     ++revision_;
-    
-    // Sort by time of ephemeris
+
+    // Keep each satellite's records in a total order that does not depend on
+    // insertion order (see compareEphemerisOrder): toe first, then, for
+    // Galileo, I/NAV before F/NAV, then the remaining tie-break keys.
+    // getEphemeris() takes the first of several equal-age candidates, so the
+    // order decides which copy of a same-toe record is used.
     auto& eph_list = ephemeris_data[eph.satellite];
-    std::sort(eph_list.begin(), eph_list.end(),
-              [](const Ephemeris& a, const Ephemeris& b) {
-                  return a.toe < b.toe;
-              });
+    std::stable_sort(eph_list.begin(), eph_list.end(),
+                     [](const Ephemeris& a, const Ephemeris& b) {
+                         return compareEphemerisOrder(a, b) < 0;
+                     });
 }
 
 namespace {
@@ -111,12 +226,35 @@ namespace {
 // Galileo orbit gap (the toe rule made no difference), whose root cause is the
 // IODE-match interacting with the I/NAV filter (separate, unsolved, ~5 cm LOS
 // impact). Kept as an opt-in for when the estimator layer is addressed.
+//
+// Tie-break among same-toe copies (default selection): merged nav files and
+// multi-stream RTCM carry an F/NAV and an I/NAV copy of each Galileo record
+// with the same toe, whose af0 differs by decimetres. getEphemeris() takes the
+// first of several equal-age candidates, so that choice used to depend on
+// insertion order (std::sort on toe alone is unstable, and RINEX load, merge,
+// RTCM decode and copy all insert in different orders). addEphemeris() now keeps
+// every satellite's list in the total order of compareEphemerisOrder(): toe,
+// then (Galileo only) I/NAV before F/NAV, then data_source_code, iode, iodc,
+// toc, af0, af1, af2 and the remaining fields. Among equal-toe Galileo copies
+// the I/NAV one therefore always wins when it exists (the RTKLIB default
+// preference), and a lone F/NAV record is still used: nothing is filtered.
+// Non-Galileo ties are likewise resolved by the same fixed order, not by
+// insertion order.
+//
+// Separately, NavigationData::setGalileoEphemerisSource(INavOnly) applies only
+// the data-source filter (no toe rule). It is set by SSR paths whose clock
+// corrections reference the I/NAV clock (Galileo HAS via RTCM SSR), where the
+// SSR IODnav already pins the record in time.
+constexpr int kGalInavClockBit = 1 << 9;
+
 inline bool galileoSkip(const SatelliteId& sat, const Ephemeris& eph,
-                        const GNSSTime& time) {
-    if (!pppEnvOverrides().gal_inav || sat.system != GNSSSystem::Galileo) {
+                        const GNSSTime& time, bool inav_only) {
+    if (sat.system != GNSSSystem::Galileo) {
         return false;
     }
-    constexpr int kGalInavClockBit = 1 << 9;
+    if (!pppEnvOverrides().gal_inav) {
+        return inav_only && !(eph.data_source_code & kGalInavClockBit);
+    }
     if (!(eph.data_source_code & kGalInavClockBit)) {
         return true;  // not I/NAV
     }
@@ -153,7 +291,8 @@ const Ephemeris* NavigationData::getEphemeris(const SatelliteId& sat, const GNSS
     double min_age = 1e9;
 
     for (const auto& eph : it->second) {
-        if (galileoSkip(sat, eph, time)) {
+        if (galileoSkip(sat, eph, time, galileo_ephemeris_source_ ==
+                                          GalileoEphemerisSource::INavOnly)) {
             continue;
         }
         if (eph.isValid(time)) {
@@ -186,7 +325,8 @@ const Ephemeris* NavigationData::getEphemeris(const SatelliteId& sat,
     const Ephemeris* best_match = nullptr;
     double min_age = 1e9;
     for (const auto& eph : it->second) {
-        if (galileoSkip(sat, eph, time)) {
+        if (galileoSkip(sat, eph, time, galileo_ephemeris_source_ ==
+                                          GalileoEphemerisSource::INavOnly)) {
             continue;
         }
         if (!ephemerisMatchesSsrIode(sat, eph, desired_iode)) {
@@ -220,7 +360,6 @@ bool NavigationData::hasMadocaGalileoEphemeris(const SatelliteId& sat,
     if (it == ephemeris_data.end()) {
         return false;
     }
-    constexpr int kGalInavClockBit = 1 << 9;
     for (const auto& eph : it->second) {
         if (desired_iode >= 0 &&
             !ephemerisMatchesSsrIode(sat, eph, desired_iode)) {
@@ -268,6 +407,9 @@ bool NavigationData::calculateSatelliteState(const SatelliteId& sat,
                 computed.clock_bias,
                 computed.clock_drift);
     }
+    if (satellite_state_cache_limit_ != 0 && satellite_state_cache_.size() >= satellite_state_cache_limit_) {
+        satellite_state_cache_.clear();
+    }
     satellite_state_cache_.emplace(cache_key, computed);
     position = computed.position;
     velocity = computed.velocity;
@@ -305,28 +447,15 @@ bool NavigationData::calculateSatelliteState(const SatelliteId& sat,
                 computed.clock_bias,
                 computed.clock_drift);
     }
+    if (satellite_state_cache_limit_ != 0 && satellite_state_cache_.size() >= satellite_state_cache_limit_) {
+        satellite_state_cache_.clear();
+    }
     satellite_state_cache_.emplace(cache_key, computed);
     position = computed.position;
     velocity = computed.velocity;
     clock_bias = computed.clock_bias;
     clock_drift = computed.clock_drift;
     return computed.valid;
-}
-
-std::map<SatelliteId, Vector3d> NavigationData::calculateSatellitePositions(
-    const std::vector<SatelliteId>& satellites,
-    const GNSSTime& time) const {
-    std::map<SatelliteId, Vector3d> positions;
-    
-    for (const auto& sat : satellites) {
-        Vector3d pos, vel;
-        double clock_bias, clock_drift;
-        if (calculateSatelliteState(sat, time, pos, vel, clock_bias, clock_drift)) {
-            positions[sat] = pos;
-        }
-    }
-    
-    return positions;
 }
 
 NavigationData::SatelliteGeometry NavigationData::calculateGeometry(
@@ -367,19 +496,62 @@ bool NavigationData::hasEphemeris(const SatelliteId& sat, const GNSSTime& time) 
     return getEphemeris(sat, time) != nullptr;
 }
 
-std::vector<SatelliteId> NavigationData::getAvailableSatellites(const GNSSTime& time) const {
-    std::vector<SatelliteId> satellites;
-    
-    for (const auto& pair : ephemeris_data) {
-        if (hasEphemeris(pair.first, time)) {
-            satellites.push_back(pair.first);
-        }
+NavigationData::NavigationData() = default;
+
+void NavigationData::setGalileoEphemerisSource(GalileoEphemerisSource source) {
+    if (source == galileo_ephemeris_source_) {
+        return;
     }
-    
-    return satellites;
+    galileo_ephemeris_source_ = source;
+    satellite_state_cache_.clear();
+    ++revision_;
 }
 
-NavigationData::NavigationData() = default;
+bool NavigationData::addEphemerisIfNew(const Ephemeris& eph) {
+    const auto it = ephemeris_data.find(eph.satellite);
+    if (it != ephemeris_data.end()) {
+        // Galileo I/NAV and F/NAV share IODnav but differ in clock reference
+        // (data-source bits 9 / 8); the remaining source bits vary between
+        // RINEX writers for the same broadcast record.
+        constexpr int kGalClockSourceMask = (1 << 8) | (1 << 9);
+        const bool galileo = eph.satellite.system == GNSSSystem::Galileo;
+        for (const auto& existing : it->second) {
+            if (existing.iode == eph.iode &&
+                std::abs(existing.toe - eph.toe) < 1e-3 &&
+                std::abs(existing.toc - eph.toc) < 1e-3 &&
+                (!galileo || (existing.data_source_code & kGalClockSourceMask) ==
+                                 (eph.data_source_code & kGalClockSourceMask))) {
+                return false;
+            }
+        }
+    }
+    addEphemeris(eph);
+    return true;
+}
+
+bool NavigationData::removeEphemeris(const Ephemeris& eph) {
+    const auto it = ephemeris_data.find(eph.satellite);
+    if (it == ephemeris_data.end()) {
+        return false;
+    }
+    auto& list = it->second;
+    // compareEphemerisOrder() runs through every field except the satellite (one list per
+    // satellite) and glonass_ln, so equality here means "the same record in every field".
+    const auto match = std::find_if(list.begin(), list.end(), [&eph](const Ephemeris& stored) {
+        return stored.satellite == eph.satellite && stored.glonass_ln == eph.glonass_ln &&
+               compareEphemerisOrder(stored, eph) == 0;
+    });
+    if (match == list.end()) {
+        return false;
+    }
+    list.erase(match);
+    if (list.empty()) {
+        ephemeris_data.erase(it);
+    }
+    satellite_state_cache_.clear();
+    ++revision_;
+    return true;
+}
 
 void NavigationData::clear() {
     ephemeris_data.clear();

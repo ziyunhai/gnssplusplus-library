@@ -130,6 +130,14 @@ bool RTKProcessor::floatResidualExceedsReacquisitionGate() const {
     if (rtk_config_.ar_policy == RTKConfig::ARPolicy::DEMO5_CONTINUOUS) {
         return false;
     }
+    // While the carrier prior holds the position, large prefit code residuals
+    // are the blocked-sky code the prior exists to ignore (the filter rejects
+    // those rows at its 3 m outlier gate). They say nothing about the float
+    // position or ambiguities, and a reacquisition reset here would throw the
+    // carrier-defined ambiguities away.
+    if (rtk_config_.enable_canyon_carrier_prior && carrier_prior_.engaged_this_epoch) {
+        return false;
+    }
     const double max_prefit_rms = rtk_config_.max_float_prefit_residual_rms_m;
     if (std::isfinite(max_prefit_rms) && max_prefit_rms > 0.0 &&
         std::isfinite(current_update_diagnostics_.prefit_residual_rms_m) &&
@@ -332,6 +340,9 @@ void RTKProcessor::recordFallbackEpoch(
 void RTKProcessor::resetPositionToSPP(
     const ObservationData& rover_obs,
     const NavigationData& nav) {
+    if (rtk_config_.enable_canyon_carrier_prior) {
+        captureCarrierPriorSnapshot();
+    }
     // M1 time updates are strictly single-use. Consume before any mode return
     // so STATIC/MOVING_BASE or a caller mode change cannot retain a stale IMU
     // increment for a later kinematic epoch.
@@ -347,6 +358,15 @@ void RTKProcessor::resetPositionToSPP(
     has_external_position_time_update_ = false;
     has_external_velocity_time_update_ = false;
     ins_time_update_applied_last_epoch_ = false;
+    // An INS-seeded float the previous epoch's measurements could not support
+    // (ins_prior_min_code_rows) leaves a posterior that is only the propagated
+    // prior. Do not propagate it again: skip this epoch's time update, count it
+    // as rejected and fall through to the legacy SPP/trusted re-seed below.
+    const bool drop_ins_prior = drop_ins_prior_next_epoch_;
+    drop_ins_prior_next_epoch_ = false;
+    // reject_float_seeded_at_base: re-evaluated at every re-seed. Only the
+    // final base_position_ fallback of the kinematic seed chain below sets it.
+    rover_seed_from_base_fallback_ = false;
 
     if (rtk_config_.position_mode == RTKConfig::PositionMode::STATIC) {
         // Static: position accumulates with process noise
@@ -358,8 +378,12 @@ void RTKProcessor::resetPositionToSPP(
 
     const bool moving_base_mode = isMovingBasePositionMode(rtk_config_);
 
-    if (rtk_config_.use_external_position_time_update &&
-        has_time_update_this_epoch && !moving_base_mode) {
+    const bool time_update_requested =
+        rtk_config_.use_external_position_time_update &&
+        has_time_update_this_epoch && !moving_base_mode;
+    if (time_update_requested && drop_ins_prior) {
+        ++ins_time_update_rejected_count_;
+    } else if (time_update_requested) {
         const bool applied = rtk_config_.enable_velocity_states &&
                 has_velocity_update_this_epoch
             ? rtk_ins_time_update::applyPositionVelocity(
@@ -560,6 +584,7 @@ void RTKProcessor::resetPositionToSPP(
                 rover_pos = last_solution_position_;
             } else {
                 rover_pos = base_position_;
+                rover_seed_from_base_fallback_ = true;
             }
         }
     }

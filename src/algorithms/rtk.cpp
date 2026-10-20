@@ -9,6 +9,7 @@
 #include <libgnss++/algorithms/rtk_measurement.hpp>
 #include <libgnss++/algorithms/rtk_selection.hpp>
 #include <libgnss++/algorithms/rtk_ins_time_update.hpp>
+#include <libgnss++/algorithms/rtk_covariance_consistency.hpp>
 #include <libgnss++/algorithms/rtk_tdcp_diagnostics.hpp>
 #include <libgnss++/algorithms/rtk_update.hpp>
 #include <libgnss++/algorithms/spp_velocity.hpp>
@@ -32,10 +33,24 @@ namespace libgnss {
 
 using namespace rtk_internal;
 
+namespace {
+
+causal_ambiguity_arc::Config wideLaneMwArcConfig(const RTKProcessor::RTKConfig& config) {
+    causal_ambiguity_arc::Config arc_config;
+    arc_config.minimum_samples = std::max(1, config.wide_lane_min_arc_samples);
+    arc_config.maximum_effective_samples =
+        std::max(arc_config.minimum_samples, config.wide_lane_arc_max_effective_samples);
+    arc_config.maximum_gap_s = config.wide_lane_arc_max_gap_s;
+    return arc_config;
+}
+
+}  // namespace
+
 RTKProcessor::RTKProcessor()
     : spp_processor_(makeRTKSppProcessor(rtk_config_)),
       l1_l5_mw_arc_bank_(
           rtk_config_.lambda_l1_l5_wlnl_causal_arc_config),
+      wide_lane_mw_arc_bank_(wideLaneMwArcConfig(rtk_config_)),
       ambiguity_arc_bank_(
           rtk_config_.lambda_causal_arc_readiness_config) {
     filter_initialized_ = false;
@@ -45,6 +60,7 @@ RTKProcessor::RTKProcessor(const RTKConfig& rtk_config)
       spp_processor_(makeRTKSppProcessor(rtk_config_)),
       l1_l5_mw_arc_bank_(
           rtk_config_.lambda_l1_l5_wlnl_causal_arc_config),
+      wide_lane_mw_arc_bank_(wideLaneMwArcConfig(rtk_config_)),
       ambiguity_arc_bank_(
           rtk_config_.lambda_causal_arc_readiness_config) {
     filter_initialized_ = false;
@@ -54,6 +70,8 @@ void RTKProcessor::setRTKConfig(const RTKConfig& config) {
     rtk_config_ = config;
     l1_l5_mw_arc_bank_ = causal_ambiguity_arc::Bank(
         rtk_config_.lambda_l1_l5_wlnl_causal_arc_config);
+    wide_lane_mw_arc_bank_ =
+        causal_ambiguity_arc::Bank(wideLaneMwArcConfig(rtk_config_));
     ambiguity_arc_bank_ = causal_ambiguity_arc::Bank(
         rtk_config_.lambda_causal_arc_readiness_config);
     syncSPPConfig();
@@ -77,11 +95,18 @@ bool RTKProcessor::initialize(const ProcessorConfig& config) {
 }
 
 PositionSolution RTKProcessor::processEpoch(const ObservationData& rover_obs, const NavigationData& nav) {
-    return spp_processor_.processEpoch(rover_obs, nav);
+    current_spp_solution_ = PositionSolution{};
+    auto spp = spp_processor_.processEpoch(rover_obs, nav);
+    current_spp_solution_ = spp;
+    return spp;
 }
 
 void RTKProcessor::reset() {
     filter_initialized_ = false;
+    carrier_prior_ = CarrierPriorRuntime{};
+    carrier_prior_stats_ = CarrierPriorStats{};
+    rover_seed_from_base_fallback_ = false;
+    current_spp_solution_ = PositionSolution{};
     adaptive_noise_tracker_.clear();
     debug_telemetry_ = EpochDebugTelemetry{};
     debug_telemetry_.prior_held_integer_count = static_cast<int>(last_dd_fixed_.size());
@@ -101,6 +126,7 @@ void RTKProcessor::reset() {
     l1_l2_multifrequency_consensus_state_machine_.reset();
     satellite_par_persistent_satellites_.clear();
     l1_l5_mw_arc_bank_.reset();
+    wide_lane_mw_arc_bank_.reset();
     filter_state_ = RTKState{};
     filter_state_.next_state_idx = REAL_STATES + IONO_STATES;
     ambiguity_states_.clear();
@@ -128,6 +154,9 @@ void RTKProcessor::reset() {
     doppler_phase_history_l1_m_.clear();
     doppler_phase_history_l2_m_.clear();
     doppler_phase_history_l5_m_.clear();
+    has_doppler_history_time_ = false;
+    has_doppler_history_base_time_ = false;
+    half_cycle_lli_history_.clear();
     code_phase_history_l1_m_.clear();
     code_phase_history_l2_m_.clear();
     tdcp_history_l1_.clear();
@@ -143,6 +172,7 @@ void RTKProcessor::reset() {
     ins_time_update_applied_count_ = 0;
     ins_time_update_rejected_count_ = 0;
     ins_time_update_applied_last_epoch_ = false;
+    drop_ins_prior_next_epoch_ = false;
     position_correction_count_ = 0;
     position_correction_sum_sq_m2_ = 0.0;
     consecutive_cp_pr_gate_rejections_ = 0;
@@ -217,7 +247,40 @@ PositionSolution RTKProcessor::generateSolution(const GNSSTime& time, SolutionSt
     double N = a / std::sqrt(1 - e2*std::sin(solution.position_geodetic.latitude)*std::sin(solution.position_geodetic.latitude));
     solution.position_geodetic.height = p / std::cos(solution.position_geodetic.latitude) - N;
     solution.num_satellites = num_satellites;
-    solution.position_covariance = Matrix3d::Identity() * 0.01;
+    solution.position_covariance =
+        Matrix3d::Identity() * RTKConfig::kLegacyReportedVarianceM2;
+    if (status == SolutionStatus::FLOAT &&
+        rtk_config_.reported_covariance_mode !=
+            RTKConfig::ReportedCovarianceMode::LEGACY_FIXED_SIGMA &&
+        filter_state_.covariance.rows() >= BASE_STATES &&
+        filter_state_.covariance.cols() >= BASE_STATES) {
+        using Mode = RTKConfig::ReportedCovarianceMode;
+        const Mode mode = rtk_config_.reported_covariance_mode;
+        Matrix3d reported =
+            filter_state_.covariance.topLeftCorner<BASE_STATES, BASE_STATES>();
+        if (mode != Mode::FILTER_MARGINAL && has_first_pass_covariance_ &&
+            first_pass_position_covariance_.allFinite()) {
+            reported = first_pass_position_covariance_;
+            if (std::isfinite(first_pass_nis_per_observation_) &&
+                first_pass_nis_per_observation_ > 1.0) {
+                solution.rtk_covariance_variance_factor =
+                    first_pass_nis_per_observation_;
+                reported *= first_pass_nis_per_observation_;
+            }
+        }
+        if (reported.allFinite()) {
+            reported = 0.5 * (reported + reported.transpose());
+            if (mode == Mode::SPP_CONSISTENCY_SCALED && epoch_spp_valid_) {
+                solution.rtk_covariance_spp_scale =
+                    rtk_covariance_consistency::sppConsistencyScale(
+                        solution.position_ecef - epoch_spp_position_ecef_,
+                        reported, epoch_spp_position_covariance_);
+                reported *= solution.rtk_covariance_spp_scale;
+            }
+            solution.position_covariance = reported;
+            solution.rtk_reported_covariance_replaced = true;
+        }
+    }
     solution.pdop = 2.0; solution.hdop = 1.5; solution.vdop = 2.5;
     if (filter_state_.state.size() >= 3) solution.baseline_length = filter_state_.state.head<3>().norm();
     solution.ratio = last_ar_ratio_;
@@ -232,6 +295,20 @@ PositionSolution RTKProcessor::generateSolution(const GNSSTime& time, SolutionSt
         current_update_diagnostics_.prefit_residual_rms_m;
     solution.rtk_update_prefit_residual_max_m =
         current_update_diagnostics_.prefit_residual_max_m;
+    {
+        // velocity_consistency_v8 (l): the solution's own update prefit
+        // residual against the configured FLOAT prefit gate (each limit only
+        // when > 0). Informational; consumed by the fusion re-anchor option.
+        const double max_rms = rtk_config_.max_float_prefit_residual_rms_m;
+        const double max_max = rtk_config_.max_float_prefit_residual_max_m;
+        solution.float_prefit_gate_exceeded =
+            (std::isfinite(max_rms) && max_rms > 0.0 &&
+             std::isfinite(solution.rtk_update_prefit_residual_rms_m) &&
+             solution.rtk_update_prefit_residual_rms_m > max_rms) ||
+            (std::isfinite(max_max) && max_max > 0.0 &&
+             std::isfinite(solution.rtk_update_prefit_residual_max_m) &&
+             solution.rtk_update_prefit_residual_max_m > max_max);
+    }
     solution.rtk_update_post_suppression_residual_rms_m =
         current_update_diagnostics_.post_suppression_residual_rms_m;
     solution.rtk_update_post_suppression_residual_max_m =
@@ -492,7 +569,8 @@ std::vector<RTKProcessor::DoubleDifference> RTKProcessor::formDoubleDifferences(
         const_cast<RTKProcessor*>(this)->current_sat_data_ = sat_data;
         const double bias_dt =
             has_last_epoch_ ? std::max(rover_obs.time - last_epoch_time_, 1e-3) : 1.0;
-        const_cast<RTKProcessor*>(this)->updateBias(sat_data, bias_dt);
+        const_cast<RTKProcessor*>(this)->updateBias(sat_data, bias_dt, rover_obs.time,
+                                                    base_obs.time);
     }
 
     std::vector<DoubleDifference> measurements;
@@ -674,7 +752,6 @@ bool RTKProcessor::validateAmbiguityResolution(const VectorXd& fixed_ambiguities
     const double norm = diff.transpose() * solver.solve(diff);
     return std::isfinite(norm) && norm >= 0.0;
 }
-void RTKProcessor::updateAmbiguityStates(const std::vector<DoubleDifference>&) {}
 Vector3d RTKProcessor::calculateBaseline() const {
     if (!filter_initialized_ || filter_state_.state.size() < 3) {
         return Vector3d::Zero();
@@ -723,7 +800,6 @@ bool RTKProcessor::hasSufficientSatellites(
     }
     return satellites.size() >= 4;
 }
-void RTKProcessor::resetAmbiguity(const SatelliteId&, SignalType) {}
 bool RTKProcessor::applyFixedAmbiguities(const VectorXd& fixed_n1,
                                          const VectorXd& fixed_n2,
                                          const std::map<SatelliteId, SatelliteData>& sat_data) {
@@ -761,16 +837,6 @@ void RTKProcessor::solvePositionWithAmbiguities(const std::map<SatelliteId, Sate
     if (has_fixed_solution_ && filter_initialized_ && filter_state_.state.size() >= 3) {
         filter_state_.state.head<3>() = fixed_baseline_;
     }
-}
-bool RTKProcessor::trySingleEpochAR(const std::map<SatelliteId, SatelliteData>& sat_data) {
-    if (!filter_initialized_) {
-        return false;
-    }
-    current_sat_data_ = sat_data;
-    if (!resolveAmbiguities(buildDoubleDifferencePairs(sat_data, 0))) {
-        return false;
-    }
-    return has_fixed_solution_ && validateFixedSolution(sat_data, last_epoch_time_);
 }
 
 } // namespace libgnss

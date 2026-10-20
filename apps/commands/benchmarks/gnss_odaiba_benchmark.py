@@ -9,6 +9,7 @@ import csv
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -19,10 +20,28 @@ from support.gnss_runtime import load_python_module, resolve_gnss_command
 from support.gnss_runtime import application_root
 
 ROOT_DIR = application_root(__file__)
-DEFAULT_RTKLIB = "/tmp/RTKLIB/app/rnx2rtkp/gcc/rnx2rtkp"
+DEFAULT_RTKLIB = os.environ.get("RTKLIB_RNX2RTKP") or shutil.which("rnx2rtkp")
+DEFAULT_DATASET_DIR = (
+    Path(os.environ["GNSSPP_URBANNAV_ROOT"]) / "Odaiba"
+    if os.environ.get("GNSSPP_URBANNAV_ROOT")
+    else ROOT_DIR / "data/driving/Tokyo_Data/Odaiba"
+)
 driving_comparison = load_python_module(
     "gnssplusplus_generate_driving_comparison",
     ROOT_DIR / "scripts" / "generate_driving_comparison.py",
+)
+
+# Surveyed ECEF position of the TUMSAT (Etchujima) Trimble base station that
+# records base_trimble.obs for the Odaiba drives, as published by the data
+# providers (Meguro/Suzuki/Kubo) for the Dec-2019 Odaiba collection:
+# https://github.com/MeijoMeguroLab/Open_data/blob/main/docs/2019_dataset.md
+# The UrbanNav Tokyo (Dec-2018) base_trimble.obs header APPROX POSITION
+# (-3961904.4341, 3348994.2660, 3698211.7067) sits 0.723 m west / 0.084 m
+# below this point, and every FIXED epoch of every solver inherits that
+# offset against the Applanix reference.csv. See docs/benchmarks.md.
+URBANNAV_ODAIBA_SURVEYED_BASE_ECEF = (-3961904.9530, 3348993.7578, 3698211.7553)
+URBANNAV_ODAIBA_SURVEYED_BASE_SOURCE = (
+    "MeijoMeguroLab/Open_data docs/2019_dataset.md surveyed base position"
 )
 
 
@@ -30,8 +49,17 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog=os.environ.get("GNSS_CLI_NAME"))
     parser.add_argument(
         "--rtklib-bin",
-        default=os.environ.get("RTKLIB_RNX2RTKP", DEFAULT_RTKLIB),
-        help="Path to the RTKLIB rnx2rtkp binary.",
+        default=DEFAULT_RTKLIB,
+        help="Path to the RTKLIB rnx2rtkp binary (default: $RTKLIB_RNX2RTKP or rnx2rtkp on PATH).",
+    )
+    parser.add_argument(
+        "--dataset-dir",
+        type=Path,
+        default=DEFAULT_DATASET_DIR,
+        help=(
+            "UrbanNav Odaiba directory holding rover_trimble.obs, base_trimble.obs, base.nav, "
+            "and reference.csv (default: $GNSSPP_URBANNAV_ROOT/Odaiba or data/driving/Tokyo_Data/Odaiba)."
+        ),
     )
     parser.add_argument(
         "--malib-bin",
@@ -41,26 +69,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--rover",
         type=Path,
-        default=ROOT_DIR / "data/driving/Tokyo_Data/Odaiba/rover_trimble.obs",
-        help="Rover RINEX observation file.",
+        default=None,
+        help="Rover RINEX observation file (default: <dataset-dir>/rover_trimble.obs).",
     )
     parser.add_argument(
         "--base",
         type=Path,
-        default=ROOT_DIR / "data/driving/Tokyo_Data/Odaiba/base_trimble.obs",
-        help="Base RINEX observation file.",
+        default=None,
+        help="Base RINEX observation file (default: <dataset-dir>/base_trimble.obs).",
     )
     parser.add_argument(
         "--nav",
         type=Path,
-        default=ROOT_DIR / "data/driving/Tokyo_Data/Odaiba/base.nav",
-        help="Navigation RINEX file.",
+        default=None,
+        help="Navigation RINEX file (default: <dataset-dir>/base.nav).",
     )
     parser.add_argument(
         "--reference-csv",
         type=Path,
-        default=ROOT_DIR / "data/driving/Tokyo_Data/Odaiba/reference.csv",
-        help="Ground-truth CSV from UrbanNav.",
+        default=None,
+        help="Ground-truth CSV from UrbanNav (default: <dataset-dir>/reference.csv).",
     )
     parser.add_argument(
         "--rtklib-config",
@@ -174,6 +202,36 @@ def parse_args() -> argparse.Namespace:
         help="Mode passed through to gnss solve.",
     )
     parser.add_argument(
+        "--preset",
+        choices=("survey", "low-cost", "moving-base", "odaiba"),
+        default=None,
+        help="Optional RTK tuning preset passed through to gnss solve (e.g. odaiba).",
+    )
+    parser.add_argument(
+        "--base-position",
+        choices=("surveyed", "rinex-header"),
+        default="surveyed",
+        help=(
+            "Base station coordinate given to both libgnss++ (--base-ecef) and RTKLIB (-r): "
+            "'surveyed' uses the provider-published base position "
+            f"{URBANNAV_ODAIBA_SURVEYED_BASE_ECEF}; 'rinex-header' uses base_trimble.obs "
+            "APPROX POSITION, which is 0.72 m west of it (default: surveyed)."
+        ),
+    )
+    parser.add_argument(
+        "--base-ecef",
+        type=float,
+        nargs=3,
+        metavar=("X", "Y", "Z"),
+        default=None,
+        help="Explicit base ECEF position in meters; overrides --base-position.",
+    )
+    parser.add_argument(
+        "--use-existing-rtklib-solution",
+        action="store_true",
+        help="Do not rerun RTKLIB; score the existing --rtklib-pos file.",
+    )
+    parser.add_argument(
         "--glonass-ar",
         default="off",
         choices=("off", "on", "autocal"),
@@ -209,7 +267,41 @@ def parse_args() -> argparse.Namespace:
         default=4,
         help="Parallel worker count for segmented libgnss++ solving.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    for attr, filename in (
+        ("rover", "rover_trimble.obs"),
+        ("base", "base_trimble.obs"),
+        ("nav", "base.nav"),
+        ("reference_csv", "reference.csv"),
+    ):
+        if getattr(args, attr) is None:
+            setattr(args, attr, args.dataset_dir / filename)
+    return args
+
+
+def preset_args(args: argparse.Namespace) -> list[str]:
+    preset = getattr(args, "preset", None)
+    return ["--preset", preset] if preset else []
+
+
+def resolve_base_position(args: argparse.Namespace) -> tuple[tuple[float, float, float] | None, str]:
+    """Return (base ECEF or None for the RINEX header, source label)."""
+    explicit = getattr(args, "base_ecef", None)
+    if explicit is not None:
+        return tuple(float(value) for value in explicit), "--base-ecef"
+    if getattr(args, "base_position", "surveyed") == "rinex-header":
+        return None, "base RINEX header APPROX POSITION"
+    return URBANNAV_ODAIBA_SURVEYED_BASE_ECEF, URBANNAV_ODAIBA_SURVEYED_BASE_SOURCE
+
+
+def lib_base_args(args: argparse.Namespace) -> list[str]:
+    base_ecef, _ = resolve_base_position(args)
+    return ["--base-ecef", *(f"{value:.4f}" for value in base_ecef)] if base_ecef else []
+
+
+def rtklib_base_args(args: argparse.Namespace) -> list[str]:
+    base_ecef, _ = resolve_base_position(args)
+    return ["-r", *(f"{value:.4f}" for value in base_ecef)] if base_ecef else []
 
 
 def ensure_exists(path: Path, description: str) -> None:
@@ -267,8 +359,14 @@ def write_summary_json(args: argparse.Namespace) -> dict[str, object]:
     else:
         lib_malib_common_summary = None
 
+    base_ecef, base_source = resolve_base_position(args)
     payload = {
         "dataset": "UrbanNav Tokyo Odaiba",
+        "preset": getattr(args, "preset", None),
+        "base_position": {
+            "source": base_source,
+            "ecef_m": list(base_ecef) if base_ecef is not None else None,
+        },
         "reference_csv": str(args.reference_csv),
         "lib_pos": str(args.lib_pos),
         "rtklib_pos": str(args.rtklib_pos),
@@ -423,6 +521,8 @@ def run_segmented_lib_solve(args: argparse.Namespace, gnss_command: Path | list[
                 args.mode,
                 "--glonass-ar",
                 args.glonass_ar,
+                *preset_args(args),
+                *lib_base_args(args),
                 "--no-kml",
                 "--no-kinematic-post-filter",
                 "--skip-epochs",
@@ -521,9 +621,13 @@ def main() -> int:
     if args.jobs <= 0:
         raise SystemExit("--jobs must be > 0")
 
-    rtklib_bin = Path(args.rtklib_bin)
-    if not rtklib_bin.exists():
-        raise SystemExit(f"Missing RTKLIB binary: {rtklib_bin}")
+    rtklib_bin = Path(args.rtklib_bin) if args.rtklib_bin else None
+    if args.use_existing_rtklib_solution:
+        ensure_exists(args.rtklib_pos, "existing RTKLIB solution")
+    elif rtklib_bin is None or not rtklib_bin.exists():
+        raise SystemExit(
+            f"Missing RTKLIB binary: {rtklib_bin or '(not set)'}; pass --rtklib-bin or set RTKLIB_RNX2RTKP"
+        )
     malib_bin = Path(args.malib_bin) if args.malib_bin else None
     if malib_bin is not None and not malib_bin.exists():
         raise SystemExit(f"Missing MALIB binary: {malib_bin}")
@@ -559,6 +663,8 @@ def main() -> int:
             args.mode,
             "--glonass-ar",
             args.glonass_ar,
+            *preset_args(args),
+            *lib_base_args(args),
         ]
         if partial_window:
             lib_command.append("--no-kml")
@@ -574,18 +680,21 @@ def main() -> int:
         print(f"  libgnss++: {args.lib_pos}")
         return 0
 
-    run_command(
-        [
-            str(rtklib_bin),
-            "-k",
-            str(args.rtklib_config),
-            "-o",
-            str(args.rtklib_pos),
-            str(args.rover),
-            str(args.base),
-            str(args.nav),
-        ]
-    )
+    if not args.use_existing_rtklib_solution:
+        assert rtklib_bin is not None
+        run_command(
+            [
+                str(rtklib_bin),
+                "-k",
+                str(args.rtklib_config),
+                *rtklib_base_args(args),
+                "-o",
+                str(args.rtklib_pos),
+                str(args.rover),
+                str(args.base),
+                str(args.nav),
+            ]
+        )
 
     if malib_bin is not None:
         run_command(
@@ -593,6 +702,7 @@ def main() -> int:
                 str(malib_bin),
                 "-k",
                 str(args.malib_config),
+                *rtklib_base_args(args),
                 "-o",
                 str(args.malib_pos),
                 str(args.rover),

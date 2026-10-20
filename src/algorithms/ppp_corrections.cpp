@@ -1,3 +1,4 @@
+#include "correction_products_internal.hpp"
 #include "ppp_internal.hpp"
 
 #include <libgnss++/algorithms/ppp_correction_contract.hpp>
@@ -13,6 +14,7 @@
 #include <libgnss++/iers/earth_rotation.hpp>
 #include <libgnss++/iers/ephemeris.hpp>
 #include <libgnss++/iers/tides.hpp>
+#include <libgnss++/models/ionosphere.hpp>
 #include <libgnss++/models/troposphere.hpp>
 
 #include <algorithm>
@@ -74,6 +76,10 @@ MadocaL6dShadowStatus PPPProcessor::inspectMadocaL6dShadow(
 
 namespace {
 
+using correction_products_internal::biasObservationCode;
+using correction_products_internal::dayOfYearFromTime;
+using correction_products_internal::ionexPiercePointAndMapping;
+
 constexpr double kDegreesToRadians = M_PI / 180.0;
 constexpr double kRtkLibMinElevationRadians = 5.0 * kDegreesToRadians;
 constexpr double kRtkLibGlonassErrorFactor = 1.5;
@@ -116,18 +122,6 @@ bool madocaSsrCorrectionIsCoherent(const SSRCorrectionStatus& status,
         return false;
     }
     return true;
-}
-
-int dayOfYearFromTime(const GNSSTime& time) {
-    const auto system_time = time.toSystemTime();
-    const std::time_t utc_seconds = std::chrono::system_clock::to_time_t(system_time);
-    std::tm utc_tm{};
-#if defined(_WIN32)
-    gmtime_s(&utc_tm, &utc_seconds);
-#else
-    gmtime_r(&utc_seconds, &utc_tm);
-#endif
-    return utc_tm.tm_yday + 1;
 }
 
 double julianDateFromTime(const GNSSTime& time) {
@@ -320,6 +314,30 @@ inline double ssrBiasLookup(const std::map<uint8_t, double>& m,
     return 0.0;
 }
 
+// GPS L2 code observations collapse onto GPS_L2C (bias id 8) whatever their
+// tracking mode. When the SSR source carries distinct L2C and L2 P(Y) biases
+// (Galileo HAS: L2 CL and L2 P), pick the one matching the tracked code:
+// P / Y / W / D / N (P(Y) and semi-/codeless) -> L2 P (id 9), otherwise L2C.
+uint8_t trackingAwareSsrBiasId(GNSSSystem system,
+                               uint8_t id,
+                               const std::string& observation_type,
+                               bool tracking_code_identity) {
+    if (!tracking_code_identity || system != GNSSSystem::GPS || (id != 8U && id != 9U) ||
+        observation_type.size() < 3) {
+        return id;
+    }
+    switch (observation_type[2]) {
+        case 'P':
+        case 'Y':
+        case 'W':
+        case 'D':
+        case 'N':
+            return 9U;
+        default:
+            return 8U;
+    }
+}
+
 double observationCodeBiasMeters(GNSSSystem system,
                                  SignalType primary_signal,
                                  SignalType secondary_signal,
@@ -329,9 +347,14 @@ double observationCodeBiasMeters(GNSSSystem system,
                                  double coeff_secondary,
                                  const std::string& primary_observation_type,
                                  const std::string& secondary_observation_type,
-                                 bool madoca_bias_identity) {
-    const uint8_t primary_id = algorithms::ppp_bias_identity::madocaBiasIdentityIdForObservation(
-        system, primary_signal, primary_observation_type, madoca_bias_identity);
+                                 bool madoca_bias_identity,
+                                 bool tracking_code_identity = false) {
+    const uint8_t primary_id = trackingAwareSsrBiasId(
+        system,
+        algorithms::ppp_bias_identity::madocaBiasIdentityIdForObservation(
+            system, primary_signal, primary_observation_type, madoca_bias_identity),
+        primary_observation_type,
+        tracking_code_identity);
     if (primary_id == 0U) {
         return 0.0;
     }
@@ -341,8 +364,12 @@ double observationCodeBiasMeters(GNSSSystem system,
         return primary_bias;
     }
 
-    const uint8_t secondary_id = algorithms::ppp_bias_identity::madocaBiasIdentityIdForObservation(
-        system, secondary_signal, secondary_observation_type, madoca_bias_identity);
+    const uint8_t secondary_id = trackingAwareSsrBiasId(
+        system,
+        algorithms::ppp_bias_identity::madocaBiasIdentityIdForObservation(
+            system, secondary_signal, secondary_observation_type, madoca_bias_identity),
+        secondary_observation_type,
+        tracking_code_identity);
     if (secondary_id == 0U) {
         return coeff_primary * primary_bias;
     }
@@ -459,33 +486,6 @@ bool madocaSsrMeasurementBiasesAreCoherent(
     return true;
 }
 
-std::string biasObservationCode(SignalType signal) {
-    switch (signal) {
-        case SignalType::GPS_L1CA: return "C1C";
-        case SignalType::GPS_L1P: return "C1P";
-        case SignalType::GPS_L2P: return "C2P";
-        case SignalType::GPS_L2C: return "C2W";
-        case SignalType::GPS_L5: return "C5Q";
-        case SignalType::GLO_L1CA: return "C1C";
-        case SignalType::GLO_L1P: return "C1P";
-        case SignalType::GLO_L2CA: return "C2C";
-        case SignalType::GLO_L2P: return "C2P";
-        case SignalType::GAL_E1: return "C1C";
-        case SignalType::GAL_E5A: return "C5Q";
-        case SignalType::GAL_E5B: return "C7Q";
-        case SignalType::GAL_E6: return "C6C";
-        case SignalType::BDS_B1I: return "C2I";
-        case SignalType::BDS_B2I: return "C7I";
-        case SignalType::BDS_B3I: return "C6I";
-        case SignalType::BDS_B1C: return "C1C";
-        case SignalType::BDS_B2A: return "C5Q";
-        case SignalType::QZS_L1CA: return "C1C";
-        case SignalType::QZS_L2C: return "C2L";
-        case SignalType::QZS_L5: return "C5Q";
-        default: return "";
-    }
-}
-
 double dcbEntryBiasMeters(const DCBEntry& entry) {
     std::string unit = trimCopy(entry.unit);
     std::transform(unit.begin(), unit.end(), unit.begin(), [](unsigned char ch) {
@@ -552,61 +552,6 @@ double observationDcbBiasMeters(const DCBProducts& dcb_products,
     }
     return coeff_primary * (have_primary ? primary_bias_m : 0.0) +
            coeff_secondary * (have_secondary ? secondary_bias_m : 0.0);
-}
-
-bool ionexPiercePointAndMapping(const IONEXProducts& ionex_products,
-                                const Vector3d& receiver_position,
-                                double azimuth_rad,
-                                double elevation_rad,
-                                double& ipp_lat_deg,
-                                double& ipp_lon_deg,
-                                double& mapping_factor) {
-    if (elevation_rad <= 0.0) {
-        return false;
-    }
-    double latitude_rad = 0.0;
-    double longitude_rad = 0.0;
-    double height_m = 0.0;
-    ecef2geodetic(receiver_position, latitude_rad, longitude_rad, height_m);
-
-    const double earth_radius_m =
-        ionex_products.base_radius_km > 0.0 ?
-            ionex_products.base_radius_km * 1000.0 :
-            constants::WGS84_A;
-    const double shell_height_m =
-        !ionex_products.height_grid.empty() ?
-            ionex_products.height_grid.front() * 1000.0 :
-            450000.0;
-    if (earth_radius_m <= 0.0 || shell_height_m < 0.0) {
-        return false;
-    }
-
-    const double ratio = earth_radius_m / (earth_radius_m + shell_height_m);
-    const double cos_elevation = std::cos(elevation_rad);
-    const double argument = std::clamp(ratio * cos_elevation, -1.0, 1.0);
-    const double psi = M_PI_2 - elevation_rad - std::asin(argument);
-    const double sin_lat = std::sin(latitude_rad);
-    const double cos_lat = std::cos(latitude_rad);
-    const double sin_psi = std::sin(psi);
-    const double cos_psi = std::cos(psi);
-
-    const double ipp_lat_rad = std::asin(
-        std::clamp(sin_lat * cos_psi + cos_lat * sin_psi * std::cos(azimuth_rad), -1.0, 1.0));
-    const double ipp_lon_rad = longitude_rad + std::atan2(
-        sin_psi * std::sin(azimuth_rad),
-        cos_lat * cos_psi - sin_lat * sin_psi * std::cos(azimuth_rad));
-
-    const double mapping_argument = ratio * cos_elevation;
-    mapping_factor = 1.0 / std::sqrt(std::max(1e-12, 1.0 - mapping_argument * mapping_argument));
-    ipp_lat_deg = ipp_lat_rad / kDegreesToRadians;
-    ipp_lon_deg = ipp_lon_rad / kDegreesToRadians;
-    while (ipp_lon_deg > 180.0) {
-        ipp_lon_deg -= 360.0;
-    }
-    while (ipp_lon_deg < -180.0) {
-        ipp_lon_deg += 360.0;
-    }
-    return std::isfinite(mapping_factor);
 }
 
 double rtklibSystemErrorFactor(GNSSSystem system) {
@@ -882,14 +827,26 @@ void PPPProcessor::applyPreciseCorrections(std::vector<IonosphereFreeObs>& obser
 
         bool have_precise = false;
         if (precise_products_loaded_) {
+            bool precise_clock_available = false;
             have_precise = precise_products_.interpolateOrbitClock(
                 observation.satellite,
                 time,
                 sat_position,
                 sat_velocity,
                 sat_clock_bias,
-                sat_clock_drift);
-            if (have_precise) {
+                sat_clock_drift,
+                &precise_clock_available);
+            // With precise products loaded, a satellite needs both a precise
+            // orbit and a precise clock. Falling back to the broadcast orbit
+            // and clock (e.g. QZSS / GLONASS absent from an IGS GPS-only SP3)
+            // would mix the broadcast clock datum into the product clock
+            // datum that the receiver clock state follows. RTKLIB (EPHOPT_PREC)
+            // likewise drops satellites missing from the SP3.
+            if (!have_precise || !precise_clock_available) {
+                observation.valid = false;
+                continue;
+            }
+            {
                 // Light-travel-time correction: the SP3 query above samples
                 // the orbit at reception time, but the signal left the sat at
                 // emission_time = reception − τ. Re-querying the precise
@@ -909,6 +866,12 @@ void PPPProcessor::applyPreciseCorrections(std::vector<IonosphereFreeObs>& obser
                     sat_position -= sat_velocity * travel_time;
                     sat_clock_bias -= sat_clock_drift * travel_time;
                 }
+                // SP3 / RINEX clock products exclude the periodic
+                // relativistic effect (up to ~14 m for GPS); add it here.
+                // The broadcast branch below gets it from the navigation
+                // message clock model instead.
+                sat_clock_bias +=
+                    preciseClockRelativisticCorrection(sat_position, sat_velocity);
             }
         }
 
@@ -956,7 +919,7 @@ void PPPProcessor::applyPreciseCorrections(std::vector<IonosphereFreeObs>& obser
                 observation.valid = false;
                 continue;
             }
-            if (env_overrides_.require_ssr_orbit &&
+            if ((env_overrides_.require_ssr_orbit || require_ssr_orbit_correction_) &&
                 ssr_products_loaded_ && ssr_orbit_iode < 0) {
                 observation.valid = false;
                 continue;
@@ -1151,7 +1114,8 @@ void PPPProcessor::applyPreciseCorrections(std::vector<IonosphereFreeObs>& obser
                     observation.secondary_code_bias_coeff,
                     observation.primary_observation_type,
                     observation.secondary_observation_type,
-                    madoca_bias_identity);
+                    madoca_bias_identity,
+                    ssr_code_bias_tracking_identity_);
                 // MADOCALIB adds SSR biases to the observables (ppp.c:432-451).
                 // The MADOCA L6 path follows that convention by default;
                 // GNSS_PPP_MADOCA_BIAS_SUBTRACT restores the legacy subtraction
@@ -1186,7 +1150,8 @@ void PPPProcessor::applyPreciseCorrections(std::vector<IonosphereFreeObs>& obser
                         SignalType::SIGNAL_TYPE_COUNT, false, code_bias_m, 1.0, 0.0,
                         observation.primary_observation_type,
                         std::string(),
-                        madoca_bias_identity);
+                        madoca_bias_identity,
+                        ssr_code_bias_tracking_identity_);
                     observation.pseudorange_l1 += ssr_bias_sign * cb_l1;
                     observation.code_bias_l1_m = cb_l1;
                     if (observation.has_l2) {
@@ -1195,7 +1160,8 @@ void PPPProcessor::applyPreciseCorrections(std::vector<IonosphereFreeObs>& obser
                             SignalType::SIGNAL_TYPE_COUNT, false, code_bias_m, 1.0, 0.0,
                             observation.secondary_observation_type,
                             std::string(),
-                            madoca_bias_identity);
+                            madoca_bias_identity,
+                            ssr_code_bias_tracking_identity_);
                         observation.pseudorange_l2 += ssr_bias_sign * cb_l2;
                         observation.code_bias_l2_m = cb_l2;
                     }
@@ -1207,7 +1173,8 @@ void PPPProcessor::applyPreciseCorrections(std::vector<IonosphereFreeObs>& obser
                             observation.satellite.system, extra.signal,
                             SignalType::SIGNAL_TYPE_COUNT, false, code_bias_m,
                             1.0, 0.0, extra.observation_type, std::string(),
-                            madoca_bias_identity);
+                            madoca_bias_identity,
+                            ssr_code_bias_tracking_identity_);
                         extra.pseudorange += ssr_bias_sign * cb;
                         extra.code_bias_m = cb;
                     }
@@ -1378,14 +1345,21 @@ void PPPProcessor::applyPreciseCorrections(std::vector<IonosphereFreeObs>& obser
             }
         }
 
-        // Satellite antenna PCO from ANTEX. The IGS final products since
-        // the 2017 convention switch publish SP3 / CLK at the iono-free
-        // combination antenna phase centre (so no shift is needed by
-        // default). For SP3 sources known to report centre of mass,
-        // setting apply_satellite_antenna_pco rotates the body-frame PCO
-        // (constructed via the yaw-steering attitude) into ECEF and
+        // Satellite antenna PCO from ANTEX. SP3 orbits (IGS and its
+        // analysis centres) refer to the satellite centre of mass, and the
+        // product clocks are consistent with the ANTEX model named in the
+        // headers (IGS finals: "PCV:IGS20", "SYS / PCVS APPLIED
+        // igs20_2375.atx"), so with precise products the ionosphere-free
+        // PCO has to be added (RTKLIB satantoff(), cssrlib). The body-frame
+        // PCO is rotated into ECEF with the yaw-steering attitude and
         // shifts sat_position so geodist() returns the antenna range.
-        if (satellite_antex_loaded_ && ppp_config_.apply_satellite_antenna_pco) {
+        // Broadcast and SSR-corrected broadcast orbits, and SP3 files marked
+        // as antenna-phase-centre orbits (gnss nav-products), already refer
+        // to the antenna phase centre; apply_satellite_antenna_pco forces
+        // the shift there as well.
+        if (satellite_antex_loaded_ &&
+            ((have_precise && !precise_products_.orbits_at_antenna_phase_center) ||
+             ppp_config_.apply_satellite_antenna_pco)) {
             Vector3d pco_body_if = Vector3d::Zero();
             bool have_pco = false;
             for (const auto& entry : satellite_antex_offsets_) {
@@ -1431,6 +1405,41 @@ void PPPProcessor::applyPreciseCorrections(std::vector<IonosphereFreeObs>& obser
         if (!std::isfinite(geometry.distance) || geometry.elevation < elevation_mask) {
             observation.valid = false;
             continue;
+        }
+
+        // Single-frequency rows of a broadcast ionosphere-free solution carry
+        // the full first-order ionospheric delay (metres to tens of metres);
+        // correct it with the broadcast Klobuchar model and its error
+        // (RTKLIB ERR_BRDCI) unless IONEX is loaded (handled below).
+        if (observation.secondary_signal == SignalType::SIGNAL_TYPE_COUNT &&
+            !ionex_products_loaded_ &&
+            broadcastClockIonosphereFree(
+                ppp_config_.use_ionosphere_free,
+                precise_products_loaded_,
+                ssr_products_loaded_,
+                dcb_products_loaded_)) {
+            const double frequency_hz =
+                signalFrequencyHz(observation.primary_signal, eph);
+            if (!nav.ionosphere_model.valid || !(frequency_hz > 0.0)) {
+                observation.valid = false;
+                continue;
+            }
+            double latitude = 0.0;
+            double longitude = 0.0;
+            double height = 0.0;
+            ecef2geodetic(receiver_position, latitude, longitude, height);
+            const double frequency_ratio = constants::GPS_L1_FREQ / frequency_hz;
+            const double ionosphere_delay_m =
+                models::ionoDelayKlobuchar(
+                    latitude, longitude, geometry.azimuth, geometry.elevation,
+                    time.tow,
+                    nav.ionosphere_model.alpha,
+                    nav.ionosphere_model.beta) *
+                frequency_ratio * frequency_ratio;
+            observation.pseudorange_if -= ionosphere_delay_m;
+            const double ionosphere_sigma_m =
+                ppp_internal::kBroadcastIonosphereErrorFactor * ionosphere_delay_m;
+            deferred_variance_pr += ionosphere_sigma_m * ionosphere_sigma_m;
         }
 
         if (!applied_ssr_code_bias && dcb_products_loaded_) {
@@ -1723,24 +1732,6 @@ double PPPProcessor::measurementVariance(const IonosphereFreeObs& observation,
         carrier_phase ? 1e-8 : 1e-6);
 }
 
-double PPPProcessor::calculateTroposphericDelay(const Vector3d& receiver_pos,
-                                                const Vector3d& satellite_pos,
-                                                const GNSSTime& time,
-                                                double zenith_delay) const {
-    double lat = 0.0;
-    double lon = 0.0;
-    double h = 0.0;
-    ecef2geodetic(receiver_pos, lat, lon, h);
-    const Vector3d los_enu = ecef2enu(satellite_pos - receiver_pos, lat, lon);
-    const double horizontal = std::hypot(los_enu.x(), los_enu.y());
-    const double elevation = std::atan2(los_enu.z(), horizontal);
-    if (!ppp_config_.estimate_troposphere) {
-        return modeledTroposphereDelayMeters(receiver_pos, elevation, time);
-    }
-    const double mapping = calculateMappingFunction(receiver_pos, elevation, time);
-    return mapping * zenith_delay;
-}
-
 double PPPProcessor::calculateMappingFunction(const Vector3d& receiver_pos,
                                               double elevation,
                                               const GNSSTime& time) const {
@@ -1792,15 +1783,18 @@ Vector3d PPPProcessor::calculateSolidEarthTides(const Vector3d& position,
     if (algorithms::ppp_correction_contract::useIersSolidEarthTide(
             madoca_per_frequency, ppp_config_.use_iers_solid_tide)) {
         // IERS Conventions 2010 §7.1.1 (Dehant) Step-1 + Step-2 model
-        // via the libgnss::iers wrapper. Sun and Moon are supplied in
-        // ICRS — see the FRAME NOTE in libgnss++/iers/tides.hpp for
-        // why this is the correct frame for the IERS routine despite
-        // its public documentation calling it "ECEF".
+        // via the libgnss::iers wrapper, with the SOFA Sun and Moon
+        // rotated to ITRS (the station frame).
         const double mjd_utc = libgnss::iers::gnssTimeToMjdUtc(time);
-        const Vector3d sun_icrs  = libgnss::iers::sunPositionIcrs(mjd_utc);
-        const Vector3d moon_icrs = libgnss::iers::moonPositionIcrs(mjd_utc);
-        return libgnss::iers::solidEarthTideDisplacement(
-            mjd_utc, position, sun_icrs, moon_icrs);
+        libgnss::iers::EarthOrientationParams eop;
+        if (eop_table_) {
+            try {
+                eop = getEarthOrientationParams(time);
+            } catch (const std::out_of_range&) {
+                eop = libgnss::iers::EarthOrientationParams{};
+            }
+        }
+        return libgnss::iers::solidEarthTideDisplacementAt(mjd_utc, position, eop);
     }
 
     // Default path: simplified Step-1-only Love-number body-tide

@@ -81,10 +81,13 @@ The default sources are fixed to this R2 fixture:
 | `IGS0OPSFIN...ORB.SP3.gz`, `...CLK.CLK.gz` | BKG IGS final products, GPS week 2295 | PPP precise orbit/clock |
 | `IGS0OPSSNX_2023365...SOL.SNX.gz` | SOPAC/Garner mirror of the IGS weekly combination | independent station truth |
 | station logs | `files.igs.org/pub/station/log/` | station/receiver history audit |
-| `IGS20.ssc`, `igs20.atx` | `files.igs.org` | reference-frame and antenna-model provenance |
+| `IGS20.ssc` | `files.igs.org/pub/station/coord/IGS20/` | reference-frame provenance |
+| `igs20_2425.atx.gz` (`igs20.atx`) | `files.igs.org/pub/station/general/pcv_archive/` | antenna-model provenance |
 
 The command verifies the pinned byte count and SHA-256 before using every
-source. Compact RINEX is converted with a system `CRX2RNX` when available;
+source. `igs20.atx` is taken from the immutable IGS PCV archive rather than
+`general/igs20.atx`, which IGS updates in place; the decompressed file is
+also checked against its own pinned size and SHA-256. Compact RINEX is converted with a system `CRX2RNX` when available;
 on Linux x86-64 it otherwise downloads the official GSI RNXCMP 4.2.0 binary,
 verifies its pinned archive hash, safely extracts the `CRX2RNX` member, and
 sets the cached copy executable. Other platforms fail closed unless a system
@@ -165,19 +168,52 @@ does not provide velocities for epoch propagation. Any nonzero gate exit,
 missing artifact, failed converter, or truth metadata error is a failed
 result rather than an inferred pass.
 
-The frozen executions on 2026-08-24 produced:
+The frozen executions on 2026-10-01 (Windows, MSVC Release, `--mode full`,
+CompactRINEX converted with the RNXCMP `CRX2RNX` bundled in the `hatanaka`
+Python package) produced:
 
 | Dataset | Lane | State rate | Horizontal / vertical error | Convergence / initial risk | Decision |
 |---|---|---:|---:|---|---|
 | 2024-01-01 development | Relative | FIX 99.861% | 0.0089 / 0.0111 m | max epoch 3D 0.0298 m | demonstration only: RTK ANTEX is not applied |
-| 2024-01-01 development | PPP | solution 100% | 1.345 / 0.168 m | converged after 5,940 s; max epoch 3D 44.3 m | candidate after convergence; authority review required |
+| 2024-01-01 development | PPP | solution 100% | 0.029 / 0.035 m | converged after 2,250 s; max epoch 3D 1.70 m | candidate after convergence; authority review required |
 | 2024-01-02 sealed holdout | Relative | FIX 99.861% | 0.0084 / 0.0106 m | max epoch 3D 0.0250 m | demonstration only: RTK ANTEX is not applied |
-| 2024-01-02 sealed holdout | PPP | solution 100% | 1.945 / 0.409 m | converged after 3,780 s; max epoch 3D 625 m | candidate after convergence; authority review required |
+| 2024-01-02 sealed holdout | PPP | solution 100% | 0.023 / 0.041 m | converged after 2,010 s; max epoch 3D 2.71 m | candidate after convergence; authority review required |
 
-The holdout was run once with unchanged gates and was not used for tuning.
-The large pre-convergence PPP errors prohibit treating the first valid
-solution as a measured control point. Neither lane is promoted here as a
-Japanese legal/survey control-point workflow.
+The holdout was run once, with the final code of that change and unchanged
+gates, and was not used for tuning. Pre-convergence PPP errors still reach
+metres, so the first valid solution must not be treated as a measured control
+point. Neither lane is promoted here as a Japanese legal/survey
+control-point workflow.
+
+**Change note (2026-10-01).** The previous frozen table (2026-08-24) read,
+for PPP: development 1.345 / 0.168 m, converged after 5,940 s, max epoch 3D
+44.3 m; sealed holdout 1.945 / 0.409 m, converged after 3,780 s, max epoch 3D
+625 m (the relative rows are unchanged to the listed precision). The PPP rows
+changed because of two solver fixes, not because of tuning:
+
+1. Precise-product PPP (#546): SP3/CLK clocks now get the periodic
+   relativistic term -2 r.v/c^2, satellites without a precise orbit and clock
+   are dropped instead of running on broadcast clocks (IGS0OPSFIN is GPS-only,
+   so the lane uses only the GPS satellites of the multi-GNSS rover file), and
+   the satellite antenna PCO from ANTEX is applied to the centre-of-mass SP3
+   orbits. On its own this gave, for the development day, 0.563 / 0.826 m,
+   convergence after 5,520 s and a start-up excursion up to 930 m 3D.
+2. Static PPP filter (this note): one Kalman measurement update per epoch
+   instead of up to three passes with the geometry frozen at the prior
+   position (the passes pushed the start-up solution hundreds of metres),
+   geometry-free / Melbourne-Wubbena cycle-slip detection for static
+   ionosphere-free PPP (it relied on the LLI flag alone; G22 losing L2 for
+   four epochs at 21:52 GPST left the development day 0.96 m east at the
+   end), and SP3/CLK satellites with a single frequency are skipped rather
+   than tied to the ionosphere-free ambiguity. RTKLIB demo5 on the same
+   development-day inputs (GPS, IGS finals) ends within 1 cm horizontally;
+   libgnss++ now ends at E +0.007 / N +0.004 / U -0.042 m.
+
+The pinned `igs20.atx` (60,295,761 bytes, SHA-256 `8715268e...`) is no longer
+what `https://files.igs.org/pub/station/general/igs20.atx` serves; it is
+`pcv_archive/igs20_2425.atx.gz` from the same server, which was placed in the
+cache for this run. The fetch step fails closed on the new upstream file
+until the source record is updated.
 
 For a future release, freeze thresholds only after:
 

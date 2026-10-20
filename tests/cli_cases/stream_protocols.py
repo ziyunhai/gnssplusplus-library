@@ -1,6 +1,7 @@
 """CLI regression cases for the StreamProtocolCases domain."""
 
 import ast
+import re
 
 from ._support import *  # noqa: F401,F403
 
@@ -32,6 +33,58 @@ def _sys_path_access_lines(source: str, *, filename: str = "<string>") -> list[i
             )
         }
     )
+
+
+def _assert_valid_rinex3_observation_text(
+    test: unittest.TestCase, text: str, *, expected_epochs: int, expected_sats: int
+) -> None:
+    """Structural RINEX 3.04 check of a writer output (header, epoch, record widths)."""
+    lines = text.split("\n")
+    header_end = next(i for i, line in enumerate(lines) if line[60:].startswith("END OF HEADER"))
+    header = lines[: header_end + 1]
+    test.assertTrue(all(len(line) == 80 for line in header), header)
+    test.assertTrue(header[0].startswith("     3.04"), header[0])
+    test.assertEqual((header[0][20], header[0][40]), ("O", "M"))
+    labels = {line[60:].strip() for line in header}
+    for label in (
+        "PGM / RUN BY / DATE",
+        "MARKER NAME",
+        "APPROX POSITION XYZ",
+        "ANTENNA: DELTA H/E/N",
+        "SYS / # / OBS TYPES",
+        "TIME OF FIRST OBS",
+    ):
+        test.assertIn(label, labels)
+    types = {}
+    for line in header:
+        if line[60:].startswith("SYS / # / OBS TYPES") and line[0] != " ":
+            types[line[0]] = int(line[3:6])
+    test.assertTrue({"G", "E", "R", "C", "J"} <= set(types), types)
+    epochs = [i for i, line in enumerate(lines) if line.startswith(">")]
+    test.assertEqual(len(epochs), expected_epochs)
+    epoch_re = re.compile(r"^> \d{4} \d{2} \d{2} \d{2} \d{2} [ \d]\d\.\d{7}  0[ \d]{2}\d$")
+    for index in epochs:
+        test.assertRegex(lines[index], epoch_re)
+        count = int(lines[index][32:35])
+        test.assertEqual(count, expected_sats)
+        for record in lines[index + 1 : index + 1 + count]:
+            test.assertEqual(len(record), 3 + 16 * types[record[0]], record)
+
+
+def _rinex3_obs_types(text: str) -> dict[str, list[str]]:
+    """SYS / # / OBS TYPES of a RINEX 3 header: system letter -> observation types."""
+    types: dict[str, list[str]] = {}
+    current = ""
+    for line in text.split("\n"):
+        if line[60:].startswith("END OF HEADER"):
+            break
+        if not line[60:].startswith("SYS / # / OBS TYPES"):
+            continue
+        if line[0] != " ":
+            current = line[0]
+            types[current] = []
+        types[current].extend(line[7:60].split())
+    return types
 
 
 class StreamProtocolCases:
@@ -304,6 +357,9 @@ class StreamProtocolCases:
             self.assertIn("R07", exported)
             self.assertIn("C19", exported)
             self.assertIn("J03", exported)
+            _assert_valid_rinex3_observation_text(
+                self, exported, expected_epochs=1, expected_sats=5
+            )
     def test_convert_converts_ubx_into_observation_rinex(self) -> None:
         with tempfile.TemporaryDirectory(prefix="gnss_convert_test_") as temp_dir:
             temp_root = Path(temp_dir)
@@ -333,6 +389,90 @@ class StreamProtocolCases:
             self.assertIn("R07", exported)
             self.assertIn("C19", exported)
             self.assertIn("J03", exported)
+            _assert_valid_rinex3_observation_text(
+                self, exported, expected_epochs=1, expected_sats=5
+            )
+            # RINEX 3.04 tracking codes per system (same as RTCM MSM and
+            # RTKLIB demo5 convbin): GPS/QZSS L1 C/A "1C", Galileo E1-C "1C",
+            # GLONASS G2 C/A "2C", BeiDou B1I "2I".
+            self.assertEqual(
+                _rinex3_obs_types(exported),
+                {
+                    "G": ["C1C", "L1C", "D1C", "S1C"],
+                    "E": ["C1C", "L1C", "D1C", "S1C"],
+                    "R": ["C2C", "L2C", "D2C", "S2C"],
+                    "C": ["C2I", "L2I", "D2I", "S2I"],
+                    "J": ["C1C", "L1C", "D1C", "S1C"],
+                },
+            )
+
+    def test_convert_ubx_multiband_rawx_keeps_distinct_tracking_codes(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="gnss_convert_codes_test_") as temp_dir:
+            temp_root = Path(temp_dir)
+            input_path = temp_root / "multiband.ubx"
+            output_path = temp_root / "multiband.obs"
+            # (pseudorange, phase, doppler, gnssId, svId, sigId, locktime, cno, trkStat)
+            input_path.write_bytes(
+                build_rawx_message(
+                    [
+                        (20200000.25, 110000.5, -1234.5, 0, 12, 0, 500, 45, 0x07),  # GPS L1 C/A
+                        (20200100.50, 90000.5, -960.0, 0, 12, 4, 500, 40, 0x07),  # GPS L2 CM
+                        (20200101.75, 90001.5, -960.0, 0, 12, 3, 500, 41, 0x07),  # GPS L2 CL
+                        (21400000.75, 120000.25, -432.5, 2, 5, 0, 480, 42, 0x07),  # GAL E1 C
+                        (21400100.25, 91000.25, -325.0, 2, 5, 5, 480, 41, 0x07),  # GAL E5b I
+                        (23400000.00, 140000.125, -55.0, 3, 19, 0, 440, 40, 0x07),  # BDS B1I D1
+                        (23400200.00, 105000.125, -43.0, 3, 19, 2, 440, 39, 0x07),  # BDS B2I D1
+                        (24500000.25, 150000.875, 8.0, 5, 3, 5, 420, 39, 0x07),  # QZSS L2 CL
+                        (22300000.50, 130000.75, 125.0, 6, 7, 0, 460, 41, 0x07),  # GLO G1
+                    ]
+                )
+            )
+
+            result = self.run_gnss(
+                "convert",
+                "--format",
+                "ubx",
+                "--input",
+                str(input_path),
+                "--obs-out",
+                str(output_path),
+                "--quiet",
+            )
+
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            self.assertIn("exported_obs_epochs=1", result.stdout)
+            exported = output_path.read_text(encoding="ascii")
+            types = _rinex3_obs_types(exported)
+            # GPS L2 CL and CM stay two distinct column groups; the library's
+            # default "2X" code must not appear for a receiver that reports
+            # the real tracking attribute.
+            for code in ("1C", "2L", "2S"):
+                for kind in "CLDS":
+                    self.assertIn(f"{kind}{code}", types["G"])
+            self.assertFalse([t for t in types["G"] if t[1:] == "2X"], types["G"])
+            self.assertEqual(
+                sorted(t[1:] for t in types["E"] if t[0] == "C"), ["1C", "7I"]
+            )
+            self.assertEqual(
+                sorted(t[1:] for t in types["C"] if t[0] == "C"), ["2I", "7I"]
+            )
+            self.assertEqual(sorted(t[1:] for t in types["J"] if t[0] == "C"), ["2L"])
+            self.assertEqual(sorted(t[1:] for t in types["R"] if t[0] == "C"), ["1C"])
+            _assert_valid_rinex3_observation_text(
+                self, exported, expected_epochs=1, expected_sats=5
+            )
+            gps_row = next(
+                line for line in exported.split("\n") if line.startswith("G12")
+            )
+            self.assertEqual(len(gps_row), 3 + 16 * len(types["G"]))
+            columns = {
+                name: gps_row[3 + 16 * i : 3 + 16 * i + 14].strip()
+                for i, name in enumerate(types["G"])
+            }
+            self.assertEqual(columns["C2L"], "20200101.750")
+            self.assertEqual(columns["C2S"], "20200100.500")
+            self.assertEqual(columns["C1C"], "20200000.250")
+
     def test_nmea_info_decodes_gga_and_rmc_from_file(self) -> None:
         with tempfile.TemporaryDirectory(prefix="gnss_nmea_test_") as temp_dir:
             temp_root = Path(temp_dir)
@@ -1046,10 +1186,10 @@ class StreamProtocolCases:
             self.assertIn("exported_sfrbx_messages=1", result.stdout)
             exported = output_path.read_text(encoding="ascii")
             self.assertIn(
-                "system,sv_id,frequency_id,channel,version,frame_kind,frame_id,page_id,word_count,words_hex",
+                "system,sv_id,signal_id,frequency_id,channel,version,frame_kind,frame_id,page_id,word_count,words_hex",
                 exported,
             )
-            self.assertIn("GPS,12,0,1,2,GPS_LNAV,5,,3,8B0000AA;00000500;CAFEBABE", exported)
+            self.assertIn("GPS,12,0,0,1,2,GPS_LNAV,5,,3,8B0000AA;00000500;CAFEBABE", exported)
     def test_convert_exports_gps_nav_from_ubx_sfrbx(self) -> None:
         with tempfile.TemporaryDirectory(prefix="gnss_convert_nav_test_") as temp_dir:
             temp_root = Path(temp_dir)
@@ -1207,3 +1347,354 @@ class StreamProtocolCases:
             self.assertIn("E05", exported)
             self.assertIn("5.440588203430D+03", exported)
             self.assertIn("1.094304025173D-08", exported)
+            # Data sources: I/NAV E1-B + clock E5b/E1 (513); SISA index 3 = 0.03 m.
+            self.assertIn(" 5.130000000000D+02 ", exported)
+            self.assertIn("\n     3.000000000000D-02", exported)
+
+    def test_convert_galileo_nav_data_sources_follow_sfrbx_signal(self) -> None:
+        # Words 0-2 received on E1-B and 3-5 on E5b-I: data sources 517
+        # (E1-B + E5b-I + clock E5b/E1), SISA index 107 written as 3.12 m.
+        with tempfile.TemporaryDirectory(prefix="gnss_convert_gal_src_test_") as temp_dir:
+            temp_root = Path(temp_dir)
+            input_path = temp_root / "session_gal_src.ubx"
+            output_path = temp_root / "session_gal_src.nav"
+            input_path.write_bytes(
+                b"".join(
+                    build_galileo_inav_sfrbx_message(
+                        word_type, sig_id=1 if word_type < 3 else 5, sisa_index=107
+                    )
+                    for word_type in range(6)
+                )
+            )
+
+            result = self.run_gnss(
+                "convert",
+                "--format",
+                "ubx",
+                "--input",
+                str(input_path),
+                "--nav-out",
+                str(output_path),
+                "--quiet",
+            )
+
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            self.assertIn("exported_nav_messages=1", result.stdout)
+            exported = output_path.read_text(encoding="ascii")
+            self.assertIn(" 5.170000000000D+02 ", exported)
+            self.assertIn("\n     3.120000000000D+00", exported)
+
+    def test_convert_exports_nav_from_real_x20_sfrbx(self) -> None:
+        # Real u-blox X20 frames: only the L1 C/A LNAV, E1-B I/NAV and B3I D1
+        # frames may feed the ephemeris decoders; CNAV / F/NAV / E6 / B-CNAV
+        # frames of the same satellites and constellations must not.
+        with tempfile.TemporaryDirectory(prefix="gnss_convert_x20_nav_test_") as temp_dir:
+            temp_root = Path(temp_dir)
+            input_path = temp_root / "x20.ubx"
+            output_path = temp_root / "x20.nav"
+            csv_path = temp_root / "x20_sfrbx.csv"
+            input_path.write_bytes(build_x20_sfrbx_excerpt())
+
+            result = self.run_gnss(
+                "convert",
+                "--format",
+                "ubx",
+                "--input",
+                str(input_path),
+                "--nav-out",
+                str(output_path),
+                "--sfrbx-out",
+                str(csv_path),
+                "--quiet",
+            )
+
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            self.assertIn("summary: processed_messages=19", result.stdout)
+            self.assertIn("exported_nav_messages=3", result.stdout)
+            self.assertIn("exported_sfrbx_messages=19", result.stdout)
+
+            # Values identical to the IGS BRDC00WRD 2025-189 records.
+            exported = output_path.read_text(encoding="ascii")
+            self.assertIn("G10 2025  7  8 20  0  0-4.758099094033D-04", exported)
+            self.assertIn("5.153654279709D+03", exported)
+            self.assertIn("E04 2025  7  8 19 20  0-2.803717507049D-04", exported)
+            self.assertIn("5.440617601395D+03", exported)
+            # E1-B pages only: data sources 513 (BRDC, from receivers that
+            # also track E5b-I: 517); SISA 3.12 m as in BRDC (index 107).
+            self.assertIn(" 5.130000000000D+02 ", exported)
+            self.assertIn("\n     3.120000000000D+00", exported)
+            self.assertTrue(exported.startswith("     3.04           NAVIGATION DATA     M"))
+            self.assertIn("C27 2025  7  8 19  0  0 5.004175473005D-04", exported)
+            self.assertIn("5.282620653152D+03", exported)
+
+            rows = csv_path.read_text(encoding="ascii").splitlines()
+            self.assertEqual(len(rows), 20)
+            self.assertTrue(rows[1].startswith("GPS,10,0,0,60,2,GPS_LNAV,1,,10,"))
+            self.assertTrue(rows[5].startswith("Galileo,4,1,0,89,2,GAL_INAV,1,,8,"))
+            self.assertTrue(rows[10].startswith("BeiDou,27,4,0,44,2,BDS_D1,1,,10,"))
+            self.assertTrue(rows[14].startswith("GPS,18,6,0,1,2,UNKNOWN,,,10,"))
+            self.assertTrue(rows[16].startswith("Galileo,19,3,0,29,2,UNKNOWN,,,8,"))
+            self.assertTrue(rows[18].startswith("BeiDou,49,6,0,77,2,UNKNOWN,,,9,"))
+
+    def test_convert_nav_rinex_out_decodes_real_x20_sfrbx(self) -> None:
+        # --nav-rinex-out uses the library SFRBX decoder (RAWX epoch = GPST reference): the
+        # same real X20 frames give the same BRDC records as the --nav-out path above.
+        with tempfile.TemporaryDirectory(prefix="gnss_convert_nav_rinex_x20_") as temp_dir:
+            temp_root = Path(temp_dir)
+            input_path = temp_root / "x20_with_time.ubx"
+            output_path = temp_root / "x20_decoded.nav"
+            legacy_path = temp_root / "x20_legacy.nav"
+            # Two transmissions of the excerpt: --nav-rinex-out writes a record once a second
+            # transmission produced the same record (confirm-twice).
+            input_path.write_bytes(
+                build_rawx_message(week=2374, tow=244800.0)
+                + build_x20_sfrbx_excerpt()
+                + build_rawx_message(week=2374, tow=244801.0)
+                + build_x20_sfrbx_excerpt()
+            )
+
+            result = self.run_gnss(
+                "convert",
+                "--format",
+                "ubx",
+                "--input",
+                str(input_path),
+                "--nav-rinex-out",
+                str(output_path),
+                "--nav-out",
+                str(legacy_path),
+                "--quiet",
+            )
+
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            self.assertIn(
+                "nav_rinex: ephemerides=3 GPS=1 Galileo=1 BeiDou=1 klobuchar=0 unconfirmed=0 conflicts=0",
+                result.stdout,
+            )
+            exported = output_path.read_text(encoding="ascii")
+            self.assertTrue(exported.startswith("     3.04           NAVIGATION DATA     M"))
+            self.assertIn("END OF HEADER", exported)
+            self.assertIn("G10 2025  7  8 20  0  0-4.758099094033D-04", exported)
+            self.assertIn("5.153654279709D+03", exported)
+            self.assertIn("E04 2025  7  8 19 20  0-2.803717507049D-04", exported)
+            self.assertIn("5.440617601395D+03", exported)
+            self.assertIn(" 5.130000000000D+02 ", exported)
+            self.assertIn("C27 2025  7  8 19  0  0 5.004175473005D-04", exported)
+            self.assertIn("5.282620653152D+03", exported)
+
+            def records(text: str) -> dict[str, list[str]]:
+                lines = text.splitlines()
+                found = {}
+                for index, line in enumerate(lines):
+                    if line[:1] in "GEC" and line[1:3].isdigit():
+                        found[line[:3]] = lines[index : index + 8]
+                return found
+
+            library_records = records(exported)
+            legacy_records = records(legacy_path.read_text(encoding="ascii"))
+            self.assertEqual(sorted(library_records), ["C27", "E04", "G10"])
+            self.assertEqual(sorted(legacy_records), ["C27", "E04", "G10"])
+            # Orbit, clock and group-delay fields agree with the app-local decoder; the
+            # transmission-time field (last line) and the BeiDou SV-accuracy column (URA index
+            # mapping) are the only differences.
+            for sat in ("G10", "E04"):
+                self.assertEqual(library_records[sat][:7], legacy_records[sat][:7], sat)
+            self.assertEqual(library_records["C27"][:6], legacy_records["C27"][:6])
+
+    def test_convert_nav_rinex_out_without_time_reference_keeps_galileo_and_beidou_only(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="gnss_convert_nav_rinex_noref_") as temp_dir:
+            temp_root = Path(temp_dir)
+            input_path = temp_root / "x20_no_time.ubx"
+            output_path = temp_root / "x20_no_time.nav"
+            input_path.write_bytes(build_x20_sfrbx_excerpt() * 2)  # two transmissions (confirm-twice)
+
+            result = self.run_gnss(
+                "convert",
+                "--format",
+                "ubx",
+                "--input",
+                str(input_path),
+                "--nav-rinex-out",
+                str(output_path),
+                "--quiet",
+            )
+
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            # GPS needs the receiver time to resolve the 10-bit week; E1-B and D1 carry full weeks.
+            self.assertIn("nav_rinex: ephemerides=2 Galileo=1 BeiDou=1 klobuchar=0", result.stdout)
+            # The GPS sets cannot be decoded without a time reference, so they are not even candidates.
+            self.assertIn("unconfirmed=0 conflicts=0", result.stdout)
+            exported = output_path.read_text(encoding="ascii")
+            self.assertNotIn("\nG10", exported)
+            self.assertIn("E04 2025  7  8 19 20  0", exported)
+
+    def test_convert_nav_rinex_out_writes_gps_klobuchar_header(self) -> None:
+        # Real GPS subframe 4 page 18 (G02, JammerTest 2024-09-10): alpha/beta of the BKG BRDC header.
+        page18 = [
+            0x22C11B1A, 0x90282C38, 0x1E0840A6, 0xBFBF90E7, 0x007F4183,
+            0x3FFFFF66, 0xBFFFFFEA, 0xBF9386E1, 0x84A241E6, 0x8480002F,
+        ]
+        with tempfile.TemporaryDirectory(prefix="gnss_convert_nav_rinex_iono_") as temp_dir:
+            temp_root = Path(temp_dir)
+            input_path = temp_root / "iono.ubx"
+            output_path = temp_root / "iono.nav"
+            input_path.write_bytes(
+                build_rawx_message()
+                + b"".join(build_gps_lnav_sfrbx_message(n) for _ in range(2) for n in (1, 2, 3))
+                + build_sfrbx_words_message(0, 2, 0, 0, page18)
+            )
+
+            result = self.run_gnss(
+                "convert",
+                "--format",
+                "ubx",
+                "--input",
+                str(input_path),
+                "--nav-rinex-out",
+                str(output_path),
+                "--quiet",
+            )
+
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            self.assertIn("nav_rinex: ephemerides=1 GPS=1 klobuchar=1", result.stdout)
+            exported = output_path.read_text(encoding="ascii")
+            self.assertIn(
+                "GPSA   3.0734E-08  1.4901E-08 -1.1921E-07 -1.1921E-07       IONOSPHERIC CORR", exported
+            )
+            self.assertIn(
+                "GPSB   1.3722E+05  1.6384E+04 -1.9661E+05  3.9322E+05       IONOSPHERIC CORR", exported
+            )
+            self.assertIn("G12 2022  3 10  0  0  0", exported)
+            self.assertIn("5.153795890808D+03", exported)
+
+    def test_convert_nav_rinex_out_keeps_unhealthy_records(self) -> None:
+        # A converter keeps what the receiver sent: a GPS set with svh=63 is written with its health
+        # (only `gnss live --ubx-nav` leaves unhealthy records out of the navigation database).
+        with tempfile.TemporaryDirectory(prefix="gnss_convert_nav_rinex_health_") as temp_dir:
+            temp_root = Path(temp_dir)
+            input_path = temp_root / "health.ubx"
+            output_path = temp_root / "health.nav"
+            input_path.write_bytes(
+                build_rawx_message()
+                + b"".join(build_gps_lnav_sfrbx_message(n, sv_id=12) for _ in range(2) for n in (1, 2, 3))
+                + b"".join(
+                    build_gps_lnav_sfrbx_message(n, sv_id=13, health=63) for _ in range(2) for n in (1, 2, 3)
+                )
+            )
+
+            result = self.run_gnss(
+                "convert",
+                "--format",
+                "ubx",
+                "--input",
+                str(input_path),
+                "--nav-rinex-out",
+                str(output_path),
+                "--quiet",
+            )
+
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            self.assertIn("nav_rinex: ephemerides=2 GPS=2 klobuchar=0", result.stdout)
+            lines = output_path.read_text(encoding="ascii").splitlines()
+            health_by_sat = {}
+            for index, line in enumerate(lines):
+                if line[:1] == "G" and line[1:3].isdigit():
+                    # broadcast orbit 6 line: SV accuracy, SV health, TGD, IODC
+                    health_by_sat[line[:3]] = float(lines[index + 6][23:42].replace("D", "E"))
+            self.assertEqual(health_by_sat, {"G12": 0.0, "G13": 63.0})
+
+    def test_convert_nav_rinex_out_needs_a_second_transmission(self) -> None:
+        # Confirm-twice: one transmission of a set writes nothing (the record stays a candidate); two
+        # differing ones (health 0 then 63, same IODE/toe) conflict and write nothing; the same one twice
+        # is written once.
+        with tempfile.TemporaryDirectory(prefix="gnss_convert_nav_rinex_d2_") as temp_dir:
+            temp_root = Path(temp_dir)
+
+            def convert(name: str, healths) -> str:
+                input_path = temp_root / f"{name}.ubx"
+                output_path = temp_root / f"{name}.nav"
+                input_path.write_bytes(
+                    build_rawx_message()
+                    + b"".join(
+                        build_gps_lnav_sfrbx_message(n, sv_id=12, health=h) for h in healths for n in (1, 2, 3)
+                    )
+                )
+                result = self.run_gnss(
+                    "convert",
+                    "--format",
+                    "ubx",
+                    "--input",
+                    str(input_path),
+                    "--nav-rinex-out",
+                    str(output_path),
+                    "--quiet",
+                )
+                self.assertEqual(result.returncode, 0, msg=result.stderr)
+                return result.stdout
+
+            self.assertIn(
+                "nav_rinex: ephemerides=0 klobuchar=0 unconfirmed=1 conflicts=0", convert("single", (0,))
+            )
+            self.assertIn(
+                "nav_rinex: ephemerides=0 klobuchar=0 unconfirmed=2 conflicts=1", convert("differ", (0, 63))
+            )
+            self.assertIn(
+                "nav_rinex: ephemerides=1 GPS=1 klobuchar=0 unconfirmed=0 conflicts=0", convert("twice", (0, 0))
+            )
+
+    def test_convert_nav_rinex_out_requires_ubx_format(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="gnss_convert_nav_rinex_fmt_") as temp_dir:
+            temp_root = Path(temp_dir)
+            result = self.run_gnss(
+                "convert",
+                "--format",
+                "rtcm",
+                "--input",
+                str(temp_root / "missing.rtcm3"),
+                "--nav-rinex-out",
+                str(temp_root / "out.nav"),
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("--nav-rinex-out requires --format ubx", result.stderr)
+
+    def test_ubx_info_decode_nav_counts_decoded_ephemerides(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="gnss_ubx_info_nav_decode_") as temp_dir:
+            input_path = Path(temp_dir) / "x20_with_time.ubx"
+            input_path.write_bytes(
+                build_rawx_message(week=2374, tow=244800.0) + build_x20_sfrbx_excerpt()
+            )
+
+            result = self.run_gnss("ubx-info", "--input", str(input_path), "--decode-nav", "--quiet")
+
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            self.assertIn(
+                "nav_decode: ephemerides=3 gps=1 qzss=0 galileo=1 beidou=1 glonass=0 klobuchar=0",
+                result.stdout,
+            )
+            plain = self.run_gnss("ubx-info", "--input", str(input_path), "--quiet")
+            self.assertNotIn("nav_decode:", plain.stdout)
+
+    def test_ubx_info_decodes_real_x20_sfrbx(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="gnss_ubx_info_x20_test_") as temp_dir:
+            input_path = Path(temp_dir) / "x20.ubx"
+            input_path.write_bytes(build_x20_sfrbx_excerpt())
+
+            result = self.run_gnss("ubx-info", "--input", str(input_path), "--decode-nav")
+
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            self.assertIn("sfrbx=19", result.stdout)
+
+            quiet = self.run_gnss("ubx-info", "--input", str(input_path), "--quiet")
+            self.assertEqual(quiet.returncode, 0, msg=quiet.stderr)
+            self.assertIn("sfrbx=19", quiet.stdout)
+            self.assertNotIn("subframe:", quiet.stdout)
+            for expected in (
+                "subframe: system=GPS sv=10 words=10 kind=GPS_LNAV frame_id=3 sig_id=0",
+                "subframe: system=Galileo sv=4 words=8 kind=GAL_INAV frame_id=0 sig_id=1",
+                "subframe: system=BeiDou sv=27 words=10 kind=BDS_D1 frame_id=2 sig_id=4",
+                "subframe: system=GPS sv=18 words=10 kind=UNKNOWN sig_id=4",
+                "subframe: system=SBAS sv=135 words=8 kind=SBAS frame_id=0 sig_id=0",
+                "subframe: system=Galileo sv=19 words=16 kind=UNKNOWN sig_id=8",
+                "subframe: system=BeiDou sv=49 words=9 kind=UNKNOWN sig_id=8",
+            ):
+                self.assertIn(expected, result.stdout)

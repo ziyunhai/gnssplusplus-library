@@ -1,5 +1,7 @@
 #include <libgnss++/io/ubx.hpp>
 
+#include <libgnss++/core/signal_policy.hpp>
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -77,6 +79,17 @@ std::vector<uint8_t> rawWordsToBigEndianBytes(const std::vector<uint32_t>& words
     return bytes;
 }
 
+/// One decoded RAWX measurement, held until every signal of the epoch is known
+/// so that tracking codes sharing a SignalType (GPS L2 CL / CM, Galileo E1 C /
+/// B, ...) can be resolved deterministically, as the RTCM MSM decoder does.
+constexpr int kDopplerOnlyRankOffset = 1000;
+
+struct RawxCandidate {
+    Observation obs;
+    const char* code = "";  // RINEX band + attribute, e.g. "2L"
+    int rank = 0;           // signal_policy tracking rank, lower is better
+};
+
 }  // namespace
 
 void UBXDecoder::clear() {
@@ -85,6 +98,8 @@ void UBXDecoder::clear() {
     has_last_nav_pvt_ = false;
     last_gps_week_ = 0;
     has_last_gps_week_ = false;
+    rawx_track_state_.clear();
+    rawx_gen9_receiver_ = false;
 }
 
 std::vector<UBXMessage> UBXDecoder::decode(const uint8_t* buffer, size_t size) {
@@ -203,44 +218,182 @@ bool UBXDecoder::decodeRawx(const UBXMessage& message, ObservationData& obs_data
         obs_data.receiver_position = last_nav_pvt_.position_ecef;
     }
 
+    // Carrier-phase validity and slip handling mirrors RTKLIB demo5
+    // decode_rxmrawx (src/rcv/ublox.c):
+    //  - phase is invalid when trkStat bit1 (cpValid) is clear, cpMes is the
+    //    -0.5 marker, or cpStdev exceeds the receiver-generation threshold;
+    //  - LLI bit0 (slip): locktime == 0, locktime decreased vs the previous
+    //    epoch of the same (sat, sigId), halfSub bit toggled, or cpStdev at
+    //    the slip threshold; the slip is carried forward until a valid phase
+    //    is reported;
+    //  - LLI bit1 (half-cycle unresolved): trkStat bit2 (halfCyc) clear on a
+    //    valid phase.  The phase is kept (as demo5 does), only flagged.  RTK
+    //    and FGO consume LLI bit0 only, so they still treat such a phase as an
+    //    integer-ambiguity phase; the bit is informational for consumers that
+    //    read bit1 (RTCM encoder, CLAS parity slip check).  RTKLIB's LLI_HALFA
+    //    (0x40) is deliberately not emitted because the RINEX LLI contract
+    //    here is bits 0-2 and several consumers test lli == 0.
+    constexpr int kCpStdevValidGen8 = 5;
+    constexpr int kCpStdevValidGen9 = 14;
+    constexpr int kCpStdevSlip = 15;
+
+    std::vector<RawxCandidate> candidates;
+    candidates.reserve(num_measurements);
     for (uint8_t index = 0; index < num_measurements; ++index) {
         const size_t base = 16U + static_cast<size_t>(index) * 32U;
         const uint8_t gnss_id = payload[base + 20];
         const uint8_t sv_id = payload[base + 21];
         const uint8_t sig_id = payload[base + 22];
+        const uint8_t freq_id = payload[base + 23];
         const uint8_t cno = payload[base + 26];
+        const int cp_stdev = payload[base + 28] & 0x0F;
         const uint8_t trk_stat = payload[base + 30];
         const uint16_t locktime = readLittleEndian<uint16_t>(payload.data() + base + 24);
+
+        if (sig_id > 1) {
+            rawx_gen9_receiver_ = true;
+        }
 
         const GNSSSystem system = ubx_utils::getSystemFromGnssId(gnss_id);
         if (system == GNSSSystem::UNKNOWN || sv_id == 0) {
             continue;
         }
+        // GLONASS svId 255 is an unknown slot (RTKLIB skips it too).
+        if (system == GNSSSystem::GLONASS && sv_id == 255) {
+            continue;
+        }
 
+        // Unknown / unsupported sigIds are dropped instead of being folded
+        // into a default signal (which duplicated observations of the same
+        // SignalType).  SBAS has no SignalType of its own; its L1 C/A
+        // (sigId 0) keeps the historical GPS_L1CA mapping under an SBAS
+        // satellite id.
         SignalType signal_type = defaultSignalType(system);
-        ubx_utils::getSignalType(gnss_id, sig_id, signal_type);
+        if (system == GNSSSystem::SBAS) {
+            if (sig_id != 0) {
+                continue;
+            }
+        } else if (!ubx_utils::getSignalType(gnss_id, sig_id, signal_type)) {
+            continue;
+        }
 
+        const char* tracking_code = ubx_utils::getRinexTrackingCode(gnss_id, sig_id);
+        if (tracking_code[0] == '\0') {
+            continue;  // every accepted pair has a code; defensive
+        }
         Observation obs(SatelliteId(system, sv_id), signal_type);
         obs.code = sig_id;
         obs.snr = static_cast<double>(cno);
         obs.signal_strength = static_cast<int>(cno);
 
-        const double pseudorange = readLittleEndian<double>(payload.data() + base);
-        const double carrier_phase = readLittleEndian<double>(payload.data() + base + 8);
+        double pseudorange = readLittleEndian<double>(payload.data() + base);
+        double carrier_phase = readLittleEndian<double>(payload.data() + base + 8);
         const double doppler = static_cast<double>(readLittleEndian<float>(payload.data() + base + 16));
 
-        obs.has_pseudorange = (trk_stat & 0x01U) != 0 && std::isfinite(pseudorange);
-        obs.has_carrier_phase = (trk_stat & 0x02U) != 0 && std::isfinite(carrier_phase);
+        const int cp_stdev_valid =
+            rawx_gen9_receiver_ ? kCpStdevValidGen9 : kCpStdevValidGen8;
+        const bool pseudorange_valid = (trk_stat & 0x01U) != 0 && std::isfinite(pseudorange);
+        const bool phase_valid = (trk_stat & 0x02U) != 0 && std::isfinite(carrier_phase) &&
+                           carrier_phase != -0.5 && cp_stdev <= cp_stdev_valid;
+        if (!pseudorange_valid) {
+            pseudorange = 0.0;
+        }
+        if (!phase_valid) {
+            carrier_phase = 0.0;
+        } else if (system == GNSSSystem::BeiDou && (sv_id <= 5 || sv_id >= 59)) {
+            // Half-cycle shift correction for BeiDou GEO (demo5 ublox.c).
+            carrier_phase += 0.5;
+        }
+
+        // Cycle-slip bookkeeping per (gnssId, svId, sigId).
+        const bool half_valid = (trk_stat & 0x04U) != 0;
+        const bool half_subtracted = (trk_stat & 0x08U) != 0;
+        const double lock_time_s = static_cast<double>(locktime) * 1e-3;
+        RawxTrackState& track = rawx_track_state_[
+            (static_cast<uint32_t>(gnss_id) << 16) | (static_cast<uint32_t>(sv_id) << 8) |
+            static_cast<uint32_t>(sig_id)];
+        const bool half_toggled = half_subtracted != track.half_subtracted;
+        if (locktime == 0 || lock_time_s < track.lock_time_s || half_toggled ||
+            cp_stdev >= kCpStdevSlip) {
+            track.slip_pending = true;
+        }
+        track.lock_time_s = lock_time_s;
+        track.half_subtracted = half_subtracted;
+
+        uint8_t lli = 0;
+        if (phase_valid) {
+            if (!half_valid) {
+                lli |= 0x02U;  // half-cycle ambiguity unresolved
+            }
+            if (track.slip_pending) {
+                lli |= 0x01U;
+                track.slip_pending = false;
+            }
+        }
+
+        obs.has_pseudorange = pseudorange_valid;
+        obs.has_carrier_phase = phase_valid;
         obs.has_doppler = std::isfinite(doppler);
         obs.pseudorange = pseudorange;
         obs.carrier_phase = carrier_phase;
         obs.doppler = doppler;
-        obs.loss_of_lock = locktime == 0;
-        obs.lli = obs.loss_of_lock ? 1 : 0;
+        obs.lli = lli;
+        obs.loss_of_lock = (lli & 0x01U) != 0;
+        if (system == GNSSSystem::GLONASS && freq_id <= 13) {
+            // freqId = FCN + 7 (0..13); other values are not a valid slot.
+            obs.has_glonass_frequency_channel = true;
+            obs.glonass_frequency_channel = static_cast<int>(freq_id) - 7;
+        }
         obs.valid = obs.has_pseudorange || obs.has_carrier_phase || obs.has_doppler;
 
         if (obs.valid) {
-            obs_data.addObservation(obs);
+            // RINEX observation types exactly as RINEXReader and the RTCM MSM
+            // decoder fill them: C<code> with a pseudorange, L<code> with a
+            // phase.  Consumers key code-bias lookups and tracking-code
+            // consistency checks on these strings.
+            if (obs.has_pseudorange) {
+                obs.pseudorange_observation_type = std::string("C") + tracking_code;
+            }
+            if (obs.has_carrier_phase) {
+                obs.carrier_phase_observation_type = std::string("L") + tracking_code;
+            }
+            RawxCandidate candidate;
+            candidate.obs = std::move(obs);
+            candidate.code = tracking_code;
+            candidate.rank = signal_policy::trackingAttributeRank(
+                system, tracking_code[0] - '0', tracking_code[1]);
+            if (!candidate.obs.has_pseudorange && !candidate.obs.has_carrier_phase) {
+                // A Doppler-only channel (e.g. a not yet locked L2 CL) must not
+                // displace a sibling code that carries a range or phase; the
+                // RTCM MSM decoder never has such rows.  The offset keeps the
+                // signal_policy order among rows of the same kind.
+                candidate.rank += kDopplerOnlyRankOffset;
+            }
+            candidates.push_back(std::move(candidate));
+        }
+    }
+
+    // Every tracking code is kept in rinex_tracking_observations (keyed like
+    // the RINEX v3 reader).  Into `observations` goes exactly one observation
+    // per (satellite, SignalType): the best (lowest) tracking rank, the
+    // earlier RAWX block winning an exact tie, so GPS L2 CL beats CM and the
+    // choice does not depend on the order the receiver listed the signals.
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        const RawxCandidate& candidate = candidates[i];
+        obs_data.addRinexTrackingObservation(candidate.code, candidate.obs);
+        bool winner = true;
+        for (size_t j = 0; j < candidates.size() && winner; ++j) {
+            if (j == i || candidates[j].obs.satellite != candidate.obs.satellite ||
+                candidates[j].obs.signal != candidate.obs.signal) {
+                continue;
+            }
+            if (candidates[j].rank < candidate.rank ||
+                (candidates[j].rank == candidate.rank && j < i)) {
+                winner = false;
+            }
+        }
+        if (winner) {
+            obs_data.addObservation(candidate.obs);
         }
     }
 
@@ -253,19 +406,22 @@ bool UBXDecoder::decodeSfrbx(const UBXMessage& message, UBXSfrbx& sfrbx) {
         return false;
     }
 
+    // gnssId, svId, sigId, freqId, numWords, chn, version, reserved, then
+    // numWords U4 data words.
     const auto& payload = message.payload;
-    const uint8_t num_words = payload[1];
+    const uint8_t num_words = payload[4];
     const size_t expected_length = 8U + static_cast<size_t>(num_words) * 4U;
     if (payload.size() < expected_length) {
         return false;
     }
 
     sfrbx = UBXSfrbx{};
-    sfrbx.version = payload[0];
-    sfrbx.channel = payload[2];
-    sfrbx.system = ubx_utils::getSystemFromGnssId(payload[4]);
-    sfrbx.sv_id = payload[5];
-    sfrbx.frequency_id = payload[7];
+    sfrbx.system = ubx_utils::getSystemFromGnssId(payload[0]);
+    sfrbx.sv_id = payload[1];
+    sfrbx.signal_id = payload[2];
+    sfrbx.frequency_id = payload[3];
+    sfrbx.channel = payload[5];
+    sfrbx.version = payload[6];
     sfrbx.words.reserve(num_words);
 
     for (uint8_t index = 0; index < num_words; ++index) {
@@ -312,57 +468,123 @@ GNSSSystem getSystemFromGnssId(uint8_t gnss_id) {
     }
 }
 
+namespace {
+
+/// One accepted (gnssId, sigId) pair of UBX-RXM-RAWX.  `code` is the RINEX
+/// 3.04 band + tracking attribute ("2L"), matching the RTCM MSM tables
+/// (msm_tables in rtcm_internal.hpp) and RTKLIB demo5 ubx_sig() (ublox.c).
+struct UbxSignalEntry {
+    uint8_t gnss_id;
+    uint8_t sig_id;
+    SignalType signal;
+    const char* code;
+};
+
+constexpr UbxSignalEntry kUbxSignals[] = {
+    // GPS: L1 C/A, L2 CL / CM, L5 I / Q
+    {0, 0, SignalType::GPS_L1CA, "1C"},
+    {0, 3, SignalType::GPS_L2C, "2L"},
+    {0, 4, SignalType::GPS_L2C, "2S"},
+    {0, 6, SignalType::GPS_L5, "5I"},
+    {0, 7, SignalType::GPS_L5, "5Q"},
+    // Galileo: E1 C / B, E5a I / Q, E5b I / Q
+    {2, 0, SignalType::GAL_E1, "1C"},
+    {2, 1, SignalType::GAL_E1, "1B"},
+    {2, 3, SignalType::GAL_E5A, "5I"},
+    {2, 4, SignalType::GAL_E5A, "5Q"},
+    {2, 5, SignalType::GAL_E5B, "7I"},
+    {2, 6, SignalType::GAL_E5B, "7Q"},
+    // BeiDou: B1I D1 / D2 (RINEX 3.04 "2I"), B2I D1 / D2, B1C pilot / data,
+    // B2a pilot / data
+    {3, 0, SignalType::BDS_B1I, "2I"},
+    {3, 1, SignalType::BDS_B1I, "2I"},
+    {3, 2, SignalType::BDS_B2I, "7I"},
+    {3, 3, SignalType::BDS_B2I, "7I"},
+    {3, 5, SignalType::BDS_B1C, "1P"},
+    {3, 6, SignalType::BDS_B1C, "1D"},
+    {3, 7, SignalType::BDS_B2A, "5P"},
+    {3, 8, SignalType::BDS_B2A, "5D"},
+    // QZSS: L1 C/A, L2 CM / CL, L5 I / Q
+    {5, 0, SignalType::QZS_L1CA, "1C"},
+    {5, 4, SignalType::QZS_L2C, "2S"},
+    {5, 5, SignalType::QZS_L2C, "2L"},
+    {5, 8, SignalType::QZS_L5, "5I"},
+    {5, 9, SignalType::QZS_L5, "5Q"},
+    // GLONASS: L1 OF, L2 OF
+    {6, 0, SignalType::GLO_L1CA, "1C"},
+    {6, 2, SignalType::GLO_L2CA, "2C"},
+    // NavIC: L5 A (carried as GPS_L5, like the RTCM and RINEX paths)
+    {7, 0, SignalType::GPS_L5, "5A"},
+};
+
+}  // namespace
+
 bool getSignalType(uint8_t gnss_id, uint8_t sig_id, SignalType& signal_type) {
+    for (const auto& entry : kUbxSignals) {
+        if (entry.gnss_id == gnss_id && entry.sig_id == sig_id) {
+            signal_type = entry.signal;
+            return true;
+        }
+    }
+    // Keep the historical per-system default for rejected pairs.
     switch (gnss_id) {
-        case 0:
-            switch (sig_id) {
-                case 0: signal_type = SignalType::GPS_L1CA; return true;
-                case 3:
-                case 4: signal_type = SignalType::GPS_L2C; return true;
-                case 6:
-                case 7: signal_type = SignalType::GPS_L5; return true;
-                default: signal_type = SignalType::GPS_L1CA; return false;
-            }
-        case 2:
-            switch (sig_id) {
-                case 0:
-                case 1: signal_type = SignalType::GAL_E1; return true;
-                case 3:
-                case 4: signal_type = SignalType::GAL_E5A; return true;
-                case 5:
-                case 6: signal_type = SignalType::GAL_E5B; return true;
-                default: signal_type = SignalType::GAL_E1; return false;
-            }
+        case 0: signal_type = SignalType::GPS_L1CA; break;
+        case 2: signal_type = SignalType::GAL_E1; break;
+        case 3: signal_type = SignalType::BDS_B1I; break;
+        case 5: signal_type = SignalType::QZS_L1CA; break;
+        case 6: signal_type = SignalType::GLO_L1CA; break;
+        case 7: signal_type = SignalType::GPS_L5; break;
+        default: break;
+    }
+    return false;
+}
+
+const char* getRinexTrackingCode(uint8_t gnss_id, uint8_t sig_id) {
+    // SBAS has no SignalType; its L1 C/A is RINEX "1C".
+    if (gnss_id == 1) {
+        return sig_id == 0 ? "1C" : "";
+    }
+    for (const auto& entry : kUbxSignals) {
+        if (entry.gnss_id == gnss_id && entry.sig_id == sig_id) {
+            return entry.code;
+        }
+    }
+    return "";
+}
+
+bool isSfrbxLegacyNavigation(const UBXSfrbx& sfrbx) {
+    const uint8_t sig = sfrbx.signal_id;
+    switch (sfrbx.system) {
+        case GNSSSystem::GPS:
+        case GNSSSystem::QZSS:
+        case GNSSSystem::SBAS:
+            return sig == 0;  // L1 C/A
+        case GNSSSystem::Galileo:
+            return sig == 0 || sig == 1 || sig == 5;  // E1-B / E5b-I I/NAV
+        case GNSSSystem::BeiDou:
+            return sig <= 4 || sig == 10;  // B1I / B2I / B3I D1 and D2
+        case GNSSSystem::GLONASS:
+            return sig == 0 || sig == 2;  // L1OF / L2OF
+        default:
+            return false;
+    }
+}
+
+bool isSfrbxBeiDouD2(const UBXSfrbx& sfrbx) {
+    if (sfrbx.system != GNSSSystem::BeiDou) {
+        return false;
+    }
+    switch (sfrbx.signal_id) {
+        case 1:
         case 3:
-            switch (sig_id) {
-                case 0:
-                case 1: signal_type = SignalType::BDS_B1I; return true;
-                case 2:
-                case 3: signal_type = SignalType::BDS_B2I; return true;
-                case 5:
-                case 6: signal_type = SignalType::BDS_B1C; return true;
-                case 7:
-                case 8: signal_type = SignalType::BDS_B2A; return true;
-                default: signal_type = SignalType::BDS_B1I; return false;
-            }
-        case 5:
-            switch (sig_id) {
-                case 0: signal_type = SignalType::QZS_L1CA; return true;
-                case 4:
-                case 5: signal_type = SignalType::QZS_L2C; return true;
-                case 8:
-                case 9: signal_type = SignalType::QZS_L5; return true;
-                default: signal_type = SignalType::QZS_L1CA; return false;
-            }
-        case 6:
-            switch (sig_id) {
-                case 0: signal_type = SignalType::GLO_L1CA; return true;
-                case 2: signal_type = SignalType::GLO_L2CA; return true;
-                default: signal_type = SignalType::GLO_L1CA; return false;
-            }
-        case 7:
-            signal_type = SignalType::GPS_L5;
-            return sig_id == 0;
+        case 10:
+            return true;
+        case 0: {
+            // sigId 0 is B1I D1 from protocol 27 on but reserved before it;
+            // GEO satellites (C01-C05, C59-C63) broadcast D2.
+            const int prn = sfrbx.sv_id;
+            return (prn >= 1 && prn <= 5) || (prn >= 59 && prn <= 63);
+        }
         default:
             return false;
     }
@@ -370,6 +592,9 @@ bool getSignalType(uint8_t gnss_id, uint8_t sig_id, SignalType& signal_type) {
 
 bool decodeSfrbxFrameInfo(const UBXSfrbx& sfrbx, UBXSfrbxFrameInfo& frame_info) {
     frame_info = UBXSfrbxFrameInfo{};
+    if (!isSfrbxLegacyNavigation(sfrbx)) {
+        return false;
+    }
 
     switch (sfrbx.system) {
         case GNSSSystem::GPS:
@@ -400,7 +625,7 @@ bool decodeSfrbxFrameInfo(const UBXSfrbx& sfrbx, UBXSfrbxFrameInfo& frame_info) 
                 return false;
             }
             frame_info.frame_id = subframe_id;
-            if (sfrbx.sv_id > 5) {
+            if (!isSfrbxBeiDouD2(sfrbx)) {
                 frame_info.kind = UBXSfrbxFrameInfo::Kind::BDS_D1;
                 frame_info.valid = true;
                 return true;
@@ -430,7 +655,7 @@ bool decodeSfrbxFrameInfo(const UBXSfrbx& sfrbx, UBXSfrbxFrameInfo& frame_info) 
             const int part2 = static_cast<int>(readBitsMsbFirst(bytes.data() + 16, 16U, 0, 1));
             const int page2 = static_cast<int>(readBitsMsbFirst(bytes.data() + 16, 16U, 1, 1));
             const int word_type = static_cast<int>(readBitsMsbFirst(bytes.data(), bytes.size(), 2, 6));
-            if (page1 == 1 || page2 == 1 || part1 != 0 || part2 != 1 || word_type <= 0) {
+            if (page1 == 1 || page2 == 1 || part1 != 0 || part2 != 1) {
                 return false;
             }
             frame_info.kind = UBXSfrbxFrameInfo::Kind::GAL_INAV;

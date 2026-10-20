@@ -123,6 +123,9 @@ PositionSolution RTKProcessor::processRTKEpochInternal(const ObservationData& ro
     const ObservationData& base_obs, const NavigationData& nav) {
     debug_telemetry_ = EpochDebugTelemetry{};
     independent_failure_budget_evaluated_this_epoch_ = false;
+    epoch_spp_valid_ = false;
+    current_spp_solution_ = PositionSolution{};
+    has_first_pass_covariance_ = false;
     PositionSolution solution;
     solution.time = rover_obs.time;
     solution.status = SolutionStatus::NONE;
@@ -142,6 +145,7 @@ PositionSolution RTKProcessor::processRTKEpochInternal(const ObservationData& ro
                 std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - spp_started)
                     .count();
+            current_spp_solution_ = spp;
             rememberSolution(spp);
             consecutive_fix_count_ = 0;
             consecutive_float_count_ = 0;
@@ -158,6 +162,14 @@ PositionSolution RTKProcessor::processRTKEpochInternal(const ObservationData& ro
             std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - spp_started)
                 .count();
+        current_spp_solution_ = current_spp;
+        epoch_spp_valid_ = current_spp.isValid() &&
+            current_spp.position_ecef.allFinite() &&
+            current_spp.position_covariance.allFinite();
+        if (epoch_spp_valid_) {
+            epoch_spp_position_ecef_ = current_spp.position_ecef;
+            epoch_spp_position_covariance_ = current_spp.position_covariance;
+        }
         auto fallback_spp = [&]() {
             last_ar_ratio_ = 0.0;
             last_num_fixed_ambiguities_ = 0;
@@ -166,9 +178,18 @@ PositionSolution RTKProcessor::processRTKEpochInternal(const ObservationData& ro
                 const double trusted_jump =
                     (spp.position_ecef - last_trusted_position_).norm();
                 if (spp.num_satellites <= 5 && trusted_jump > 25.0) {
-                    spp = PositionSolution{};
-                    spp.time = rover_obs.time;
-                    spp.status = SolutionStatus::NONE;
+                    // velocity_consistency_v8 (m): bound the blanking by the
+                    // trusted anchor's age; 0 (default) = no limit.
+                    const double max_anchor_age =
+                        rtk_config_.spp_fallback_blank_max_anchor_age_s;
+                    const double anchor_age = rover_obs.time - last_trusted_time_;
+                    if (max_anchor_age > 0.0 && !(anchor_age <= max_anchor_age)) {
+                        debug_telemetry_.spp_blank_age_limited = true;
+                    } else {
+                        spp = PositionSolution{};
+                        spp.time = rover_obs.time;
+                        spp.status = SolutionStatus::NONE;
+                    }
                 }
             }
             if (!moving_base_mode && spp.isValid() && has_last_solution_position_ && has_last_epoch_) {
@@ -233,6 +254,7 @@ PositionSolution RTKProcessor::processRTKEpochInternal(const ObservationData& ro
 
         const auto reset_started = std::chrono::steady_clock::now();
         resetPositionToSPP(rover_obs, nav);
+        debug_telemetry_.rover_seed_from_base_fallback = rover_seed_from_base_fallback_;
         debug_telemetry_.stage_reset_position_ms +=
             std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - reset_started)
@@ -248,6 +270,10 @@ PositionSolution RTKProcessor::processRTKEpochInternal(const ObservationData& ro
                 .count();
         if (sat_data.size() < 4) {
             return fallback_spp();
+        }
+
+        if (rtk_config_.enable_canyon_carrier_prior) {
+            applyCarrierPrior(rover_obs, sat_data);
         }
 
         // WP9/WP10: cache this epoch's NLOS fraction (sat_data is only
@@ -285,7 +311,7 @@ PositionSolution RTKProcessor::processRTKEpochInternal(const ObservationData& ro
         handleReferenceSatelliteChange(new_ref, sat_data);
         current_sat_data_ = sat_data;
         const auto bias_started = std::chrono::steady_clock::now();
-        updateBias(sat_data, state_dt);
+        updateBias(sat_data, state_dt, rover_obs.time, base_obs.time);
         debug_telemetry_.stage_bias_update_ms +=
             std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - bias_started)
@@ -303,6 +329,13 @@ PositionSolution RTKProcessor::processRTKEpochInternal(const ObservationData& ro
             const Vector3d baseline_before_iter = filter_state_.state.head<3>();
             filter_ok = updateFilter(sat_data);
             if (!filter_ok) break;
+            if (iter == 0 && filter_state_.covariance.rows() >= 3) {
+                first_pass_position_covariance_ =
+                    filter_state_.covariance.topLeftCorner<3, 3>();
+                first_pass_nis_per_observation_ =
+                    current_update_diagnostics_.normalized_innovation_squared_per_observation;
+                has_first_pass_covariance_ = true;
+            }
             current_update_diagnostics_.iterations++;
             if (iter >= 1) {
                 const double baseline_step =
@@ -316,6 +349,10 @@ PositionSolution RTKProcessor::processRTKEpochInternal(const ObservationData& ro
             std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - filter_started)
                 .count();
+
+        if (rtk_config_.enable_canyon_carrier_prior) {
+            finishCarrierPriorEpoch(filter_ok);
+        }
 
         if (filter_ok) {
             incrementLockCounts(sat_data);
@@ -359,6 +396,44 @@ PositionSolution RTKProcessor::processRTKEpochInternal(const ObservationData& ro
             if (!finitePosition(solution) ||
                 deviatesTooFarFromSPP(solution, 150.0) ||
                 float_exceeds_spp_gate) {
+                restoreRememberedState();
+                return fallback_spp();
+            }
+
+            // No independent SPP this epoch: the filter was seeded from the
+            // previous solution or the base and nothing bounds it. RTKLIB
+            // demo5 relpos() skips such an epoch (rtkpos.c "point pos error").
+            if (rtk_config_.require_spp_for_kinematic_epoch && isDynamicPositionMode(rtk_config_) &&
+                !moving_base_mode && !current_spp.isValid() && !rtk_config_.use_external_position_prior &&
+                !ins_time_update_applied_last_epoch_) {
+                debug_telemetry_.spp_unavailable_rejected = true;
+                restoreRememberedState();
+                return fallback_spp();
+            }
+
+            // An INS-seeded float whose update kept too few code rows is the
+            // propagated prior, not a measurement: the absolute prefit test
+            // zeroes every row once the prior has drifted a few metres, the
+            // update then moves nothing, and the INS increment of the
+            // filter's own posterior is integrated again at the next epoch.
+            // Emit the SPP fallback and make the next epoch re-seed from SPP
+            // instead of propagating the unsupported posterior (the batch
+            // kinematic path re-seeds every epoch and never carries it).
+            if (ins_time_update_applied_last_epoch_ &&
+                rtk_config_.ins_prior_min_code_rows > 0 &&
+                debug_telemetry_.retained_code_rows < rtk_config_.ins_prior_min_code_rows) {
+                debug_telemetry_.ins_prior_unsupported_rejected = true;
+                drop_ins_prior_next_epoch_ = true;
+                restoreRememberedState();
+                return fallback_spp();
+            }
+
+            // velocity_consistency_v8 (k): a FLOAT whose position seed fell
+            // through to the base coordinates is not emitted. Same handling as
+            // the gates above; the filter stays initialised.
+            if (rtk_config_.reject_float_seeded_at_base && !moving_base_mode &&
+                rover_seed_from_base_fallback_) {
+                debug_telemetry_.float_seeded_at_base_rejected = true;
                 restoreRememberedState();
                 return fallback_spp();
             }
@@ -481,7 +556,7 @@ PositionSolution RTKProcessor::processRTKEpochInternal(const ObservationData& ro
             auto build_pairs_for_mode = [&](RTKConfig::GlonassARMode mode) {
                 const auto saved_mode = rtk_config_.glonass_ar_mode;
                 rtk_config_.glonass_ar_mode = mode;
-                auto dd_pairs = buildDoubleDifferencePairs(sat_data, min_lock);
+                auto dd_pairs = buildDoubleDifferencePairs(sat_data, min_lock, true);
                 rtk_config_.glonass_ar_mode = saved_mode;
                 return dd_pairs;
             };
@@ -710,6 +785,14 @@ PositionSolution RTKProcessor::processRTKEpochInternal(const ObservationData& ro
                         applied_fix_solution = true;
                     }
                 }
+            }
+
+            if (applied_fix_solution &&
+                solution.status == SolutionStatus::FIXED) {
+                // Read-only record of this epoch's float position for the
+                // --pos-fix-diagnostics columns (io/solution_writer.hpp).
+                solution.rtk_float_reference_valid = true;
+                solution.rtk_float_position_ecef = float_solution.position_ecef;
             }
 
             if (!applied_fix_solution && !forced_fixed_reacquisition_reset) {

@@ -1,5 +1,6 @@
 #include <libgnss++/io/rinex.hpp>
 #include <libgnss++/io/ubx.hpp>
+#include <libgnss++/io/ubx_nav_decode.hpp>
 
 #include <array>
 #include <cmath>
@@ -8,6 +9,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <map>
 #include <system_error>
 #include <string>
 #include <vector>
@@ -19,19 +21,26 @@
 #include <unistd.h>
 #endif
 
+#include "ubx_input_source.hpp"
+
 namespace {
 
+using libgnss_apps::UbxInputSource;
+using libgnss_apps::closeUbxInputSource;
+using libgnss_apps::openUbxInputSource;
+using libgnss_apps::readNextUbxEvents;
+
 constexpr double kRadToDeg = 180.0 / 3.14159265358979323846;
-constexpr int kDefaultSerialBaud = 115200;
 
 void printUsage(const char* argv0) {
     std::cerr
         << "Usage: " << argv0 << " --input <file.ubx|serial://...|/dev/tty...> [options]\n"
         << "Options:\n"
         << "  --limit <count>           Stop after this many decoded UBX messages (0 = all)\n"
-        << "  --decode-nav             Print decoded NAV-PVT and RXM-SFRBX summaries\n"
+        << "  --decode-nav             Print decoded NAV-PVT and RXM-SFRBX summaries and, before the summary\n"
+        << "                           line, the number of broadcast ephemerides decoded from them per system\n"
         << "  --decode-observations    Print decoded RXM-RAWX summaries\n"
-        << "  --obs-rinex-out <file>   Export decoded RAWX epochs to a simple RINEX observation file\n"
+        << "  --obs-rinex-out <file>   Export decoded RAWX epochs to a RINEX 3.04 observation file\n"
         << "  --quiet                  Suppress per-message type lines\n"
         << "  --help                   Show this help text\n";
 }
@@ -44,177 +53,15 @@ libgnss::io::RINEXReader::RINEXHeader makeObservationHeader(
     header.satellite_system = "M";
     header.program = "libgnss++";
     header.run_by = "gnss ubx-info";
-    header.observation_types = {"C1C", "L1C", "D1C", "S1C"};
+    header.receiver_type = "u-blox";
     if (decoder.hasLastNavPVT()) {
         const auto nav = decoder.getLastNavPVT();
         if (nav.valid_position) {
             header.approximate_position = nav.position_ecef;
+            header.has_approximate_position = true;
         }
     }
     return header;
-}
-
-struct UbxInputSource {
-    bool serial = false;
-    bool eof = false;
-    std::ifstream file;
-#ifndef _WIN32
-    int serial_fd = -1;
-#endif
-};
-
-std::string resolveSerialPath(const std::string& source) {
-    constexpr const char* kPrefix = "serial://";
-    if (source.rfind(kPrefix, 0) != 0) {
-        return source;
-    }
-
-    std::string path = source.substr(std::char_traits<char>::length(kPrefix));
-    const size_t query_pos = path.find('?');
-    if (query_pos != std::string::npos) {
-        path.resize(query_pos);
-    }
-    if (!path.empty() && path.front() != '/') {
-        return path;
-    }
-    while (path.size() > 1 && path[0] == '/' && path[1] == '/') {
-        path.erase(path.begin());
-    }
-    return path;
-}
-
-int parseSerialBaud(const std::string& source) {
-    constexpr const char* kQuery = "?baud=";
-    const size_t query_pos = source.find(kQuery);
-    if (query_pos == std::string::npos) {
-        return kDefaultSerialBaud;
-    }
-    const std::string baud_text =
-        source.substr(query_pos + std::char_traits<char>::length(kQuery));
-    if (baud_text.empty()) {
-        return kDefaultSerialBaud;
-    }
-    return std::stoi(baud_text);
-}
-
-#ifndef _WIN32
-speed_t baudRateConstant(int baud) {
-    switch (baud) {
-        case 9600: return B9600;
-        case 19200: return B19200;
-        case 38400: return B38400;
-        case 57600: return B57600;
-        case 115200: return B115200;
-        case 230400: return B230400;
-        default:
-            throw std::invalid_argument("unsupported serial baud rate");
-    }
-}
-
-bool configureSerialPort(int fd, int baud) {
-    termios tio{};
-    if (tcgetattr(fd, &tio) != 0) {
-        return false;
-    }
-    cfmakeraw(&tio);
-    const speed_t speed = baudRateConstant(baud);
-    cfsetispeed(&tio, speed);
-    cfsetospeed(&tio, speed);
-    tio.c_cflag |= (CLOCAL | CREAD);
-    tio.c_cflag &= ~CSTOPB;
-    tio.c_cflag &= ~CRTSCTS;
-    tio.c_cc[VMIN] = 1;
-    tio.c_cc[VTIME] = 0;
-    return tcsetattr(fd, TCSANOW, &tio) == 0;
-}
-#endif
-
-void closeUbxInputSource(UbxInputSource& source) {
-    if (source.file.is_open()) {
-        source.file.close();
-    }
-#ifndef _WIN32
-    if (source.serial_fd >= 0) {
-        ::close(source.serial_fd);
-        source.serial_fd = -1;
-    }
-#endif
-    source.serial = false;
-    source.eof = false;
-}
-
-bool openUbxInputSource(const std::string& input_path, UbxInputSource& source) {
-    closeUbxInputSource(source);
-
-    const std::string resolved_path = resolveSerialPath(input_path);
-    std::error_code ec;
-    const auto status = std::filesystem::status(resolved_path, ec);
-    if (!ec && std::filesystem::is_regular_file(status)) {
-        source.file.open(resolved_path, std::ios::binary);
-        return source.file.is_open();
-    }
-
-#ifndef _WIN32
-    const int baud = parseSerialBaud(input_path);
-    const int fd = ::open(resolved_path.c_str(), O_RDONLY | O_NOCTTY);
-    if (fd < 0) {
-        return false;
-    }
-    if (!configureSerialPort(fd, baud)) {
-        ::close(fd);
-        return false;
-    }
-    source.serial = true;
-    source.serial_fd = fd;
-    return true;
-#else
-    (void)input_path;
-    return false;
-#endif
-}
-
-bool readNextUbxEvents(libgnss::io::UBXStreamDecoder& decoder,
-                       UbxInputSource& source,
-                       std::vector<libgnss::io::UBXStreamDecoder::Event>& events) {
-    events.clear();
-    std::array<uint8_t, 4096> chunk{};
-
-    while (true) {
-        size_t bytes_read = 0;
-        if (source.serial) {
-#ifndef _WIN32
-            const ssize_t count = ::read(source.serial_fd, chunk.data(), chunk.size());
-            if (count < 0) {
-                if (errno == EINTR) {
-                    continue;
-                }
-                source.eof = true;
-                return false;
-            }
-            if (count == 0) {
-                source.eof = true;
-                return false;
-            }
-            bytes_read = static_cast<size_t>(count);
-#else
-            source.eof = true;
-            return false;
-#endif
-        } else {
-            source.file.read(reinterpret_cast<char*>(chunk.data()),
-                             static_cast<std::streamsize>(chunk.size()));
-            bytes_read = static_cast<size_t>(source.file.gcount());
-            if (bytes_read == 0) {
-                source.eof = true;
-                return false;
-            }
-        }
-
-        decoder.pushBytes(chunk.data(), bytes_read, events);
-        if (!events.empty()) {
-            return true;
-        }
-    }
 }
 
 }  // namespace
@@ -272,6 +119,8 @@ int main(int argc, char** argv) {
     size_t sfrbx_count = 0;
     size_t rawx_count = 0;
     size_t exported_obs_epochs = 0;
+    libgnss::io::UBXNavDecoder nav_decoder;
+    std::vector<libgnss::Ephemeris> decoded_ephemerides;
     std::vector<libgnss::io::UBXStreamDecoder::Event> events;
 
     while ((limit == 0 || processed_messages < limit) &&
@@ -296,7 +145,16 @@ int main(int argc, char** argv) {
                           << std::dec << std::setfill(' ') << ")\n";
             }
 
-            if ((decode_nav || !obs_rinex_out.empty()) && event.has_nav_pvt) {
+            if (decode_nav) {
+                if (event.has_observation) {
+                    nav_decoder.setReferenceTime(event.observation.time);
+                }
+                if (event.has_sfrbx) {
+                    nav_decoder.pushSfrbx(event.sfrbx, decoded_ephemerides);
+                }
+            }
+
+            if (event.has_nav_pvt) {
                 ++nav_pvt_count;
                 if (decode_nav) {
                     std::cout << "  nav: fix_type=" << static_cast<int>(event.nav_pvt.fix_type)
@@ -311,8 +169,11 @@ int main(int argc, char** argv) {
                 continue;
             }
 
-            if (decode_nav && event.has_sfrbx) {
+            if (event.has_sfrbx) {
                 ++sfrbx_count;
+                if (!decode_nav) {
+                    continue;
+                }
                 libgnss::io::UBXSfrbxFrameInfo frame_info;
                 const bool has_frame_info =
                     libgnss::io::ubx_utils::decodeSfrbxFrameInfo(event.sfrbx, frame_info);
@@ -324,6 +185,7 @@ int main(int argc, char** argv) {
                     case libgnss::GNSSSystem::BeiDou: std::cout << "BeiDou"; break;
                     case libgnss::GNSSSystem::QZSS: std::cout << "QZSS"; break;
                     case libgnss::GNSSSystem::NavIC: std::cout << "NavIC"; break;
+                    case libgnss::GNSSSystem::SBAS: std::cout << "SBAS"; break;
                     default: std::cout << "UNKNOWN"; break;
                 }
                 std::cout << " sv=" << static_cast<int>(event.sfrbx.sv_id)
@@ -337,13 +199,14 @@ int main(int argc, char** argv) {
                     }
                 }
                 std::cout
+                          << " sig_id=" << static_cast<int>(event.sfrbx.signal_id)
                           << " freq_id=" << static_cast<int>(event.sfrbx.frequency_id)
                           << " channel=" << static_cast<int>(event.sfrbx.channel)
                           << "\n";
                 continue;
             }
 
-            if ((decode_observations || !obs_rinex_out.empty()) && event.has_observation) {
+            if (event.has_observation) {
                 ++rawx_count;
                 if (decode_observations) {
                     std::cout << "  obs: week=" << event.observation.time.week
@@ -376,12 +239,32 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (obs_writer_open) {
-        obs_writer.close();
+    bool obs_file_ok = true;
+    if (obs_writer_open && !obs_writer.close()) {
+        std::cerr << "Error: failed to write observation RINEX file: " << obs_rinex_out << "\n";
+        obs_file_ok = false;
     }
 
     closeUbxInputSource(input_source);
     const auto stats = decoder.getStats();
+
+    if (decode_nav) {
+        std::map<libgnss::GNSSSystem, size_t> per_system;
+        for (const auto& ephemeris : decoded_ephemerides) {
+            ++per_system[ephemeris.satellite.system];
+        }
+        const auto count = [&per_system](libgnss::GNSSSystem system) {
+            const auto it = per_system.find(system);
+            return it == per_system.end() ? size_t{0} : it->second;
+        };
+        std::cout << "nav_decode: ephemerides=" << decoded_ephemerides.size()
+                  << " gps=" << count(libgnss::GNSSSystem::GPS)
+                  << " qzss=" << count(libgnss::GNSSSystem::QZSS)
+                  << " galileo=" << count(libgnss::GNSSSystem::Galileo)
+                  << " beidou=" << count(libgnss::GNSSSystem::BeiDou)
+                  << " glonass=" << count(libgnss::GNSSSystem::GLONASS)
+                  << " klobuchar=" << (nav_decoder.hasKlobuchar() ? 1 : 0) << "\n";
+    }
 
     std::cout << "summary: processed_messages=" << processed_messages
               << " valid_messages=" << stats.valid_messages
@@ -390,5 +273,5 @@ int main(int argc, char** argv) {
               << " sfrbx=" << sfrbx_count
               << " rawx=" << rawx_count
               << " exported_obs_epochs=" << exported_obs_epochs << "\n";
-    return 0;
+    return obs_file_ok ? 0 : 1;
 }

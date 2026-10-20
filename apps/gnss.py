@@ -64,6 +64,18 @@ def python_target(filename: str) -> str:
     return os.path.join(APPS_DIR, filename)
 
 COMMANDS = {
+    "pva-demo": {
+        "kind": "python", "target": python_target("gnss_pva_demo.py"),
+        "summary": "Run the tracked synthetic PVA scoring witness without hardware or a source build.",
+    },
+    "pva-evaluate": {
+        "kind": "python", "target": python_target("gnss_pva_evaluate.py"),
+        "summary": "Replay received GNSS/IMU events and score position, velocity, attitude and motion scenes offline.",
+    },
+    "pva-replay": {
+        "kind": "binary", "target": "gnss_pva_replay",
+        "summary": "Replay raw PPC through the causal online API without opening reference truth.",
+    },
     "commands": {
         "kind": "builtin",
         "summary": "List registered dispatcher commands as text or JSON for users, docs, and tooling.",
@@ -179,6 +191,11 @@ COMMANDS = {
         "target": "gnss_fuse",
         "summary": "GNSS/IMU fusion with SPP/RTK and validated tight-coupling presets.",
     },
+    "online": {
+        "kind": "binary",
+        "target": "gnss_online",
+        "summary": "Process received RTCM and IMU events sequentially, with explicit input age and reset metadata.",
+    },
     "vel-d": {
         "kind": "binary",
         "target": "gnss_vel_d",
@@ -208,6 +225,11 @@ COMMANDS = {
         "kind": "python",
         "target": python_target("gnss_mode_compare.py"),
         "summary": "Run SPP/FGO/RTK on shared RINEX inputs and emit a mode-comparison JSON summary.",
+    },
+    "uncertainty-eval": {
+        "kind": "python",
+        "target": python_target("gnss_uncertainty_eval.py"),
+        "summary": "Check reported per-epoch sigma (gnss solve --pos-uncertainty) against truth: normalized errors, exceedances, K*sigma Stanford bins (not a certified protection level).",
     },
     "taroz-pc-dogfood": {
         "kind": "python",
@@ -309,6 +331,11 @@ COMMANDS = {
         "target": "gnss_stream",
         "summary": "Read and relay RTCM from file, NTRIP, or serial sources with optional decode summaries and relay sinks.",
     },
+    "has-info": {
+        "kind": "binary",
+        "target": "gnss_has_info",
+        "summary": "Decode Galileo HAS E6-B pages (UBX/SBF/cssrlib text) and dump MT1 messages and held corrections.",
+    },
     "ubx-info": {
         "kind": "binary",
         "target": "gnss_ubx_info",
@@ -367,7 +394,7 @@ COMMANDS = {
     "convert": {
         "kind": "binary",
         "target": "gnss_convert",
-        "summary": "Convert RTCM or UBX input into simple RINEX files and export UBX SFRBX frame metadata.",
+        "summary": "Convert RTCM or UBX input into RINEX 3.04 observation/navigation files and export UBX SFRBX frame metadata.",
     },
     "replay": {
         "kind": "binary",
@@ -378,6 +405,16 @@ COMMANDS = {
         "kind": "binary",
         "target": "gnss_live",
         "summary": "Continuously solve RTCM or UBX rover input against RTCM base corrections into a live RTK solution file.",
+    },
+    "realtime-stress": {
+        "kind": "python",
+        "target": python_target("gnss_realtime_stress.py"),
+        "summary": "Replay a recorded RINEX run as paced RTCM3 over TCP/NTRIP with fault injection and measure gnss live survival, latency, recovery, accuracy, RSS and batch parity.",
+    },
+    "rtcm-encode": {
+        "kind": "binary",
+        "target": "gnss_rtcm_encode",
+        "summary": "Encode recorded RINEX observations (+ nav) into an RTCM3 stream with a per-epoch index for replay.",
     },
     "live-signoff": {
         "kind": "python",
@@ -469,6 +506,11 @@ COMMANDS = {
         "target": os.path.join(ROOT_DIR, "scripts", "generate_architecture_diagram.py"),
         "summary": "Generate a docs-friendly architecture diagram image.",
     },
+    "reproduce": {
+        "kind": "python",
+        "target": python_target("gnss_reproduce.py"),
+        "summary": "Reproduce README result numbers from tracked lane manifests and check them against expectations.",
+    },
     "odaiba-benchmark": {
         "kind": "python",
         "target": python_target("gnss_odaiba_benchmark.py"),
@@ -559,6 +601,16 @@ COMMANDS = {
         "target": python_target("gnss_ppp_products_signoff.py"),
         "summary": "Run static, kinematic, or PPC PPP sign-off with fetched SP3/CLK/IONEX/DCB products and emit summary JSON.",
     },
+    "observation-analysis": {
+        "kind": "python",
+        "target": python_target("gnss_observation_analysis.py"),
+        "summary": "Export satellite code residuals, SNR and carrier-continuity diagnostics through the public Python API.",
+    },
+    "ppc-native-replay": {
+        "kind": "python",
+        "target": python_target("gnss_ppc_native_replay.py"),
+        "summary": "Build and regenerate PPC RTK/IMU baselines from raw inputs with complete run provenance.",
+    },
     "ppc-demo": {
         "kind": "python",
         "target": python_target("gnss_ppc_demo.py"),
@@ -594,6 +646,21 @@ COMMANDS = {
         "target": python_target("gnss_smartphone_gnss_adapter.py"),
         "summary": "Validate and normalize Google Smartphone Decimeter Challenge raw GNSS and truth CSVs.",
     },
+    "smartphone-mimir-adapter": {
+        "kind": "python",
+        "target": python_target("gnss_smartphone_mimir_adapter.py"),
+        "summary": "Fail-closed adapter for Mimir (Nantes dataset) Raw.csv/PSR.csv: RINEX observations plus GPST barometer CSV.",
+    },
+    "smartphone-baro-eval": {
+        "kind": "python",
+        "target": python_target("gnss_smartphone_baro_eval.py"),
+        "summary": "Score a smartphone SPP POS against the weak Awinda reference (H/V RMSE, P95, availability, jumps).",
+    },
+    "smartphone-baro-nantes": {
+        "kind": "python",
+        "target": python_target("gnss_smartphone_baro_nantes_runner.py"),
+        "summary": "Run barometer OFF vs ON standalone SPP on Nantes/Mimir runs and score against the Awinda reference.",
+    },
     "smartphone-gnss-signoff": {
         "kind": "python",
         "target": python_target("gnss_smartphone_gnss_signoff.py"),
@@ -609,20 +676,10 @@ COMMANDS = {
         "target": python_target("gnss_smartphone_raw_quality_control.py"),
         "summary": "Audit truth-free smartphone raw GNSS observables and run the frozen robust SPP fallback candidate.",
     },
-    "smartphone-raw-quality-control-eval": {
-        "kind": "python",
-        "target": python_target("gnss_smartphone_raw_quality_control_eval.py"),
-        "summary": "Evaluate the frozen raw-quality robust SPP candidate on development routes before any validation or holdout access.",
-    },
     "smartphone-native-gnss-pdc": {
         "kind": "python",
         "target": python_target("gnss_smartphone_native_gnss_pdc.py"),
         "summary": "Run the native raw-Android GNSS/PDC executable with an atomic raw/nav/binary provenance manifest.",
-    },
-    "smartphone-native-gnss-pdc-evaluate": {
-        "kind": "python",
-        "target": python_target("gnss_smartphone_native_gnss_pdc_eval.py"),
-        "summary": "Score one sealed raw-only native GNSS/PDC route with fixed development timestamp alignment.",
     },
     "smartphone-kaggle-submit": {
         "kind": "python",
@@ -644,45 +701,20 @@ COMMANDS = {
         "target": python_target("gnss_smartphone_trajectory_smoother_eval.py"),
         "summary": "Select and validate frozen truth-free smartphone trajectory smoother parameters on development only.",
     },
-    "smartphone-trajectory-imu-eval": {
-        "kind": "python",
-        "target": python_target("gnss_smartphone_trajectory_imu_eval.py"),
-        "summary": "Select development-only causal IMU motion-adaptive process-noise parameters without attitude integration.",
-    },
     "smartphone-tdcp-trajectory": {
         "kind": "python",
         "target": python_target("gnss_smartphone_tdcp_trajectory.py"),
         "summary": "Run truth-free TDCP/ADR displacement-constrained smartphone trajectory postprocess.",
-    },
-    "smartphone-tdcp-trajectory-eval": {
-        "kind": "python",
-        "target": python_target("gnss_smartphone_tdcp_trajectory_eval.py"),
-        "summary": "Evaluate frozen truth-free TDCP smartphone trajectory on fixed train and validation routes.",
     },
     "smartphone-observable-error-correction": {
         "kind": "python",
         "target": python_target("gnss_smartphone_observable_error_correction.py"),
         "summary": "Apply a sealed truth-free observable-feature residual correction to handset WLS ECEF positions.",
     },
-    "smartphone-observable-error-correction-eval": {
-        "kind": "python",
-        "target": python_target("gnss_smartphone_observable_error_correction_eval.py"),
-        "summary": "Evaluate the frozen observable-feature handset-WLS correction with route-level train LOO and gated fresh validation.",
-    },
     "smartphone-doppler-position": {
         "kind": "python",
         "target": python_target("gnss_smartphone_doppler_position.py"),
         "summary": "Run a truth-free bounded pseudorange-rate Doppler position update around handset WLS.",
-    },
-    "smartphone-doppler-position-eval": {
-        "kind": "python",
-        "target": python_target("gnss_smartphone_doppler_position_eval.py"),
-        "summary": "Evaluate the frozen Doppler position-update candidate on route-disjoint train/validation roles.",
-    },
-    "smartphone-imu-motion-q-eval": {
-        "kind": "python",
-        "target": python_target("gnss_smartphone_imu_motion_q_eval.py"),
-        "summary": "Evaluate the frozen truth-free causal IMU motion-adaptive process-noise alternative on route-disjoint roles.",
     },
     "smartphone-gnss-workflow": {
         "kind": "python",
@@ -704,11 +736,6 @@ COMMANDS = {
         "target": python_target("gnss_smartphone_reacquisition_conservative_eval.py"),
         "summary": "Evaluate conservative truth-free smartphone reacquisition bounds on a frozen new validation route and byte-identical main regression.",
     },
-    "smartphone-segment-stability-eval": {
-        "kind": "python",
-        "target": python_target("gnss_smartphone_segment_stability_eval.py"),
-        "summary": "Evaluate truth-free segment stability fallback to raw/Hatch POS with a frozen new validation route and main regression gate.",
-    },
     "smartphone-wls-position": {
         "kind": "python",
         "target": python_target("gnss_smartphone_wls.py"),
@@ -718,11 +745,6 @@ COMMANDS = {
         "kind": "python",
         "target": python_target("gnss_smartphone_wls_eval.py"),
         "summary": "Compare truth-free handset WLS against Galileo E1/Hatch and segment-stability lanes on fixed development routes.",
-    },
-    "smartphone-wls-device-family-eval": {
-        "kind": "python",
-        "target": python_target("gnss_smartphone_wls_device_family_eval.py"),
-        "summary": "Evaluate a frozen Pixel7Pro WLS/native route and gate a development-only device-family lane selector without opening holdout data.",
     },
     "smartphone-wls-stability-selector-eval": {
         "kind": "python",
@@ -739,20 +761,10 @@ COMMANDS = {
         "target": python_target("gnss_smartphone_wls_residual_v2_eval.py"),
         "summary": "Run the one-shot v2 fresh validation of the frozen truth-free WLS residual median5/zero-shift lane without opening the next holdout.",
     },
-    "smartphone-wls-stability-selector-holdout-eval": {
-        "kind": "python",
-        "target": python_target("gnss_smartphone_wls_stability_selector_holdout_eval.py"),
-        "summary": "Run the single sealed post-freeze smartphone stability-selector holdout evaluation and emit immutable truth-free/truth-scored manifests.",
-    },
     "smartphone-wls-multi-phone-ensemble-eval": {
         "kind": "python",
         "target": python_target("gnss_smartphone_wls_multi_phone_ensemble_eval.py"),
         "summary": "Evaluate a fixed truth-free multi-phone handset-WLS ensemble on train routes and one new validation route while keeping the next holdout sealed.",
-    },
-    "smartphone-wls-multi-phone-ensemble-holdout-eval": {
-        "kind": "python",
-        "target": python_target("gnss_smartphone_wls_multi_phone_ensemble_holdout_eval.py"),
-        "summary": "Run the single sealed multi-phone WLS ensemble holdout evaluation after freeze and truth-free artifact sealing.",
     },
     "smartphone-wls-test-batch": {
         "kind": "python",
@@ -763,11 +775,6 @@ COMMANDS = {
         "kind": "python",
         "target": python_target("gnss_performance_report.py"),
         "summary": "Summarize native per-epoch SPP/RTK timing CSVs by GPST interval.",
-    },
-    "performance-baseline": {
-        "kind": "python",
-        "target": python_target("gnss_performance_baseline.py"),
-        "summary": "Run a reproducible Release SPP/RTK baseline with interval timing artifacts.",
     },
     "uav-mars-acquire": {
         "kind": "python",
@@ -928,6 +935,8 @@ def usage() -> str:
             "  python3 apps/gnss.py convert --format ubx --input logs/session.ubx --obs-out output/session.obs",
             "  python3 apps/gnss.py convert --format ubx --input logs/session.ubx --nav-out output/session.nav",
             "    # exports GPS/QZSS/Galileo/GLONASS/BeiDou broadcast nav from RXM-SFRBX when available",
+            "  python3 apps/gnss.py convert --format ubx --input logs/session.ubx --nav-rinex-out output/session_sfrbx.nav",
+            "    # library SFRBX decoder (checked, with the GPS Klobuchar GPSA/GPSB header lines); needs RAWX in the log for GPS/QZSS/GLONASS",
             "  python3 apps/gnss.py convert --format ubx --input logs/session.ubx --sfrbx-out output/session_sfrbx.csv",
             "  python3 apps/gnss.py social-card --lib-pos output/rtk_solution.pos --rtklib-pos output/driving_rtklib_rtk.pos --reference-csv data/driving/Tokyo_Data/Odaiba/reference.csv --output docs/driving_odaiba_social_card.png",
             "  python3 apps/gnss.py architecture-card --output docs/libgnsspp_architecture.png",
@@ -1228,6 +1237,10 @@ def find_binary(target_name: str) -> str | None:
     default_build = os.path.join(ROOT_DIR, "build")
     if default_build not in build_roots:
         build_roots.insert(0, default_build)
+    # GNSSPP_BUILD_DIR points at an out-of-tree build and takes precedence.
+    override_build = os.environ.get("GNSSPP_BUILD_DIR")
+    if override_build:
+        build_roots.insert(0, os.path.abspath(override_build))
 
     candidates = [
         os.path.join(APPS_DIR, filename),

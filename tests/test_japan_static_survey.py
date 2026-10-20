@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
 from pathlib import Path
@@ -46,6 +47,49 @@ class JapanStaticSurveyTest(unittest.TestCase):
         )
         self.assertIn("coord/IGS20/IGS20.ssc", survey.SOURCES["igs20_ssc"]["url"])
         self.assertIn("RNXCMP_4.2.0_Linux_gcc_64bit", survey.SOURCES["rnxcmp_linux_x86_64"]["url"])
+
+    def test_antex_source_is_the_immutable_archive_copy(self) -> None:
+        antex = survey.SOURCES["antex"]
+        # general/igs20.atx is updated in place; only the PCV archive is stable.
+        self.assertEqual(
+            antex["url"],
+            "https://files.igs.org/pub/station/general/pcv_archive/igs20_2425.atx.gz",
+        )
+        self.assertEqual(antex["materialized_bytes"], 60295761)
+        self.assertEqual(
+            antex["materialized_sha256"],
+            "8715268e17e09e5447f4949d67cbd067e7f0f33d48dd698aafe14f5cffb26de2",
+        )
+        for sources in (survey.HOLDOUT_SOURCES, survey.R7_DAY3_SOURCES):
+            self.assertEqual(sources["antex"], antex)
+
+    def test_materialize_source_gunzips_and_checks_payload_pin(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="japan_survey_materialize_") as temp_dir:
+            root = Path(temp_dir)
+            payload = b"IGS20 ANTEX fixture\n"
+            archive = root / "fixture.atx.gz"
+            archive.write_bytes(gzip.compress(payload))
+            destination = root / "fixture.atx"
+            source = {
+                "url": "https://example.invalid/fixture.atx.gz",
+                "materialized_bytes": len(payload),
+                "materialized_sha256": hashlib.sha256(payload).hexdigest(),
+            }
+            survey.materialize_source(archive, source, destination)
+            self.assertEqual(destination.read_bytes(), payload)
+
+            wrong_hash = {**source, "materialized_sha256": "0" * 64}
+            with self.assertRaisesRegex(ValueError, "materialized SHA-256 mismatch"):
+                survey.materialize_source(archive, wrong_hash, destination)
+
+            wrong_size = {**source, "materialized_bytes": len(payload) + 1}
+            with self.assertRaisesRegex(ValueError, "materialized byte-size mismatch"):
+                survey.materialize_source(archive, wrong_size, destination)
+
+            plain = root / "plain.log"
+            plain.write_bytes(b"log\n")
+            survey.materialize_source(plain, {"url": "https://example.invalid/plain.log"}, root / "copy.log")
+            self.assertEqual((root / "copy.log").read_bytes(), b"log\n")
 
     def test_holdout_is_a_distinct_pinned_dataset(self) -> None:
         args = survey.parse_args(["--output-dir", "/tmp/japan-survey-test", "--dataset", "holdout"])
@@ -145,13 +189,18 @@ class JapanStaticSurveyTest(unittest.TestCase):
             output = root / "observation.rnx"
             output.write_text("stale\n", encoding="ascii")
             converter = root / "converter"
-            converter.write_text(
-                "#!/bin/sh\nprintf 'fresh\\n' > \"${1%.crx}.rnx\"\n",
-                encoding="ascii",
-            )
-            converter.chmod(0o755)
-            survey.convert_crx(source, output, converter)
+            def convert(argv, **kwargs):
+                self.assertEqual(argv, [str(converter), str(output.with_suffix(".crx"))])
+                self.assertFalse(output.exists(), "stale output must be removed before conversion")
+                self.assertEqual(Path(argv[1]).read_bytes(), b"compact payload\n")
+                output.write_text("fresh\n", encoding="ascii")
+                return survey.subprocess.CompletedProcess(argv, 0, "", "")
+
+            with mock.patch.object(survey.subprocess, "run", side_effect=convert) as run:
+                survey.convert_crx(source, output, converter)
+                run.assert_called_once()
             self.assertEqual(output.read_text(encoding="ascii"), "fresh\n")
+            self.assertFalse(output.with_suffix(".crx").exists())
 
     def test_child_commands_carry_independent_truth_and_antenna_contract(self) -> None:
         with tempfile.TemporaryDirectory(prefix="japan_survey_commands_") as temp_dir:

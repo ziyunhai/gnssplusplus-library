@@ -17,6 +17,7 @@
 #include <vector>
 
 #include <libgnss++/algorithms/integrity_consensus.hpp>
+#include <libgnss++/algorithms/fix_recovery_guard.hpp>
 #include <libgnss++/algorithms/nlos_weights.hpp>
 #include <libgnss++/algorithms/float_trust_policy.hpp>
 #include <libgnss++/algorithms/rtk.hpp>
@@ -105,6 +106,12 @@ struct SolveConfig {
     double doppler_float_seed_max_age_s = 6.0;
     std::string rover_seed_pos_path;
     std::string diagnostics_csv_path;
+    // Default-off RTK reported-covariance mode and per-epoch covariance log.
+    int rtk_reported_covariance_mode = 0;
+    std::string rtk_covariance_log_path;
+    // Opt-in: append sdn/sde/sdu/sdne/sdeu/sdun and DiffAge(s) to .pos rows.
+    bool pos_uncertainty = false;
+    bool pos_fix_diagnostics = false;
     std::string timing_csv_path;
     double rtk_update_outlier_threshold = 0.0;
     bool student_t_rtk_front_end = false;
@@ -128,6 +135,9 @@ struct SolveConfig {
     double low_count_rescue_max_history_speed_mps = 0.0;
     int min_hold_count = 5;
     double hold_ratio_threshold = 2.0;
+    bool hold_fix_unchanged_set = false;
+    int hold_fix_min_matched_pairs = 4;
+    int min_fix_satellites = 0;
     double elevation_mask_deg = 15.0;
     double process_noise_position = 1e-4;
     double process_noise_ambiguity = 1e-8;
@@ -137,6 +147,9 @@ struct SolveConfig {
     double snr_reference_dbhz = 45.0;
     double snr_max_variance_scale = 25.0;
     double snr_min_baseline_m = 0.0;
+    bool snr_elevation_aware = false;
+    bool snr_inflate_code_only = false;
+    bool enable_canyon_carrier_prior = false;
     double cycle_slip_threshold = 0.05;
     double doppler_slip_threshold = 0.20;
     double code_slip_threshold = 5.0;
@@ -237,6 +250,8 @@ struct SolveConfig {
     double min_demote_fixed_status_baseline_m = 0.0;
     double max_demote_fixed_status_baseline_m = 0.0;
     bool enable_realtime_fix_integrity = false;
+    bool enable_fix_recovery = false;
+    std::string fix_recovery_log_path;
     // Fix 1 (agent/realtime-fix-integrity follow-up): opt-in, off by
     // default. Ported field-for-field from the frozen offline external
     // audit and safe there (Shinjuku-Trimble: 22 caught / 0 harmed), but
@@ -267,6 +282,8 @@ struct SolveConfig {
     bool wide_lane_ar_set = false;
     double wide_lane_acceptance_threshold = 0.25;
     bool wide_lane_acceptance_threshold_set = false;
+    int wide_lane_min_arc_samples = 0;
+    bool wide_lane_min_arc_samples_set = false;
     bool enable_wlnl_fallback = false;
     bool enable_bsr_guided_decimation = false;
     int bsr_guided_worst_axes = 3;
@@ -320,6 +337,9 @@ struct SolveConfig {
     // (RTKConfig::cmc_aware_reference_selection). Off by default; see the
     // config field's doc comment in rtk.hpp for the full algorithm.
     bool cmc_aware_reference_selection = false;
+    // RINEX/receiver LLI bit1 (half-cycle unresolved) handling
+    // (RTKConfig::use_half_cycle_lli); the default follows the library.
+    bool use_half_cycle_lli = libgnss::RTKProcessor::RTKConfig().use_half_cycle_lli;
     double cmc_ref_level_m = 0.75;
     int cmc_ref_switch_epochs = 3;
     double cmc_ref_return_min_elev_deg = 5.0;
@@ -1494,6 +1514,18 @@ void printAdvancedUsage(const char* program_name) {
         << "  --ratio <value|sat-count>  Fixed or satellite-count-aware Ratio threshold\n"
         << "  --preset <survey|low-cost|moving-base|odaiba>\n"
         << "                             Apply a named RTK tuning preset\n"
+        << "  --rtk-reported-covariance <legacy|filter|first-pass|spp-consistency>\n"
+        << "                             Covariance reported on RTK FLOAT epochs (default: legacy\n"
+        << "                             constant 0.01 m^2); positions are never changed\n"
+        << "  --rtk-covariance-log <file> Write per-epoch status, ECEF position and covariance\n"
+        << "  --pos-uncertainty          Append sdn sde sdu sdne sdeu sdun (m, 1-sigma, local ENU,\n"
+        << "                             RTKLIB signed-sqrt cross terms) and DiffAge(s) to .pos rows\n"
+        << "                             (--format pos only; default off = byte-identical output)\n"
+        << "  --pos-fix-diagnostics      Append FloatFixH(m) FloatFixU(m) to .pos rows: horizontal / vertical distance\n"
+        << "                             between the RTK epoch's float and FIXED positions. nan unless the written row\n"
+        << "                             is FIXED and still the RTK epoch's own fixed position (post-processing that\n"
+        << "                             changed its position or status gives nan). Diagnostic only, not an integrity bound\n"
+        << "                             (--format pos only; default off = byte-identical output)\n"
         << "  --arfilter                 Require extra ratio margin for subset AR fixes\n"
         << "  --no-arfilter              Disable subset AR filter margin even if a preset enables it\n"
         << "  --arfilter-margin <v>      Extra ratio margin for --arfilter (default: 0.25)\n"
@@ -1516,6 +1548,11 @@ void printAdvancedUsage(const char* program_name) {
         << "                             (default: 0, disabled)\n"
         << "  --min-hold-count <n>       Consecutive fixes before hold ambiguity is allowed (default: 5)\n"
         << "  --hold-ratio-threshold <v> Ratio threshold used while hold ambiguity is active (default: 2.0)\n"
+        << "  --hold-fix-unchanged-set   Reject the hold-fix fallback when a DD pair has no held integer (default: off)\n"
+        << "  --hold-fix-min-matched-pairs <n>\n"
+        << "                             Min held DD pairs for the hold-fix fallback (default: 4)\n"
+        << "  --min-fix-satellites <k>\n"
+        << "                             Min non-reference satellites in an ambiguity-resolution FIX (default: 0 = off)\n"
         << "  --elevation-mask-deg <v>   Elevation mask in degrees (default: 15)\n"
         << "  --process-noise-position <v>\n"
         << "                             KF process noise for position state, m^2/s (default: 1e-4)\n"
@@ -1531,6 +1568,18 @@ void printAdvancedUsage(const char* program_name) {
         << "  --rtk-snr-min-baseline <m>\n"
         << "                             Apply RTK SNR weighting only above this baseline length\n"
         << "                             (default: 0, disabled)\n"
+        << "  --rtk-snr-elevation-aware  Measure the SNR deficit against an elevation-dependent\n"
+        << "                             expected C/N0 (33 + 15 sin(el), capped by the reference)\n"
+        << "                             instead of the constant reference (default: off)\n"
+        << "  --rtk-snr-code-only        Apply the SNR variance inflation to code rows only\n"
+        << "                             (default: off)\n"
+        << "  --rtk-canyon-carrier-prior Kinematic RTK: while the code of a satellite above 45 deg\n"
+        << "                             disagrees (>3 m) with the position advanced from the\n"
+        << "                             previous posterior by a validated time-differenced\n"
+        << "                             carrier displacement (blocked-sky NLOS, e.g. a stop\n"
+        << "                             under an overpass), keep that position/ambiguity\n"
+        << "                             posterior instead of re-seeding the position from SPP\n"
+        << "                             (default: off)\n"
         << "  --cycle-slip-threshold <m> Geometry-free L1/L2 slip threshold (default: 0.05)\n"
         << "  --doppler-slip-threshold <m>\n"
         << "                             Doppler-predicted phase slip threshold (default: 0.20)\n"
@@ -1659,6 +1708,9 @@ void printAdvancedUsage(const char* program_name) {
         << "  --enable-wide-lane-ar      Enable MW wide-lane AR pre-step (default: off)\n"
         << "  --no-wide-lane-ar          Disable MW wide-lane AR, overriding presets\n"
         << "  --wide-lane-threshold <v>  WL float->int threshold in cycles (default: 0.25)\n"
+        << "  --wide-lane-min-arc-samples <n>\n"
+        << "                             Average the MW wide-lane over >= n epochs of each\n"
+        << "                             satellite arc before fixing (default: 0 = single epoch)\n"
         << "  --enable-wlnl-fallback     Enable MW WL/NL fallback after LAMBDA fails\n"
         << "  --enable-bsr-decimation    Enable BSR-guided partial AR decimation\n"
         << "                             (eigendecomposition-driven drop subsets)\n"
@@ -1804,6 +1856,14 @@ void printAdvancedUsage(const char* program_name) {
         << "                             satellites (per --nlos-weights) among the AR\n"
         << "                             candidate set before attempting/accepting a fix\n"
         << "                             (default: 0, disabled). Requires --nlos-weights\n"
+        << "  --half-cycle-lli / --no-half-cycle-lli\n"
+        << "                             Honour (or ignore) RINEX/receiver LLI bit1\n"
+        << "                             (half-cycle ambiguity unresolved) like RTKLIB demo5:\n"
+        << "                             a set<->clear transition is a slip for that\n"
+        << "                             satellite/frequency, phase variance is +0.01 m^2\n"
+        << "                             while set, and the satellite is excluded from\n"
+        << "                             ambiguity resolution. Library default applies\n"
+        << "                             when neither is given\n"
         << "  --cmc-ref                  Phase 2a: CMC-aware DD reference-satellite selection\n"
         << "                             with hysteresis (default: off). Switches the DD\n"
         << "                             reference away from a code-minus-carrier-suspect\n"
@@ -1947,6 +2007,10 @@ void printAdvancedUsage(const char* program_name) {
         << "  --timing-csv <file>        Write per-epoch RTK solver processing timing CSV\n"
         << "  --realtime-fix-integrity   Gate FIX output with bounded-latency residual checks\n"
         << "                             (default: off; maximum latency: 7 epochs)\n"
+        << "  --fix-recovery            Optional residual quarantine and clean-FIX recovery\n"
+        << "                             (default: off; zero additional output delay)\n"
+        << "  --no-fix-recovery         Disable residual quarantine/recovery\n"
+        << "  --fix-recovery-log <file>  Record every recovery decision; implies --fix-recovery\n"
         << "  --integrity-base-gate      Also enable the frozen offline low-satellite/ratio\n"
         << "                             confidence gate (default: off). Recommended for\n"
         << "                             low-FIX-rate receivers matching the audited offline\n"
@@ -1987,7 +2051,8 @@ void printAdvancedUsage(const char* program_name) {
         << "                             on PPC tokyo1 despite passing GDOP/DDPR-RMS/nsat/age)\n"
         << "  --integrity-log <file>     Write real-time integrity decisions and latency CSV\n"
         << "  --rtk-update-outlier-threshold <v>\n"
-        << "                             Outlier rejection threshold for RTK measurement update (default: 30.0)\n"
+        << "                             Prefit-residual outlier threshold for the RTK measurement update, m\n"
+        << "                             (default: RTKConfig::outlier_threshold, 3.0)\n"
         << "  --student-t-rtk-front-end  Enable Student-t(nu=4) DD covariance inflation (default: off)\n"
         << "  --no-kinematic-post-filter Disable the kinematic output post-filter\n"
         << "  --no-base-interp           Require exact rover/base epoch alignment\n"
@@ -2063,6 +2128,23 @@ void applyRTKTuningPreset(SolveConfig& config) {
             if (!config.min_hold_count_set) config.min_hold_count = 5;
             if (!config.hold_ratio_threshold_set) config.hold_ratio_threshold = 2.0;
             return;
+        case RTKTuningPreset::ODAIBA:
+            // low-cost profile plus arc-smoothed MW wide-lane AR. ODAIBA used
+            // to be a frozen copy of the early low-cost values, so it missed
+            // the later motion-aware jump gate / subset full-ratio guard /
+            // float-divergence reset, and its single-epoch MW test admitted
+            // near-random WL integers (metre-level urban code noise) as hard
+            // constraints. Falling through keeps it in lockstep with
+            // LOW_COST.
+            if (!config.wide_lane_ar_set) config.enable_wide_lane_ar = true;
+            if (!config.wide_lane_acceptance_threshold_set) {
+                config.wide_lane_acceptance_threshold = 0.12;
+            }
+            // 10 s of MW averaging at the 10 Hz UrbanNav rover rate.
+            if (!config.wide_lane_min_arc_samples_set) {
+                config.wide_lane_min_arc_samples = 100;
+            }
+            [[fallthrough]];
         case RTKTuningPreset::LOW_COST:
             if (!config.ratio_threshold_set) config.ratio_threshold = 3.0;
             if (!config.has_ar_filter_override) config.enable_ar_filter = true;
@@ -2108,18 +2190,6 @@ void applyRTKTuningPreset(SolveConfig& config) {
             if (!config.min_hold_count_set) config.min_hold_count = 8;
             if (!config.hold_ratio_threshold_set) config.hold_ratio_threshold = 2.4;
             return;
-        case RTKTuningPreset::ODAIBA:
-            if (!config.ratio_threshold_set) config.ratio_threshold = 3.0;
-            if (!config.has_ar_filter_override) config.enable_ar_filter = true;
-            if (!config.ar_filter_margin_set) config.ar_filter_margin = 0.35;
-            if (!config.min_satellites_for_ar_set) config.min_satellites_for_ar = 6;
-            if (!config.min_hold_count_set) config.min_hold_count = 8;
-            if (!config.hold_ratio_threshold_set) config.hold_ratio_threshold = 2.5;
-            if (!config.wide_lane_ar_set) config.enable_wide_lane_ar = true;
-            if (!config.wide_lane_acceptance_threshold_set) {
-                config.wide_lane_acceptance_threshold = 0.12;
-            }
-            return;
     }
 }
 
@@ -2162,6 +2232,7 @@ SolveConfig parseArguments(int argc, char* argv[]) {
             {"--float-bridge-tail-guard", "--no-float-bridge-tail-guard"},
             {"--glonass", "--no-glonass"},
             {"--integrity-base-gate", "--no-integrity-base-gate"},
+            {"--fix-recovery", "--no-fix-recovery"},
             {"--kinematic-post-filter", "--no-kinematic-post-filter"},
             {"--kml", "--no-kml"},
             {"--nonfix-drift-guard", "--no-nonfix-drift-guard"},
@@ -2195,8 +2266,21 @@ SolveConfig parseArguments(int argc, char* argv[]) {
         // chain below, which already sits at MSVC's C1061 nested-block
         // limit (gnss_solve is clang-only to build anyway, but there is no
         // reason to push the chain any deeper).
+        if (arg == "--wide-lane-min-arc-samples" && i + 1 < argc) {
+            config.wide_lane_min_arc_samples = std::stoi(argv[++i]);
+            config.wide_lane_min_arc_samples_set = true;
+            continue;
+        }
         if (arg == "--cmc-ref") {
             config.cmc_aware_reference_selection = true;
+            continue;
+        }
+        if (arg == "--half-cycle-lli") {
+            config.use_half_cycle_lli = true;
+            continue;
+        }
+        if (arg == "--no-half-cycle-lli") {
+            config.use_half_cycle_lli = false;
             continue;
         }
         if (arg == "--cmc-ref-level" && i + 1 < argc) {
@@ -2309,6 +2393,15 @@ SolveConfig parseArguments(int argc, char* argv[]) {
         }
         if (arg == "--realtime-fix-integrity") {
             config.enable_realtime_fix_integrity = true;
+            continue;
+        }
+        if (arg == "--fix-recovery" || arg == "--no-fix-recovery") {
+            config.enable_fix_recovery = arg == "--fix-recovery";
+            continue;
+        }
+        if (arg == "--fix-recovery-log" && i + 1 < argc) {
+            config.fix_recovery_log_path = argv[++i];
+            config.enable_fix_recovery = true;
             continue;
         }
         if (arg == "--integrity-base-gate") {
@@ -2444,6 +2537,42 @@ SolveConfig parseArguments(int argc, char* argv[]) {
             config.debug_epoch_log_path = argv[++i];
             continue;
         }
+        if (arg == "--rtk-reported-covariance" && i + 1 < argc) {
+            const std::string mode = argv[++i];
+            if (mode == "legacy") config.rtk_reported_covariance_mode = 0;
+            else if (mode == "filter") config.rtk_reported_covariance_mode = 1;
+            else if (mode == "first-pass") config.rtk_reported_covariance_mode = 2;
+            else if (mode == "spp-consistency") config.rtk_reported_covariance_mode = 3;
+            else {
+                std::cerr << "Error: --rtk-reported-covariance expects legacy|filter|first-pass|spp-consistency\n";
+                std::exit(1);
+            }
+            continue;
+        }
+        if (arg == "--rtk-covariance-log" && i + 1 < argc) {
+            config.rtk_covariance_log_path = argv[++i];
+            continue;
+        }
+        if (arg == "--pos-uncertainty") {
+            config.pos_uncertainty = true;
+            continue;
+        }
+        if (arg == "--pos-fix-diagnostics") {
+            config.pos_fix_diagnostics = true;
+            continue;
+        }
+        if (arg == "--hold-fix-unchanged-set") {
+            config.hold_fix_unchanged_set = true;
+            continue;
+        }
+        if (arg == "--hold-fix-min-matched-pairs" && i + 1 < argc) {
+            config.hold_fix_min_matched_pairs = std::stoi(argv[++i]);
+            continue;
+        }
+        if (arg == "--min-fix-satellites" && i + 1 < argc) {
+            config.min_fix_satellites = std::stoi(argv[++i]);
+            continue;
+        }
         // Keep these late-chain options standalone as well. Besides making
         // the parser easier to extend, this keeps MSVC below C1061's nested
         // else-if limit.
@@ -2563,6 +2692,12 @@ SolveConfig parseArguments(int argc, char* argv[]) {
             config.snr_max_variance_scale = std::stod(argv[++i]);
         } else if (arg == "--rtk-snr-min-baseline" && i + 1 < argc) {
             config.snr_min_baseline_m = std::stod(argv[++i]);
+        } else if (arg == "--rtk-snr-elevation-aware") {
+            config.snr_elevation_aware = true;
+        } else if (arg == "--rtk-snr-code-only") {
+            config.snr_inflate_code_only = true;
+        } else if (arg == "--rtk-canyon-carrier-prior") {
+            config.enable_canyon_carrier_prior = true;
         } else if (arg == "--cycle-slip-threshold" && i + 1 < argc) {
             config.cycle_slip_threshold = std::stod(argv[++i]);
         } else if (arg == "--doppler-slip-threshold" && i + 1 < argc) {
@@ -2858,6 +2993,9 @@ SolveConfig parseArguments(int argc, char* argv[]) {
     if (config.min_satellites_for_ar < 4) {
         argumentError("--min-ar-sats must be >= 4", argv[0]);
     }
+    if (config.wide_lane_min_arc_samples < 0) {
+        argumentError("--wide-lane-min-arc-samples must be >= 0", argv[0]);
+    }
     if (config.min_subset_pairs_for_ar < 4) {
         argumentError("--min-subset-ar-pairs must be >= 4", argv[0]);
     }
@@ -2978,6 +3116,12 @@ SolveConfig parseArguments(int argc, char* argv[]) {
     }
     if (config.hold_ratio_threshold <= 0.0) {
         argumentError("--hold-ratio-threshold must be > 0", argv[0]);
+    }
+    if (config.hold_fix_min_matched_pairs < 4) {
+        argumentError("--hold-fix-min-matched-pairs must be >= 4", argv[0]);
+    }
+    if (config.min_fix_satellites < 0) {
+        argumentError("--min-fix-satellites must be >= 0", argv[0]);
     }
     if (config.elevation_mask_deg < 0.0 || config.elevation_mask_deg >= 90.0) {
         argumentError("--elevation-mask-deg must be in [0, 90)", argv[0]);
@@ -3316,6 +3460,14 @@ SolveConfig parseArguments(int argc, char* argv[]) {
         config.doppler_float_seed_max_age_s <= 0.0) {
         argumentError("--doppler-float-seed-max-age must be > 0", argv[0]);
     }
+    if (config.pos_uncertainty &&
+        config.output_format != libgnss::io::SolutionWriter::Format::POS) {
+        argumentError("--pos-uncertainty requires --format pos", argv[0]);
+    }
+    if (config.pos_fix_diagnostics &&
+        config.output_format != libgnss::io::SolutionWriter::Format::POS) {
+        argumentError("--pos-fix-diagnostics requires --format pos", argv[0]);
+    }
 
     return config;
 }
@@ -3391,17 +3543,79 @@ std::string ionoOptString(libgnss::RTKProcessor::RTKConfig::IonoOpt iono) {
     return "off";
 }
 
-bool writeSolutions(const SolveConfig& config, const libgnss::Solution& solution) {
+// Age of differential (s) per rover epoch, keyed by integer milliseconds of
+// week*604800+tow. Only populated when --pos-uncertainty is on.
+using DifferentialAgeMap = std::map<long long, double>;
+
+long long differentialAgeKey(const libgnss::GNSSTime& time) {
+    return std::llround((static_cast<double>(time.week) * 604800.0 + time.tow) * 1000.0);
+}
+
+// RTK epoch results that were FIXED as returned by RTKProcessor, keyed like
+// DifferentialAgeMap, with the exact fixed position. Read-only record for
+// --pos-fix-diagnostics: a written row keeps its float-fix distance only if it
+// is FIXED and its position is bit-identical to this one, i.e. nothing in
+// gnss_solve's post-processing replaced it. Only populated when the option is on.
+using RtkOwnFixedMap = std::map<long long, Eigen::Vector3d>;
+
+// Counters for the --pos-fix-diagnostics summary line.
+struct FixDiagnosticStats {
+    size_t rtk_fixed_epochs = 0;             // epochs FIXED as returned by RTKProcessor
+    size_t written_fixed_rows = 0;           // rows written with status FIXED
+    size_t finite_rows = 0;                  // FIXED rows with finite columns
+    size_t fixed_nan_modified = 0;           // FIXED rows nan: not the RTK epoch's own fixed position
+    size_t fixed_nan_no_reference = 0;       // FIXED rows nan: RTK epoch carried no float reference
+    size_t rtk_fixed_not_written_as_own = 0; // RTK-FIXED epochs written non-FIXED, modified or dropped
+};
+
+bool writeSolutions(const SolveConfig& config, const libgnss::Solution& solution,
+                    const DifferentialAgeMap& differential_age,
+                    const RtkOwnFixedMap& rtk_own_fixed, FixDiagnosticStats& fix_stats) {
     libgnss::io::SolutionWriter writer;
-    if (!writer.open(config.output_pos_path, config.output_format)) {
+    if (!writer.open(config.output_pos_path, config.output_format, config.pos_uncertainty,
+                     config.pos_fix_diagnostics)) {
         std::cerr << "Error: failed to open output file: " << config.output_pos_path << std::endl;
         return false;
     }
 
+    size_t written_as_own = 0;
     for (const auto& epoch_solution : solution.solutions) {
-        writer.writeEpoch(epoch_solution);
+        double age_s = std::numeric_limits<double>::quiet_NaN();
+        if (config.pos_uncertainty) {
+            const auto age_it = differential_age.find(differentialAgeKey(epoch_solution.time));
+            if (age_it != differential_age.end()) age_s = age_it->second;
+        }
+        if (config.pos_fix_diagnostics) {
+            const auto own_it = rtk_own_fixed.find(differentialAgeKey(epoch_solution.time));
+            const bool is_fixed = epoch_solution.status == libgnss::SolutionStatus::FIXED;
+            const bool own_position = is_fixed && own_it != rtk_own_fixed.end() &&
+                                      epoch_solution.position_ecef == own_it->second;
+            if (own_position) ++written_as_own;
+            if (is_fixed) {
+                ++fix_stats.written_fixed_rows;
+                if (own_position && epoch_solution.rtk_float_reference_valid &&
+                    epoch_solution.rtk_float_position_ecef.allFinite()) {
+                    ++fix_stats.finite_rows;
+                } else if (own_position) {
+                    ++fix_stats.fixed_nan_no_reference;
+                } else {
+                    ++fix_stats.fixed_nan_modified;
+                }
+            }
+            if (!own_position && epoch_solution.rtk_float_reference_valid) {
+                // Post-processing changed this row (status or position): the
+                // float reference no longer belongs to it, so write nan.
+                auto row = epoch_solution;
+                row.rtk_float_reference_valid = false;
+                writer.writeEpoch(row, age_s);
+                continue;
+            }
+        }
+        writer.writeEpoch(epoch_solution, age_s);
     }
     writer.close();
+    fix_stats.rtk_fixed_epochs = rtk_own_fixed.size();
+    fix_stats.rtk_fixed_not_written_as_own = rtk_own_fixed.size() - written_as_own;
 
     if (config.write_kml && !solution.writeKML(config.output_kml_path)) {
         std::cerr << "Error: failed to write KML output: " << config.output_kml_path << std::endl;
@@ -3486,6 +3700,7 @@ int main(int argc, char* argv[]) {
         rtk_config.trust_lapse_gate_nlos_frac = config.trust_lapse_gate_nlos_frac;
         rtk_config.nlos_min_los_sats = config.nlos_min_los_sats;
         rtk_config.cmc_aware_reference_selection = config.cmc_aware_reference_selection;
+        rtk_config.use_half_cycle_lli = config.use_half_cycle_lli;
         rtk_config.cmc_ref_level_m = config.cmc_ref_level_m;
         rtk_config.cmc_ref_switch_epochs = config.cmc_ref_switch_epochs;
         rtk_config.cmc_ref_return_min_elev_deg = config.cmc_ref_return_min_elev_deg;
@@ -3524,6 +3739,9 @@ int main(int argc, char* argv[]) {
             config.min_subset_dual_frequency_sats_for_ar;
         rtk_config.min_full_ratio_for_subset_ar = config.min_full_ratio_for_subset_ar;
         rtk_config.min_hold_count = config.min_hold_count;
+        rtk_config.hold_fix_unchanged_set_only = config.hold_fix_unchanged_set;
+        rtk_config.hold_fix_min_matched_pairs = config.hold_fix_min_matched_pairs;
+        rtk_config.min_fix_satellites = config.min_fix_satellites;
         rtk_config.elevation_mask = config.elevation_mask_deg * M_PI / 180.0;
         if (config.process_noise_position_set) {
             rtk_config.process_noise_position = config.process_noise_position;
@@ -3538,9 +3756,15 @@ int main(int argc, char* argv[]) {
             rtk_config.carrier_phase_sigma = config.carrier_phase_sigma;
         }
         rtk_config.enable_snr_weighting = config.enable_snr_weighting;
+        rtk_config.reported_covariance_mode =
+            static_cast<libgnss::RTKProcessor::RTKConfig::ReportedCovarianceMode>(
+                config.rtk_reported_covariance_mode);
         rtk_config.snr_reference_dbhz = config.snr_reference_dbhz;
         rtk_config.snr_max_variance_scale = config.snr_max_variance_scale;
         rtk_config.snr_min_baseline_m = config.snr_min_baseline_m;
+        rtk_config.snr_elevation_aware = config.snr_elevation_aware;
+        rtk_config.snr_inflate_code_only = config.snr_inflate_code_only;
+        rtk_config.enable_canyon_carrier_prior = config.enable_canyon_carrier_prior;
         rtk_config.cycle_slip_threshold = config.cycle_slip_threshold;
         rtk_config.doppler_slip_threshold = config.doppler_slip_threshold;
         rtk_config.code_slip_threshold = config.code_slip_threshold;
@@ -3618,6 +3842,7 @@ int main(int argc, char* argv[]) {
         rtk_config.max_postfix_residual_rms = config.max_postfix_residual_rms;
         rtk_config.enable_wide_lane_ar = config.enable_wide_lane_ar;
         rtk_config.wide_lane_acceptance_threshold = config.wide_lane_acceptance_threshold;
+        rtk_config.wide_lane_min_arc_samples = config.wide_lane_min_arc_samples;
         rtk_config.enable_wlnl_fallback = config.enable_wlnl_fallback;
         rtk_config.enable_bsr_guided_decimation = config.enable_bsr_guided_decimation;
         rtk_config.bsr_guided_worst_axes = config.bsr_guided_worst_axes;
@@ -3721,6 +3946,17 @@ int main(int argc, char* argv[]) {
             writeDiagnosticsHeader(diagnostics_csv);
         }
 
+        std::ofstream rtk_covariance_log;
+        if (!config.rtk_covariance_log_path.empty()) {
+            rtk_covariance_log.open(config.rtk_covariance_log_path);
+            if (!rtk_covariance_log.is_open()) {
+                std::cerr << "Error: failed to open RTK covariance log: "
+                          << config.rtk_covariance_log_path << std::endl;
+                return 1;
+            }
+            rtk_covariance_log << "week,tow,status,x,y,z,c00,c01,c02,c11,c12,c22\n";
+        }
+
         std::ofstream timing_csv;
         if (!config.timing_csv_path.empty()) {
             timing_csv.open(config.timing_csv_path);
@@ -3764,6 +4000,19 @@ int main(int argc, char* argv[]) {
         }
 
         std::unique_ptr<libgnss::RealtimeFixIntegrityGate> integrity_gate;
+        libgnss::FixRecoveryGuard::Config fix_recovery_config;
+        fix_recovery_config.enabled = config.enable_fix_recovery;
+        libgnss::FixRecoveryGuard fix_recovery_guard(fix_recovery_config);
+        std::ofstream fix_recovery_log;
+        if (config.enable_fix_recovery && !config.fix_recovery_log_path.empty()) {
+            fix_recovery_log.open(config.fix_recovery_log_path);
+            if (!fix_recovery_log) {
+                std::cerr << "Error: cannot open FIX recovery log: " << config.fix_recovery_log_path << '\n';
+                return 1;
+            }
+            fix_recovery_log << "gps_week,tow,input_status,output_status,state,reasons,"
+                                "demote_fixed,request_primary_reset,recovered,suspect_streak,clean_streak\n";
+        }
         IntegrityTelemetryWriter integrity_writer;
         if (config.enable_realtime_fix_integrity) {
             libgnss::RealtimeFixIntegrityGate::Config integrity_config;
@@ -3899,6 +4148,9 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
+        DifferentialAgeMap differential_age_s;
+        RtkOwnFixedMap rtk_own_fixed_positions;
+        FixDiagnosticStats fix_diagnostic_stats;
         int processed_rover_epochs = 0;
         int valid_solution_count = 0;
         int fixed_solution_count = 0;
@@ -3982,6 +4234,11 @@ int main(int argc, char* argv[]) {
                 aligned_base_obs = base_obs;
                 exact_base_epochs++;
                 have_aligned_base = true;
+                if (config.pos_uncertainty) {
+                    // Exact match: the base observation used is the rover epoch's own.
+                    differential_age_s[differentialAgeKey(rover_obs.time)] =
+                        timeDiffSeconds(rover_obs.time, base_obs.time);
+                }
             } else if (config.enable_base_interpolation && base_ok && have_lower_base &&
                        timeDiffSeconds(rover_obs.time, lower_base_obs.time) >= -kExactTimeToleranceSeconds &&
                        timeDiffSeconds(base_obs.time, rover_obs.time) >= -kExactTimeToleranceSeconds &&
@@ -3990,6 +4247,12 @@ int main(int argc, char* argv[]) {
                 interpolated_base_epochs++;
                 have_aligned_base = true;
                 used_interpolated_base = true;
+                if (config.pos_uncertainty) {
+                    // Interpolated between two real base epochs: report the age of
+                    // the older bracketing sample (rover time - lower base time).
+                    differential_age_s[differentialAgeKey(rover_obs.time)] =
+                        timeDiffSeconds(rover_obs.time, lower_base_obs.time);
+                }
             }
 
             if (!have_aligned_base) {
@@ -4016,6 +4279,13 @@ int main(int argc, char* argv[]) {
                                          ? std::chrono::steady_clock::now()
                                          : std::chrono::steady_clock::time_point{};
             auto pos_solution = rtk_processor.processRTKEpoch(rover_obs, aligned_base_obs, nav_data);
+            if (config.pos_fix_diagnostics &&
+                pos_solution.status == libgnss::SolutionStatus::FIXED) {
+                // Read-only record of the RTK epoch's own fixed position, taken
+                // before any gnss_solve post-processing (see writeSolutions).
+                rtk_own_fixed_positions[differentialAgeKey(rover_obs.time)] =
+                    pos_solution.position_ecef;
+            }
             if (timing_enabled) {
                 const double elapsed_ms =
                     std::chrono::duration<double, std::milli>(
@@ -4429,6 +4699,22 @@ int main(int argc, char* argv[]) {
 
             auto gated_feedback_solution = feedback_solution;
             bool integrity_reset_requested = false;
+            if (config.enable_fix_recovery) {
+                const auto recovery = fix_recovery_guard.update(feedback_solution, rover_obs.time);
+                if (recovery.demote_fixed) {
+                    if (pos_solution.isFixed()) pos_solution.status = libgnss::SolutionStatus::FLOAT;
+                    if (gated_feedback_solution.isFixed()) gated_feedback_solution.status = libgnss::SolutionStatus::FLOAT;
+                }
+                integrity_reset_requested = recovery.request_primary_reset;
+                if (fix_recovery_log) {
+                    fix_recovery_log << rover_obs.time.week << ',' << std::fixed << std::setprecision(3)
+                        << rover_obs.time.tow << ',' << static_cast<int>(feedback_solution.status) << ','
+                        << static_cast<int>(pos_solution.status) << ',' << static_cast<int>(recovery.state) << ','
+                        << recovery.reasons << ',' << recovery.demote_fixed << ','
+                        << recovery.request_primary_reset << ',' << recovery.recovered << ','
+                        << recovery.suspect_streak << ',' << recovery.clean_streak << '\n';
+                }
+            }
             if (integrity_gate) {
                 libgnss::RealtimeFixIntegrityGate::EpochInput integrity_input;
                 integrity_input.primary = pos_solution;
@@ -4443,6 +4729,7 @@ int main(int argc, char* argv[]) {
                     }
                 }
                 integrity_reset_requested =
+                    integrity_reset_requested ||
                     integrity_update.current.consensus.request_primary_reset ||
                     integrity_update.current.residual_streak_demoted ||
                     integrity_update.current.residual_spike_demoted ||
@@ -4451,6 +4738,14 @@ int main(int argc, char* argv[]) {
             }
 
             debug_writer.write(pos_solution, rtk_processor.getLastDebugTelemetry());
+            if (rtk_covariance_log.is_open() && pos_solution.position_ecef.allFinite()) {
+                const auto& c = pos_solution.position_covariance;
+                rtk_covariance_log << pos_solution.time.week << ',' << std::setprecision(12)
+                    << pos_solution.time.tow << ',' << static_cast<int>(pos_solution.status) << ','
+                    << pos_solution.position_ecef.x() << ',' << pos_solution.position_ecef.y() << ','
+                    << pos_solution.position_ecef.z() << ',' << c(0, 0) << ',' << c(0, 1) << ','
+                    << c(0, 2) << ',' << c(1, 1) << ',' << c(1, 2) << ',' << c(2, 2) << '\n';
+            }
 
             if (diagnostics_csv.is_open()) {
                 EpochDiagnostics diag;
@@ -4609,63 +4904,54 @@ int main(int argc, char* argv[]) {
             // pointing at the prior trusted anchor.
             libgnss::Solution filtered_solution;
             filtered_solution.solutions.reserve(solution.solutions.size());
-            bool have_kept_fixed = false;
-            const libgnss::PositionSolution* last_kept = nullptr;
+            // Shared with gnss_live (--kinematic-post-filter): the verdict for an epoch
+            // depends only on the last kept epoch, so the same filter runs causally.
+            libgnss::rtk_validation::KinematicPostFilter height_step_filter(
+                libgnss::rtk_validation::KinematicPostFilterConfig{
+                    kDefaultVerticalStepGuardMeters, 4.0});
             for (const auto& epoch_solution : solution.solutions) {
                 if (!epoch_solution.isValid()) {
                     continue;
                 }
 
-                if (last_kept != nullptr && have_kept_fixed) {
-                    double dt = epoch_solution.time - last_kept->time;
-                    if (!std::isfinite(dt) || dt <= 0.0) {
-                        dt = 1.0;
+                if (height_step_filter.exceedsHeightStep(epoch_solution)) {
+                    const double dt = height_step_filter.anchorDt(epoch_solution);
+                    const auto& last_kept = height_step_filter.anchor();
+                    const auto continuity =
+                        libgnss::safe_float_continuity::propagate(
+                            rtk_config.safe_float_continuity,
+                            last_kept.position_ecef,
+                            dt,
+                            last_kept.velocity_ecef,
+                            dt);
+                    if (
+                        last_kept.has_velocity &&
+                        continuity.valid) {
+                        auto replacement = last_kept;
+                        replacement.time = epoch_solution.time;
+                        replacement.status =
+                            libgnss::SolutionStatus::FLOAT;
+                        replacement.position_ecef =
+                            continuity.position_ecef;
+                        replacement.position_geodetic =
+                            libgnss::spp_utils::ecefToGeodetic(
+                                replacement.position_ecef);
+                        replacement.position_covariance =
+                            Eigen::Matrix3d::Identity() *
+                            continuity.position_variance_m2;
+                        replacement.num_satellites = 4;
+                        replacement.ratio = 0.0;
+                        replacement.num_fixed_ambiguities = 0;
+                        filtered_solution.addSolution(replacement);
+                        ++kinematic_postfilter_continuity_epochs;
                     }
-                    const double height_step = std::abs(
-                        epoch_solution.position_geodetic.height -
-                        last_kept->position_geodetic.height);
-                    const double max_height_step =
-                        std::max(kDefaultVerticalStepGuardMeters, 4.0 * dt);
-                    if (height_step > max_height_step) {
-                        const auto continuity =
-                            libgnss::safe_float_continuity::propagate(
-                                rtk_config.safe_float_continuity,
-                                last_kept->position_ecef,
-                                dt,
-                                last_kept->velocity_ecef,
-                                dt);
-                        if (
-                            last_kept->has_velocity &&
-                            continuity.valid) {
-                            auto replacement = *last_kept;
-                            replacement.time = epoch_solution.time;
-                            replacement.status =
-                                libgnss::SolutionStatus::FLOAT;
-                            replacement.position_ecef =
-                                continuity.position_ecef;
-                            replacement.position_geodetic =
-                                libgnss::spp_utils::ecefToGeodetic(
-                                    replacement.position_ecef);
-                            replacement.position_covariance =
-                                Eigen::Matrix3d::Identity() *
-                                continuity.position_variance_m2;
-                            replacement.num_satellites = 4;
-                            replacement.ratio = 0.0;
-                            replacement.num_fixed_ambiguities = 0;
-                            filtered_solution.addSolution(replacement);
-                            ++kinematic_postfilter_continuity_epochs;
-                        }
-                        // Never advance the trusted post-filter anchor with a
-                        // propagated replacement.
-                        continue;
-                    }
+                    // Never advance the trusted post-filter anchor with a
+                    // propagated replacement.
+                    continue;
                 }
 
                 filtered_solution.addSolution(epoch_solution);
-                last_kept = &filtered_solution.solutions.back();
-                if (epoch_solution.isFixed()) {
-                    have_kept_fixed = true;
-                }
+                height_step_filter.accept(epoch_solution);
             }
             solution = std::move(filtered_solution);
         }
@@ -4726,7 +5012,8 @@ int main(int argc, char* argv[]) {
             std::cerr << "Error: no valid solutions were produced" << std::endl;
             return 1;
         }
-        if (!writeSolutions(config, solution)) {
+        if (!writeSolutions(config, solution, differential_age_s, rtk_own_fixed_positions,
+                            fix_diagnostic_stats)) {
             return 1;
         }
 
@@ -4766,6 +5053,16 @@ int main(int argc, char* argv[]) {
             std::cout << "  CMC-aware reference selection: enabled"
                       << " suspect_epochs=" << cmc_ref_diag.suspect_epoch_count
                       << " switches=" << cmc_ref_diag.switch_count << std::endl;
+        }
+        if (config.enable_canyon_carrier_prior) {
+            const auto prior_stats = rtk_processor.getCarrierPriorStats();
+            std::cout << "  canyon carrier prior: enabled"
+                      << " epochs=" << prior_stats.epochs_evaluated
+                      << " tdcp_valid=" << prior_stats.tdcp_valid_epochs
+                      << " bridged=" << prior_stats.bridged_epochs
+                      << " engaged_epochs=" << prior_stats.engaged_epochs
+                      << " engagements=" << prior_stats.engagements
+                      << " contradictions=" << prior_stats.contradictions << std::endl;
         }
         if (rtk_config.position_mode != libgnss::RTKProcessor::RTKConfig::PositionMode::STATIC) {
             std::cout << "  non-FIX drift guard: "
@@ -4819,6 +5116,15 @@ int main(int argc, char* argv[]) {
                           << "% qualified as demotion authority)";
             }
             std::cout << std::endl;
+        }
+        if (config.pos_fix_diagnostics) {
+            std::cout << "  fix diagnostics: rtk_fixed_epochs=" << fix_diagnostic_stats.rtk_fixed_epochs
+                      << " written_fixed_rows=" << fix_diagnostic_stats.written_fixed_rows
+                      << " finite_rows=" << fix_diagnostic_stats.finite_rows
+                      << " nan_modified_fixed_rows=" << fix_diagnostic_stats.fixed_nan_modified
+                      << " nan_no_float_reference_rows=" << fix_diagnostic_stats.fixed_nan_no_reference
+                      << " rtk_fixed_not_written_as_own="
+                      << fix_diagnostic_stats.rtk_fixed_not_written_as_own << std::endl;
         }
         std::cout << "  output written: " << config.output_pos_path << std::endl;
         if (config.write_kml) {

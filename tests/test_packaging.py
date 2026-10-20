@@ -16,7 +16,7 @@ from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 BUILD_DIR = Path(os.environ.get("GNSSPP_BINARY_DIR", ROOT_DIR / "build"))
-PUBLIC_IMAGE = "ghcr.io/rsasaki0109/gnssplusplus-library:v0.2.0"
+PUBLIC_IMAGE = "ghcr.io/rsasaki0109/gnssplusplus-library:v0.3.0"
 PUBLIC_DEMO_COMMAND = re.compile(
     re.escape(PUBLIC_IMAGE)
     + r"\s+demo\s+--output-dir\s+/workspace/output/self-contained-demo"
@@ -42,6 +42,24 @@ def repo_data_exists(*relative_paths: str) -> bool:
 
 
 class PackagingSmokeTest(unittest.TestCase):
+    @unittest.skipIf(os.name == "nt", "POSIX installer runs on UNIX; CMake file(WRITE) uses host newlines")
+    def test_posix_install_normalizes_scripts_without_touching_frozen_data(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="gnss_script_eol_") as temp_dir:
+            prefix = Path(temp_dir)/"prefix"
+            bindir = prefix/"bin"
+            bindir.mkdir(parents=True)
+            script = bindir/"gnss"
+            script.write_bytes(b"#!/usr/bin/env python3\r\nprint('ready')\r\n")
+            frozen = prefix/"frozen.json"
+            original = b'{"immutable":true}\r\n'
+            frozen.write_bytes(original)
+            template = (ROOT_DIR/"apps/normalize_installed_scripts.cmake.in").read_text(encoding="utf-8")
+            cmake_script = Path(temp_dir)/"normalize.cmake"
+            cmake_script.write_text(template.replace("@CMAKE_INSTALL_BINDIR@", "bin"), encoding="utf-8")
+            subprocess.run(["cmake", f"-DCMAKE_INSTALL_PREFIX={prefix.as_posix()}", "-P", str(cmake_script)], check=True)
+            self.assertEqual(script.read_bytes(), b"#!/usr/bin/env python3\nprint('ready')\n")
+            self.assertEqual(frozen.read_bytes(), original)
+
     def test_docker_files_exist_and_look_like_runtime_packaging(self) -> None:
         dockerfile = ROOT_DIR / "Dockerfile"
         dockerignore = ROOT_DIR / ".dockerignore"
@@ -197,7 +215,9 @@ class PackagingSmokeTest(unittest.TestCase):
                 prefix / "bin" / "support" / "gnss_input_source.py",
                 prefix / "bin" / "support" / "gnss_runtime.py",
                 prefix / "bin" / "support" / "gnss_toml_config.py",
+                prefix / "bin" / "support" / "gnss_rtstress.py",
                 prefix / "bin" / "gnss_live_signoff.py",
+                prefix / "bin" / "gnss_realtime_stress.py",
                 prefix / "bin" / "gnss_moving_base_signoff.py",
                 prefix / "bin" / "gnss_scorpion_moving_base_signoff.py",
                 prefix / "bin" / "gnss_moving_base_prepare.py",
@@ -241,6 +261,12 @@ class PackagingSmokeTest(unittest.TestCase):
                 prefix / "share" / "libgnsspp" / "demo" / "synthetic_ppp.obs",
                 prefix / "share" / "libgnsspp" / "demo" / "synthetic_ppp.sp3",
                 prefix / "share" / "libgnsspp" / "demo" / "synthetic_ppp.clk",
+                prefix / "share" / "libgnsspp" / "demo" / "synthetic_pva.csv",
+                prefix / "share" / "libgnsspp" / "demo" / "synthetic_reference.csv",
+                prefix / "share" / "libgnsspp" / "docs" / "online_pva.md",
+                prefix / "share" / "libgnsspp" / "docs" / "online_pva_candidate_v1.md",
+                prefix / "share" / "libgnsspp" / "docs" / "online_pva_development_plan.md",
+                prefix / "bin" / ("gnss_pva_replay" + EXE_SUFFIX),
             ]
             commands_root = ROOT_DIR / "apps" / "commands"
             command_sources = [
@@ -295,9 +321,11 @@ class PackagingSmokeTest(unittest.TestCase):
             env["PATH"] = str(prefix / "bin") + os.pathsep + env.get("PATH", "")
 
             installed_demo_output = Path(temp_dir) / "installed-demo-output"
+            installed_dispatcher = ([sys.executable, str(prefix / "bin" / "gnss")]
+                                    if os.name == "nt" else [str(prefix / "bin" / "gnss")])
             installed_demo = subprocess.run(
                 [
-                    str(prefix / "bin" / "gnss"),
+                    *installed_dispatcher,
                     "demo",
                     "--output-dir",
                     str(installed_demo_output),
@@ -309,6 +337,12 @@ class PackagingSmokeTest(unittest.TestCase):
                 text=True,
             )
             self.assertIn("Self-contained offline demo complete:", installed_demo.stdout)
+            pva_demo = subprocess.run(
+                [*installed_dispatcher, "pva-demo", "--output-dir", str(Path(temp_dir)/"installed-pva")],
+                check=True, cwd=Path(temp_dir), env=env, capture_output=True, text=True)
+            self.assertIn("Synthetic scoring witness passed", pva_demo.stdout)
+            subprocess.run([*installed_dispatcher, "pva-replay", "--help"], check=True,
+                           cwd=Path(temp_dir), env=env, capture_output=True, text=True)
             for artifact_name in (
                 "demo_solution.pos",
                 "demo_solution.kml",
@@ -342,7 +376,7 @@ class PackagingSmokeTest(unittest.TestCase):
             )
             self.assertEqual(
                 installed_web_hash.stdout.strip(),
-                hashlib.sha256((prefix / "bin" / "gnss_web.html").read_bytes()).hexdigest(),
+                hashlib.sha256((prefix / "bin" / "gnss_web.html").read_text(encoding="utf-8").encode("utf-8")).hexdigest(),
             )
 
             for command in (
@@ -355,7 +389,7 @@ class PackagingSmokeTest(unittest.TestCase):
                 "binex-info",
             ):
                 receiver_help = subprocess.run(
-                    [str(prefix / "bin" / "gnss"), command, "--help"],
+                    [*installed_dispatcher, command, "--help"],
                     check=True,
                     cwd=ROOT_DIR,
                     env=env,
@@ -372,7 +406,7 @@ class PackagingSmokeTest(unittest.TestCase):
                 "ppc-spp-policy-suite",
             ):
                 ppc_help = subprocess.run(
-                    [str(prefix / "bin" / "gnss"), command, "--help"],
+                    [*installed_dispatcher, command, "--help"],
                     check=True,
                     cwd=ROOT_DIR,
                     env=env,
@@ -390,7 +424,7 @@ class PackagingSmokeTest(unittest.TestCase):
                 short_baseline_summary = prefix / "tmp_short_baseline.json"
                 subprocess.run(
                     [
-                        str(prefix / "bin" / "gnss"),
+                        *installed_dispatcher,
                         "short-baseline-signoff",
                         "--rover",
                         str(ROOT_DIR / "data/short_baseline/TSK200JPN_R_20240010000_01D_30S_MO.rnx"),
@@ -420,7 +454,7 @@ class PackagingSmokeTest(unittest.TestCase):
                 visibility_png = prefix / "tmp_visibility.png"
                 subprocess.run(
                     [
-                        str(prefix / "bin" / "gnss"),
+                        *installed_dispatcher,
                         "ppp-static-signoff",
                         "--obs",
                         str(ROOT_DIR / "data/rover_static.obs"),
@@ -442,7 +476,7 @@ class PackagingSmokeTest(unittest.TestCase):
 
                 subprocess.run(
                     [
-                        str(prefix / "bin" / "gnss"),
+                        *installed_dispatcher,
                         "ppp-products-signoff",
                         "--help",
                     ],
@@ -454,7 +488,7 @@ class PackagingSmokeTest(unittest.TestCase):
 
                 subprocess.run(
                     [
-                        str(prefix / "bin" / "gnss"),
+                        *installed_dispatcher,
                         "visibility",
                         "--obs",
                         str(ROOT_DIR / "data/rover_static.obs"),
@@ -476,7 +510,7 @@ class PackagingSmokeTest(unittest.TestCase):
                 self.assertTrue(visibility_summary.exists(), "installed visibility did not write summary")
                 subprocess.run(
                     [
-                        str(prefix / "bin" / "gnss"),
+                        *installed_dispatcher,
                         "visibility-plot",
                         str(visibility_csv),
                         str(visibility_png),
@@ -495,7 +529,7 @@ class PackagingSmokeTest(unittest.TestCase):
                 social_card_png = prefix / "tmp_social_card.png"
                 subprocess.run(
                     [
-                        str(prefix / "bin" / "gnss"),
+                        *installed_dispatcher,
                         "social-card",
                         "--lib-pos",
                         str(ROOT_DIR / "output" / "rtk_solution.pos"),
@@ -515,7 +549,7 @@ class PackagingSmokeTest(unittest.TestCase):
             feature_overview_png = prefix / "tmp_feature_overview.png"
             subprocess.run(
                 [
-                    "python3",
+                    sys.executable,
                     str(prefix / "scripts" / "generate_feature_overview_card.py"),
                     "--output",
                     str(feature_overview_png),
@@ -529,7 +563,7 @@ class PackagingSmokeTest(unittest.TestCase):
             architecture_png = prefix / "tmp_architecture.png"
             subprocess.run(
                 [
-                    "python3",
+                    sys.executable,
                     str(prefix / "scripts" / "generate_architecture_diagram.py"),
                     "--output",
                     str(architecture_png),
@@ -541,7 +575,7 @@ class PackagingSmokeTest(unittest.TestCase):
             self.assertTrue(architecture_png.exists(), "installed architecture generator did not write PNG")
 
             web_help = subprocess.run(
-                [str(prefix / "bin" / "gnss"), "web", "--help"],
+                [*installed_dispatcher, "web", "--help"],
                 check=True,
                 cwd=ROOT_DIR,
                 env=env,
@@ -551,7 +585,7 @@ class PackagingSmokeTest(unittest.TestCase):
             self.assertIn("local web UI", web_help.stdout)
 
             live_signoff_help = subprocess.run(
-                [str(prefix / "bin" / "gnss"), "live-signoff", "--help"],
+                [*installed_dispatcher, "live-signoff", "--help"],
                 check=True,
                 cwd=ROOT_DIR,
                 env=env,
@@ -561,7 +595,7 @@ class PackagingSmokeTest(unittest.TestCase):
             self.assertIn("realtime", live_signoff_help.stdout.lower())
 
             moving_base_signoff_help = subprocess.run(
-                [str(prefix / "bin" / "gnss"), "moving-base-signoff", "--help"],
+                [*installed_dispatcher, "moving-base-signoff", "--help"],
                 check=True,
                 cwd=ROOT_DIR,
                 env=env,
@@ -571,7 +605,7 @@ class PackagingSmokeTest(unittest.TestCase):
             self.assertIn("moving-base", moving_base_signoff_help.stdout.lower())
 
             scorpion_moving_base_help = subprocess.run(
-                [str(prefix / "bin" / "gnss"), "scorpion-moving-base-signoff", "--help"],
+                [*installed_dispatcher, "scorpion-moving-base-signoff", "--help"],
                 check=True,
                 cwd=ROOT_DIR,
                 env=env,
@@ -581,7 +615,7 @@ class PackagingSmokeTest(unittest.TestCase):
             self.assertIn("scorpion", scorpion_moving_base_help.stdout.lower())
 
             moving_base_plot_help = subprocess.run(
-                [str(prefix / "bin" / "gnss"), "moving-base-plot", "--help"],
+                [*installed_dispatcher, "moving-base-plot", "--help"],
                 check=True,
                 cwd=ROOT_DIR,
                 env=env,
@@ -591,7 +625,7 @@ class PackagingSmokeTest(unittest.TestCase):
             self.assertIn("baseline", moving_base_plot_help.stdout.lower())
 
             fetch_products_help = subprocess.run(
-                [str(prefix / "bin" / "gnss"), "fetch-products", "--help"],
+                [*installed_dispatcher, "fetch-products", "--help"],
                 check=True,
                 cwd=ROOT_DIR,
                 env=env,
@@ -602,7 +636,7 @@ class PackagingSmokeTest(unittest.TestCase):
             self.assertIn("--preset", fetch_products_help.stdout)
 
             artifact_manifest_help = subprocess.run(
-                [str(prefix / "bin" / "gnss"), "artifact-manifest", "--help"],
+                [*installed_dispatcher, "artifact-manifest", "--help"],
                 check=True,
                 cwd=ROOT_DIR,
                 env=env,
@@ -612,7 +646,7 @@ class PackagingSmokeTest(unittest.TestCase):
             self.assertIn("artifact manifest", artifact_manifest_help.stdout.lower())
 
             ionex_help = subprocess.run(
-                [str(prefix / "bin" / "gnss"), "ionex-info", "--help"],
+                [*installed_dispatcher, "ionex-info", "--help"],
                 check=True,
                 cwd=ROOT_DIR,
                 env=env,
@@ -622,7 +656,7 @@ class PackagingSmokeTest(unittest.TestCase):
             self.assertIn("IONEX", ionex_help.stdout)
 
             dcb_help = subprocess.run(
-                [str(prefix / "bin" / "gnss"), "dcb-info", "--help"],
+                [*installed_dispatcher, "dcb-info", "--help"],
                 check=True,
                 cwd=ROOT_DIR,
                 env=env,
@@ -632,7 +666,7 @@ class PackagingSmokeTest(unittest.TestCase):
             self.assertIn("DCB", dcb_help.stdout)
 
             visibility_help = subprocess.run(
-                [str(prefix / "bin" / "gnss"), "visibility", "--help"],
+                [*installed_dispatcher, "visibility", "--help"],
                 check=True,
                 cwd=ROOT_DIR,
                 env=env,
@@ -642,7 +676,7 @@ class PackagingSmokeTest(unittest.TestCase):
             self.assertIn("visibility rows", visibility_help.stdout.lower())
 
             visibility_plot_help = subprocess.run(
-                [str(prefix / "bin" / "gnss"), "visibility-plot", "--help"],
+                [*installed_dispatcher, "visibility-plot", "--help"],
                 check=True,
                 cwd=ROOT_DIR,
                 env=env,

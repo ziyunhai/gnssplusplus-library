@@ -738,7 +738,7 @@ bool RTKProcessor::tryHoldFix(const std::map<SatelliteId, SatelliteData>& sat_da
 
     const int na = usesGlonassAutocal(rtk_config_) ? REAL_STATES : BASE_STATES;
 
-    std::vector<DDPair> dd_pairs = buildDoubleDifferencePairs(sat_data, 1);
+    std::vector<DDPair> dd_pairs = buildDoubleDifferencePairs(sat_data, 1, true);
     dd_pairs.erase(
         std::remove_if(dd_pairs.begin(), dd_pairs.end(),
                        [&](const DDPair& pair) {
@@ -778,6 +778,15 @@ bool RTKProcessor::tryHoldFix(const std::map<SatelliteId, SatelliteData>& sat_da
 
     debug_telemetry_.hold_fix_matched_pairs = matched;
     if (matched < 4) return reject_hold("matched_pairs_lt4");
+    if (matched < rtk_config_.hold_fix_min_matched_pairs) {
+        return reject_hold("matched_pairs_below_min");
+    }
+    // Opt-in: the held integers only describe an unchanged pair set. A candidate
+    // pair that joined or was reset has no held integer; reject instead of
+    // using the rounded value computed above
+    if (rtk_config_.hold_fix_unchanged_set_only && matched < nb) {
+        return reject_hold("unmatched_pairs");
+    }
 
     std::vector<rtk_measurement::AmbiguityDifference> differences;
     differences.reserve(nb);

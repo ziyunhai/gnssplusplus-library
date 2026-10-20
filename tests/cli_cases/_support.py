@@ -23,6 +23,7 @@ import zipfile
 import http.server
 import importlib.util
 from functools import partial
+from contextlib import closing
 from pathlib import Path
 from urllib import request
 
@@ -88,7 +89,7 @@ def build_synthetic_sqlite_rosbag(
     if include_fix:
         topic_specs.append(("/gnss/fix", "sensor_msgs/msg/NavSatFix", [1_000_000_000, 1_200_000_000, 4_000_000_000]))
 
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection:
         connection.execute(
             "CREATE TABLE topics("
             "id INTEGER PRIMARY KEY, "
@@ -700,15 +701,15 @@ def build_nav_pvt_message() -> bytes:
     return build_ubx_message(0x01, 0x07, payload)
 
 
-def build_rawx_message(measurements=None) -> bytes:
+def build_rawx_message(measurements=None, *, week: int = 2200, tow: float = 345600.125) -> bytes:
     if measurements is None:
         measurements = [
             (20200000.25, 110000.5, -1234.5, 0, 12, 0, 500, 45, 0x03),
         ]
 
     payload = bytearray()
-    payload.extend(struct.pack("<d", 345600.125))
-    payload.extend(struct.pack("<H", 2200))
+    payload.extend(struct.pack("<d", tow))
+    payload.extend(struct.pack("<H", week))
     payload.extend(bytes([18, len(measurements), 0x01, 0x01, 0x00, 0x00]))
 
     for pseudorange, carrier_phase, doppler, gnss_id, sv_id, sig_id, locktime, cno, trk_stat in measurements:
@@ -734,17 +735,24 @@ def build_mixed_rawx_message() -> bytes:
     )
 
 
+def build_sfrbx_words_message(gnss_id: int, sv_id: int, sig_id: int, freq_id: int, words) -> bytes:
+    payload = bytearray([gnss_id, sv_id, sig_id, freq_id, len(words), 0x01, 0x02, 0x00])
+    for word in words:
+        payload.extend(struct.pack("<I", word))
+    return build_ubx_message(0x02, 0x13, bytes(payload))
+
+
 def build_sfrbx_message() -> bytes:
     payload = bytearray(
         [
-            0x02,  # version
-            0x03,  # numWords
-            0x01,  # channel
-            0x00,
             0x00,  # gnssId = GPS
             0x0C,  # svId = 12
-            0x00,
+            0x00,  # sigId = L1 C/A
             0x00,  # freqId
+            0x03,  # numWords
+            0x01,  # chn
+            0x02,  # version
+            0x00,  # reserved
         ]
     )
     payload.extend(struct.pack("<I", 0x8B0000AA))
@@ -1638,13 +1646,21 @@ def build_single_grid_residuals(
     return tuple(residuals)
 
 
-def build_gps_lnav_sfrbx_message(subframe_id: int, sv_id: int = 12, week: int = 2200) -> bytes:
+def build_gps_lnav_sfrbx_message(
+    subframe_id: int,
+    sv_id: int = 12,
+    week: int = 2200,
+    health: int = 0,
+    iode: int = 77,
+    toe_offset_s: int = 0,
+) -> bytes:
+    # iode / toe_offset_s pick another issue of the same satellite (IODE = IODC low byte, toe = toc =
+    # 345600 + toe_offset_s); the defaults are the original single issue.
     payload_bits = bytearray(30)
     tow_seconds = 345600
-    toc_seconds = 345600
-    toes_seconds = 345600
-    iodc = 77
-    iode = 77
+    toc_seconds = 345600 + toe_offset_s
+    toes_seconds = 345600 + toe_offset_s
+    iodc = iode
 
     set_unsigned_bits(payload_bits, 24, 17, tow_seconds // 6)
     set_unsigned_bits(payload_bits, 43, 3, subframe_id)
@@ -1657,7 +1673,7 @@ def build_gps_lnav_sfrbx_message(subframe_id: int, sv_id: int = 12, week: int = 
         bit += 2
         set_unsigned_bits(payload_bits, bit, 4, 0)
         bit += 4
-        set_unsigned_bits(payload_bits, bit, 6, 0)
+        set_unsigned_bits(payload_bits, bit, 6, health)  # LNAV svh
         bit += 6
         set_unsigned_bits(payload_bits, bit, 2, iodc >> 8)
         bit += 2
@@ -1720,14 +1736,14 @@ def build_gps_lnav_sfrbx_message(subframe_id: int, sv_id: int = 12, week: int = 
 
     payload = bytearray(
         [
-            0x02,  # version
-            0x0A,  # numWords
-            0x01,  # channel
-            0x00,
             0x00,  # gnssId = GPS
             sv_id,
-            0x00,
+            0x00,  # sigId = L1 C/A
             0x00,  # freqId
+            0x0A,  # numWords
+            0x01,  # chn
+            0x02,  # version
+            0x00,  # reserved
         ]
     )
     for word_index in range(10):
@@ -1795,14 +1811,14 @@ def build_glonass_sfrbx_message(string_number: int, sv_id: int = 7, frequency_id
 
     payload = bytearray(
         [
-            0x02,  # version
-            0x04,  # numWords
-            0x01,  # channel
-            0x00,
             0x06,  # gnssId = GLONASS
             sv_id,
-            0x00,
-            frequency_id,
+            0x00,  # sigId = L1OF
+            frequency_id,  # freqId
+            0x04,  # numWords
+            0x01,  # chn
+            0x02,  # version
+            0x00,  # reserved
         ]
     )
     for word_index in range(4):
@@ -1896,14 +1912,14 @@ def build_beidou_d1_sfrbx_message(subframe_id: int, sv_id: int = 12, bdt_week: i
 
     payload = bytearray(
         [
-            0x02,  # version
-            0x0A,  # numWords
-            0x01,  # channel
-            0x00,
             0x03,  # gnssId = BeiDou
             sv_id,
-            0x00,
+            0x00,  # sigId = B1I D1
             0x00,  # freqId
+            0x0A,  # numWords
+            0x01,  # chn
+            0x02,  # version
+            0x00,  # reserved
         ]
     )
     for word_index in range(10):
@@ -2014,14 +2030,14 @@ def build_beidou_d2_sfrbx_message(page_id: int, sv_id: int = 3, bdt_week: int = 
 
     payload = bytearray(
         [
-            0x02,  # version
-            0x0A,  # numWords
-            0x01,  # channel
-            0x00,
             0x03,  # gnssId = BeiDou
             sv_id,
-            0x00,
+            0x01,  # sigId = B1I D2
             0x00,  # freqId
+            0x0A,  # numWords
+            0x01,  # chn
+            0x02,  # version
+            0x00,  # reserved
         ]
     )
     for word_index in range(10):
@@ -2034,6 +2050,8 @@ def build_galileo_inav_sfrbx_message(
     word_type: int,
     sv_id: int = 5,
     gst_week: int = 1176,
+    sig_id: int = 1,
+    sisa_index: int = 3,
 ) -> bytes:
     if word_type < 0 or word_type > 5:
         raise ValueError(f"unsupported Galileo word type: {word_type}")
@@ -2075,7 +2093,7 @@ def build_galileo_inav_sfrbx_message(
         set_signed_bits(word, 72, 16, round(-1.5e-6 / (2.0 ** -29)))
         set_signed_bits(word, 88, 16, round(210.0 / (2.0 ** -5)))
         set_signed_bits(word, 104, 16, round(120.0 / (2.0 ** -5)))
-        set_unsigned_bits(word, 120, 8, 3)
+        set_unsigned_bits(word, 120, 8, sisa_index)
 
     elif word_type == 4:
         set_unsigned_bits(word, 0, 6, 4)
@@ -2109,20 +2127,73 @@ def build_galileo_inav_sfrbx_message(
 
     payload = bytearray(
         [
-            0x02,  # version
-            0x08,  # numWords
-            0x01,  # channel
-            0x00,
             0x02,  # gnssId = Galileo
             sv_id,
-            0x00,
+            sig_id,  # sigId: 1 = E1-B, 5 = E5b-I (I/NAV)
             0x00,  # freqId
+            0x08,  # numWords
+            0x01,  # chn
+            0x02,  # version
+            0x00,  # reserved
         ]
     )
     for word_index in range(8):
         raw_word = int.from_bytes(frame[word_index * 4:(word_index + 1) * 4], "big")
         payload.extend(struct.pack("<I", raw_word))
     return build_ubx_message(0x02, 0x13, payload)
+
+
+# Nineteen complete UBX-RXM-SFRBX frames recorded by a u-blox X20 on
+# 2025-07-08 (rtklibexplorer/GNSS_IMU drive_0708/gnss_1934.ubx, BSD-3-Clause,
+# see THIRD_PARTY_NOTICES.md): GPS L1 C/A LNAV subframes 1-3 of G10, Galileo
+# E1-B I/NAV word types 0-5 of E04, BeiDou B3I D1 subframes 1-3 of C27, then
+# one frame each of GPS L2-CM and L5-I CNAV, SBAS L1, Galileo E5a-I F/NAV and
+# E6-B, BeiDou B1C B-CNAV1 and B2a B-CNAV2.
+X20_SFRBX_EXCERPT_HEX = (
+        "B56202133000000A00000A3C02001846C122D849CC131A006414409BA58E90EE"
+        "2D28B2A6992E71C1D69A30F1CE90FDE93F00F49E68B05A35"
+        "B56202133000000A00000A3C02001846C122B06ACC132B58FC10F8E08D0A8ED6"
+        "483D7CC1CBBC9BBD610F57685E02ECFD4E031F1FF10EDA4B"
+        "B56202133000000A00000A3C02001846C1228C8BCC1357D500008D8B3A120B8A"
+        "E3BF90B7ED146BA8AC09DA9FA523B611EBBFE0ACFE907124"
+        "B56202132800020401000859020055559500555555555555555500C01855B2D6"
+        "90AD6ABE9BD9A07BAAAA00C08A380D1F"
+        "B562021328000204010008590200C8CF0501760ED2136F2F260000C004AA88D3"
+        "D9B02A61F7434154AAAA00C04AFD7808"
+        "B56202132800020401000859020025E10502D509E688EA39A56A008002539350"
+        "8884EA5570A2024CAAAA000041709A7B"
+        "B562021328000204010008590200F1FF0503FEEF47D38374C52C00803DAAB7D3"
+        "DAAD6AD623D2EF7DAAAA00C00B27EDE2"
+        "B56202132800020401000859020000C405043FDAFF0204B4FD230040FF97CD54"
+        "008EEACEA13F217BAAAA00C0CA66638A"
+        "B562021328000204010008590200E84046055F7D600E768C0A3800802AC8E699"
+        "AAAAAAB6F36DBA66AAAA000001C7E9D7"
+        "B56202133000031B04000A2C0200BE139038B510A0187E75F407265FBD31C0FF"
+        "1E1529CF033E257F313F0A2000001C40E7328361B2028CEB"
+        "B56202133000031B04000A2C0200BC239038EFA8B818C32A0E08FD1EA40ECA01"
+        "343BC9CF2B14BF71EE0140086707DC517A2EB864DC134313"
+        "B56202133000031B04000A2C0200B3339038A7AED3189EB74D0CA380EA2B69FD"
+        "8F00D400DE28E1616106D575AB020803CA259F8E402D76D9"
+        "B56202133000001204000A8D0200F3144A8B76ED7201A144635501303A8020FE"
+        "1FFE09604C02894B3C4600000000B80900008AB408C54257"
+        "B56202133000001206000A010200F2E4498B76ED72F9A144635501303A8082FE"
+        "0FEEE07FFCCFFEFF030AF9FF0931E2070046A1B4C86801A4"
+        "B5620213280001870000085702000000FC530000000000000000000000000000"
+        "00000000000000000000C0368001ECAD"
+        "B5620213280002130300081D0200FC5C3005C82A4180FD500C00A00319AD8AF3"
+        "81394AC6768C43AAAAAA00000C4054F6"
+        "B5620213480002130800106302000719FDFFDAC2827BB6A498914A267A40F196"
+        "DDD5872D1EC7726374AF8AA1CA2BF20A0B883AD4752AADBA2DDB094B3638C66C"
+        "B191B671A3135D590B2F000000341DF7"
+        "B56202132C0003310600094D0200BCCA1E09A563FE380067F1FF7859FA9ABC1E"
+        "7802A02F0A000000007052AC00001728A9696602"
+        "B56202132C000331080009150200E5F2B4C40951051EAFDE0449B8D28E665700"
+        "A01827029CFF501A04681C2072027F4A795EBADE"
+)
+
+
+def build_x20_sfrbx_excerpt() -> bytes:
+    return bytes.fromhex(X20_SFRBX_EXCERPT_HEX)
 
 
 def build_gsof_record(record_type: int, payload: bytes) -> bytes:
@@ -2208,10 +2279,6 @@ def build_skytraq_epoch_message(*, iod: int = 7, week: int = 2200, tow_ms: int =
         0xDC,
         bytes([iod]) + week.to_bytes(2, "big") + tow_ms.to_bytes(4, "big"),
     )
-
-
-def build_skytraq_raw_message(*, iod: int = 7, nsat: int = 12) -> bytes:
-    return build_skytraq_frame(0xDD, bytes([iod, nsat]))
 
 
 def build_skytraq_rawx_message(
@@ -2512,7 +2579,12 @@ def build_synthetic_ppp_inputs(
     temp_root: Path,
     *,
     include_antenna_header: bool = False,
+    epochs: int = 8,
 ) -> tuple[Path, Path, Path, tuple[float, float, float]]:
+    # The satellites are fixed in ECEF and the observations noise-free, so the
+    # static float position is carried by the repeated code rows and its error
+    # falls roughly as 1/n with one measurement update per epoch. The SP3/CLK
+    # span (01:00-01:10) allows up to 20 epochs at 30 s.
     latitude = math.radians(35.0)
     longitude = math.radians(139.0)
     true_position = geodetic_to_ecef(latitude, longitude, 45.0)
@@ -2558,7 +2630,7 @@ def build_synthetic_ppp_inputs(
     clk_path = temp_root / "synthetic_ppp.clk"
 
     epoch_times = []
-    for epoch_index in range(8):
+    for epoch_index in range(epochs):
         total_seconds = 30.0 * epoch_index
         minute = int(total_seconds // 60.0)
         second = total_seconds - minute * 60.0

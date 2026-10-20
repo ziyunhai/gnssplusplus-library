@@ -26,6 +26,10 @@ struct AndroidRawGnssConfig {
     // common receiver clock fields within GPS/Galileo satellite/UTC groups.
     // Default OFF does not change legacy ingestion or measurement selection.
     bool require_frequency_pair_timing = false;
+    /// Experimental continuous FullBias reference for a single hardware-clock
+    /// segment. Gaps do not reset the reference. Backward TimeNanos or changed
+    /// HardwareClockDiscontinuityCount fail closed. Default preserves upstream.
+    bool continuous_clock_reference = false;
     /// Optional device name used only for the published ADR sign correction.
     std::string device_model;
     /// Retain the L1 observations used by taroz's FGO mapping when true.
@@ -213,5 +217,13 @@ bool loadAndroidRawGnssCsv(const std::string& path,
                            const AndroidRawGnssConfig& config,
                            AndroidRawGnssResult& result,
                            std::string& error);
+
+// Explicit leading time-only states (at most four seconds, same hardware
+// clock), with no invalid observations admitted. Requires a native estimator
+// with bounded leading initialization and verified continuous mapped IMU.
+bool loadAndroidRawGnssCsvWithLeadingClockEpochs(
+    const std::string& path, const AndroidRawGnssConfig& config,
+    AndroidRawGnssResult& result, std::string& error);
+
 
 }  // namespace libgnss::io

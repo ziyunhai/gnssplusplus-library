@@ -4,6 +4,7 @@
 #include <sstream>
 #include <iomanip>
 #include <cmath>
+#include <cstdlib>
 #include <utility>
 
 namespace libgnss {
@@ -47,7 +48,60 @@ std::vector<std::string> parseSolutionColumnsHeader(const std::string& line) {
 }
 
 int optionalColumnToInt(double value) {
+    if (!std::isfinite(value)) {
+        return 0;
+    }
     return static_cast<int>(std::lround(value));
+}
+
+// Optional-column values are plain numbers, but the writer emits "nan" for
+// unavailable entries (e.g. the --pos-uncertainty columns); stream extraction
+// of a double rejects "nan", so parse with strtod and stop at the first
+// non-numeric token exactly like the previous stream loop did.
+bool parseOptionalColumnToken(const std::string& token, double& value) {
+    char* end = nullptr;
+    value = std::strtod(token.c_str(), &end);
+    return end != token.c_str() && *end == '\0';
+}
+
+// Rebuild position_covariance (ECEF) from the sdn/sde/sdu[/sdne/sdeu/sdun]
+// columns written by SolutionWriter's uncertainty option. Left untouched
+// (NaN) when the three standard deviations are not all finite.
+void applyUncertaintyColumns(PositionSolution& sol,
+                             const std::vector<std::string>& columns,
+                             const std::vector<double>& values,
+                             double latitude_rad,
+                             double longitude_rad) {
+    double sd[6] = {std::nan(""), std::nan(""), std::nan(""),
+                    0.0, 0.0, 0.0};
+    static const char* const kNames[6] = {"sdn(m)", "sde(m)", "sdu(m)",
+                                          "sdne(m)", "sdeu(m)", "sdun(m)"};
+    for (std::size_t offset = 0; offset < values.size(); ++offset) {
+        const std::size_t column_index = kMandatorySolutionColumns + offset;
+        if (column_index >= columns.size()) {
+            break;
+        }
+        for (int i = 0; i < 6; ++i) {
+            if (columns[column_index] == kNames[i]) {
+                sd[i] = values[offset];
+            }
+        }
+    }
+    if (!std::isfinite(sd[0]) || !std::isfinite(sd[1]) || !std::isfinite(sd[2])) {
+        return;
+    }
+    for (int i = 3; i < 6; ++i) {
+        if (!std::isfinite(sd[i])) {
+            sd[i] = 0.0;
+        }
+    }
+    const auto signed_square = [](double v) { return std::copysign(v * v, v); };
+    Matrix3d covariance_enu;
+    covariance_enu << sd[1] * sd[1], signed_square(sd[3]), signed_square(sd[4]),
+        signed_square(sd[3]), sd[0] * sd[0], signed_square(sd[5]),
+        signed_square(sd[4]), signed_square(sd[5]), sd[2] * sd[2];
+    const Matrix3d ecef_to_enu = ecefToEnuRotation(latitude_rad, longitude_rad);
+    sol.position_covariance = ecef_to_enu.transpose() * covariance_enu * ecef_to_enu;
 }
 
 void applyOptionalSolutionColumns(PositionSolution& sol,
@@ -269,15 +323,31 @@ bool parseRtklibSolutionLine(const std::string& line, PositionSolution& sol) {
 
 } // namespace
 
+Matrix3d PositionSolution::positionCovarianceEnu() const {
+    if (!position_ecef.allFinite() || position_ecef.norm() <= 1e6 ||
+        !position_covariance.allFinite()) {
+        return Matrix3d::Constant(std::numeric_limits<double>::quiet_NaN());
+    }
+    double latitude_rad = 0.0;
+    double longitude_rad = 0.0;
+    double height_m = 0.0;
+    ecef2geodetic(position_ecef, latitude_rad, longitude_rad, height_m);
+    const Matrix3d ecef_to_enu = ecefToEnuRotation(latitude_rad, longitude_rad);
+    return ecef_to_enu * position_covariance * ecef_to_enu.transpose();
+}
+
 double PositionSolution::getHorizontalAccuracy() const {
-    // 95% confidence (2-sigma)
-    double sigma_h = std::sqrt(position_covariance(0,0) + position_covariance(1,1));
+    // 95% confidence (2-sigma) from the local East/North variances;
+    // position_covariance is ECEF, so its XX/YY terms are not horizontal.
+    const Matrix3d enu = positionCovarianceEnu();
+    double sigma_h = std::sqrt(enu(0,0) + enu(1,1));
     return 2.0 * sigma_h;
 }
 
 double PositionSolution::getVerticalAccuracy() const {
-    // 95% confidence (2-sigma)
-    double sigma_v = std::sqrt(position_covariance(2,2));
+    // 95% confidence (2-sigma) from the local Up variance.
+    const Matrix3d enu = positionCovarianceEnu();
+    double sigma_v = std::sqrt(enu(2,2));
     return 2.0 * sigma_v;
 }
 
@@ -517,19 +587,6 @@ bool Solution::writeGeoJSON(const std::string& filename) const {
     return true;
 }
 
-bool Solution::writeNMEA(const std::string& filename) const {
-    std::ofstream file(filename);
-    if (!file.is_open()) {
-        return false;
-    }
-    
-    for (const auto& sol : solutions) {
-        file << sol.toNMEA();
-    }
-    
-    return true;
-}
-
 bool Solution::loadFromFile(const std::string& filename) {
     std::ifstream file(filename);
     if (!file.is_open()) {
@@ -575,28 +632,25 @@ bool Solution::loadFromFile(const std::string& filename) {
         }
 
         std::vector<double> optional_values;
+        std::string optional_token;
         double optional_value = 0.0;
-        while (iss >> optional_value) {
+        while (iss >> optional_token && parseOptionalColumnToken(optional_token, optional_value)) {
             optional_values.push_back(optional_value);
         }
         applyOptionalSolutionColumns(sol, columns, optional_values);
 
         sol.position_geodetic.latitude = lat_deg * M_PI / 180.0;
         sol.position_geodetic.longitude = lon_deg * M_PI / 180.0;
+        if (!columns.empty()) {
+            applyUncertaintyColumns(sol, columns, optional_values,
+                                    sol.position_geodetic.latitude,
+                                    sol.position_geodetic.longitude);
+        }
         sol.status = static_cast<SolutionStatus>(status);
         solutions.push_back(sol);
     }
 
     return !solutions.empty();
-}
-
-const PositionSolution* Solution::getSolution(const GNSSTime& time) const {
-    for (const auto& sol : solutions) {
-        if (sol.time == time) {
-            return &sol;
-        }
-    }
-    return nullptr;
 }
 
 std::vector<PositionSolution> Solution::filterByStatus(SolutionStatus status) const {

@@ -5,6 +5,8 @@ set(GNSS_APP_TARGETS
     gnss_doppler_row_attrition_audit
     gnss_smartphone_fgo
     gnss_fuse
+    gnss_online
+    gnss_pva_replay
     gnss_vel_d
     gnss_pos_pdc
     gnss_pos_pd
@@ -17,9 +19,11 @@ set(GNSS_APP_TARGETS
     gnss_rinex_info
     gnss_stream
     gnss_ubx_info
+    gnss_has_info
     gnss_convert
     gnss_replay
     gnss_live
+    gnss_rtcm_encode
 )
 
 set(GNSS_NATIVE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/native)
@@ -69,6 +73,11 @@ if(GTSAM_FOUND)
     add_executable(gnss_fgo_imu_no_base ${GNSS_NATIVE_DIR}/gnss_fgo_imu_no_base.cpp)
     target_compile_definitions(gnss_fgo_imu_no_base PRIVATE GNSS_WITH_GTSAM=1)
     target_link_libraries(gnss_fgo_imu_no_base PRIVATE gnss_lib gnss_lib_solvers Threads::Threads gtsam)
+    if(MSVC)
+        # Full smartphone trajectories exhaust Windows' default 1 MiB stack
+        # during GTSAM processing. Keep enough reserve for the batch graph.
+        target_link_options(gnss_fgo_imu_no_base PRIVATE /STACK:8388608)
+    endif()
 
     # v2.1 keeps the v1 ordinary TDCP + position/clock motion graph while
     # retaining the opt-in Pose3/velocity/bias CombinedImuFactor chain.  It is
@@ -94,8 +103,11 @@ add_executable(gnss_fuse
 )
 target_link_libraries(gnss_fuse PRIVATE gnss_lib gnss_rtk_runtime Threads::Threads)
 
-add_executable(gnss_safe_bridge gnss_safe_bridge.cpp)
-target_link_libraries(gnss_safe_bridge PRIVATE gnss_lib gnss_rtk_runtime)
+add_executable(gnss_online ${GNSS_NATIVE_DIR}/gnss_online.cpp)
+target_link_libraries(gnss_online PRIVATE gnss_lib gnss_rtk_runtime Threads::Threads)
+
+add_executable(gnss_pva_replay ${GNSS_NATIVE_DIR}/gnss_pva_replay.cpp)
+target_link_libraries(gnss_pva_replay PRIVATE gnss_lib gnss_rtk_runtime Threads::Threads)
 
 add_executable(gnss_vel_d ${GNSS_NATIVE_DIR}/gnss_vel_d.cpp)
 target_link_libraries(gnss_vel_d PRIVATE gnss_lib gnss_lib_solvers Threads::Threads)
@@ -150,6 +162,9 @@ target_link_libraries(gnss_stream PRIVATE gnss_lib gnss_lib_solvers Threads::Thr
 add_executable(gnss_ubx_info ${GNSS_NATIVE_DIR}/gnss_ubx_info.cpp)
 target_link_libraries(gnss_ubx_info PRIVATE gnss_lib gnss_lib_solvers Threads::Threads)
 
+add_executable(gnss_has_info ${GNSS_NATIVE_DIR}/gnss_has_info.cpp)
+target_link_libraries(gnss_has_info PRIVATE gnss_lib gnss_lib_solvers Threads::Threads)
+
 add_executable(gnss_convert ${GNSS_NATIVE_DIR}/gnss_convert.cpp)
 target_link_libraries(gnss_convert PRIVATE gnss_lib gnss_lib_solvers Threads::Threads)
 
@@ -158,6 +173,10 @@ target_link_libraries(gnss_replay PRIVATE gnss_lib gnss_lib_solvers Threads::Thr
 
 add_executable(gnss_live ${GNSS_NATIVE_DIR}/gnss_live.cpp)
 target_link_libraries(gnss_live PRIVATE gnss_lib gnss_lib_solvers Threads::Threads)
+
+# Recorded RINEX -> RTCM3 stream + per-epoch index, used by `gnss realtime-stress`.
+add_executable(gnss_rtcm_encode ${GNSS_NATIVE_DIR}/gnss_rtcm_encode.cpp)
+target_link_libraries(gnss_rtcm_encode PRIVATE gnss_lib gnss_lib_solvers Threads::Threads)
 
 install(TARGETS ${GNSS_APP_TARGETS}
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
@@ -168,6 +187,19 @@ install(PROGRAMS
     DESTINATION ${CMAKE_INSTALL_BINDIR}
     RENAME gnss
 )
+if(WIN32)
+    install(PROGRAMS ${CMAKE_CURRENT_SOURCE_DIR}/gnss.cmd DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()
+install(FILES
+    ${CMAKE_SOURCE_DIR}/docs/online_pva.md
+    ${CMAKE_SOURCE_DIR}/docs/online_pva_development_plan.md
+    ${CMAKE_SOURCE_DIR}/docs/online_pva_candidate_v1.md
+    ${CMAKE_SOURCE_DIR}/docs/online_pva_development_results.md
+    ${CMAKE_SOURCE_DIR}/docs/online_pva_development_scorecard.png
+    ${CMAKE_SOURCE_DIR}/docs/online_pva_decision_v1.json
+    ${CMAKE_SOURCE_DIR}/docs/online_pva_provenance_v1.json
+    DESTINATION share/libgnsspp/docs)
+install(FILES ${CMAKE_SOURCE_DIR}/LICENSE DESTINATION share/licenses/libgnsspp)
 
 file(GLOB GNSS_PYTHON_COMMAND_FILES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/commands/*/*.py"
@@ -325,5 +357,14 @@ install(FILES
     ${CMAKE_SOURCE_DIR}/demo/fixtures/synthetic_ppp.obs
     ${CMAKE_SOURCE_DIR}/demo/fixtures/synthetic_ppp.sp3
     ${CMAKE_SOURCE_DIR}/demo/fixtures/synthetic_ppp.clk
+    ${CMAKE_SOURCE_DIR}/demo/fixtures/synthetic_pva.csv
+    ${CMAKE_SOURCE_DIR}/demo/fixtures/synthetic_reference.csv
+    ${CMAKE_SOURCE_DIR}/demo/fixtures/PVA_README.md
     DESTINATION share/libgnsspp/demo
 )
+
+if(UNIX)
+    configure_file(normalize_installed_scripts.cmake.in
+        ${CMAKE_CURRENT_BINARY_DIR}/normalize_installed_scripts.cmake @ONLY NEWLINE_STYLE UNIX)
+    install(SCRIPT ${CMAKE_CURRENT_BINARY_DIR}/normalize_installed_scripts.cmake)
+endif()

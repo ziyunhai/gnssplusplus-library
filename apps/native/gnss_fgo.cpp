@@ -38,7 +38,11 @@
 #include <tuple>
 #include <vector>
 
+#include "json_output_helpers.hpp"
+
 namespace {
+
+using libgnss_apps::jsonEscape;
 
 struct Options {
     std::string obs_path;
@@ -915,21 +919,6 @@ void applySystemFilter(libgnss::ObservationData& epoch, const Options& options) 
         epoch.observations.end());
 }
 
-std::string jsonEscape(const std::string& value) {
-    std::ostringstream escaped;
-    for (char ch : value) {
-        switch (ch) {
-            case '\\': escaped << "\\\\"; break;
-            case '"': escaped << "\\\""; break;
-            case '\n': escaped << "\\n"; break;
-            case '\r': escaped << "\\r"; break;
-            case '\t': escaped << "\\t"; break;
-            default: escaped << ch; break;
-        }
-    }
-    return escaped.str();
-}
-
 const char* jsonBool(bool value) {
     return value ? "true" : "false";
 }
@@ -1285,21 +1274,6 @@ double ddGeometry(const libgnss::Vector3d& rover_position,
            (base_satellite_position - base_position).norm() -
            ((rover_reference_position - rover_position).norm() -
             (base_reference_position - base_position).norm());
-}
-
-double elevationRad(const libgnss::Vector3d& receiver_position,
-                    const libgnss::Vector3d& satellite_position) {
-    double lat = 0.0;
-    double lon = 0.0;
-    double height = 0.0;
-    libgnss::ecef2geodetic(receiver_position, lat, lon, height);
-    const libgnss::Vector3d enu =
-        libgnss::ecef2enu(satellite_position - receiver_position, lat, lon);
-    const double range = enu.norm();
-    if (range <= 0.0) {
-        return 0.0;
-    }
-    return std::asin(std::max(-1.0, std::min(1.0, enu(2) / range)));
 }
 
 double seedPositionDivergenceMeters(
@@ -2665,11 +2639,7 @@ bool isPrimaryFgoDebugSignal(libgnss::SignalType signal) {
 
 bool isHealthyForFgoDebug(const libgnss::Observation& observation,
                           const libgnss::Ephemeris& eph) {
-    int sv_health = static_cast<int>(eph.health);
-    if (observation.satellite.system == libgnss::GNSSSystem::QZSS) {
-        sv_health &= 0xFE;
-    }
-    return sv_health == 0;
+    return libgnss::ephemerisHealthy(eph, observation.satellite.system);
 }
 
 double groupDelayCorrectionMeters(const libgnss::Observation& observation,

@@ -4,6 +4,7 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <map>
 #include <sstream>
@@ -14,8 +15,10 @@
 #include <libgnss++/algorithms/ppp_env_overrides.hpp>
 #include <libgnss++/core/solution.hpp>
 #include <libgnss++/external/madocalib_bridge.hpp>
+#include <libgnss++/io/galileo_has.hpp>
 #include <libgnss++/io/madoca_l6.hpp>
 #include <libgnss++/io/rinex.hpp>
+#include <libgnss++/io/rtcm.hpp>
 
 #include "cli_toml_config.hpp"
 
@@ -32,6 +35,9 @@ struct Options {
     std::string clk_path;
     std::string ssr_path;
     std::string ssr_rtcm_path;
+    std::string ssr_rtcm_profile = "legacy";
+    std::string has_pages_path;
+    std::string has_pages_format;
     std::vector<std::string> madoca_l6_paths;
     std::vector<std::string> madoca_l6d_paths;
     std::vector<std::string> madoca_l6d_shadow_paths;
@@ -54,6 +60,7 @@ struct Options {
     double convergence_threshold_horizontal = 0.1;
     double convergence_threshold_vertical = 0.2;
     double ssr_step_seconds = 1.0;
+    double elevation_mask_deg = -1.0;  // < 0: processor default
     bool estimate_troposphere = true;
     bool estimate_ionosphere = false;
     bool use_ionosphere_free = true;
@@ -89,6 +96,8 @@ struct Options {
     std::string ar_method = "iflc";
     double process_noise_iono = 0.0;
     bool process_noise_iono_set = false;
+    double process_noise_accel_h = -1.0;
+    double process_noise_accel_v = -1.0;
     bool use_iers_solid_tide = true;
     bool use_iers_ocean_loading = false;
     std::string eop_c04_file;
@@ -97,6 +106,74 @@ struct Options {
     std::string atm_tidal_loading_file;
     bool use_iers_atm_tidal_loading = false;
     bool quiet = false;
+    double progress_interval_s = 0.0;
+};
+
+// Periodic stderr progress for long post-processing runs (--progress).
+class ProgressReporter {
+public:
+    ProgressReporter(double interval_s, const libgnss::GNSSTime& first_obs,
+                     const libgnss::GNSSTime& last_obs)
+        : interval_s_(interval_s),
+          first_obs_(first_obs),
+          span_s_(first_obs.week > 0 && last_obs.week > 0 ? last_obs - first_obs : 0.0),
+          started_(std::chrono::steady_clock::now()),
+          next_report_(started_ + toDuration(interval_s)) {}
+
+    void update(int epochs, const libgnss::GNSSTime& epoch_time, int valid, int fixed) {
+        if (interval_s_ <= 0.0) {
+            return;
+        }
+        if (first_obs_.week == 0) {
+            first_obs_ = epoch_time;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now < next_report_) {
+            return;
+        }
+        next_report_ = now + toDuration(interval_s_);
+        const double elapsed_s = secondsSince(now);
+        const double data_s = epoch_time - first_obs_;
+        std::ostringstream line;
+        line << std::fixed << std::setprecision(1) << "[gnss_ppp] progress: epoch " << epochs
+             << ", data " << data_s << " s";
+        if (span_s_ > 0.0) {
+            const double fraction = std::clamp(data_s / span_s_, 0.0, 1.0);
+            line << " / " << span_s_ << " s (" << fraction * 100.0 << "%)";
+            if (fraction > 0.0) {
+                line << ", eta " << elapsed_s * (1.0 - fraction) / fraction << " s";
+            }
+        }
+        line << ", valid " << valid << " (fixed " << fixed << "), elapsed " << elapsed_s
+             << " s, " << epochs / elapsed_s << " epoch/s";
+        std::cerr << line.str() << std::endl;
+    }
+
+    void finish(int epochs, int valid, int fixed) const {
+        if (interval_s_ <= 0.0) {
+            return;
+        }
+        std::cerr << std::fixed << std::setprecision(1) << "[gnss_ppp] progress: done, "
+                  << epochs << " epochs, valid " << valid << " (fixed " << fixed
+                  << "), elapsed " << secondsSince(std::chrono::steady_clock::now()) << " s"
+                  << std::endl;
+    }
+
+private:
+    static std::chrono::steady_clock::duration toDuration(double seconds) {
+        return std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            std::chrono::duration<double>(seconds));
+    }
+
+    double secondsSince(std::chrono::steady_clock::time_point now) const {
+        return std::chrono::duration<double>(now - started_).count();
+    }
+
+    double interval_s_;
+    libgnss::GNSSTime first_obs_;
+    double span_s_;
+    std::chrono::steady_clock::time_point started_;
+    std::chrono::steady_clock::time_point next_report_;
 };
 
 void printUsage(const char* program_name) {
@@ -110,6 +187,16 @@ void printUsage(const char* program_name) {
         << "  --ssr <corrections.csv>  Simple SSR orbit/clock corrections CSV\n"
         << "  --ssr-rtcm <file|ntrip://...|serial://...|tcp://...>\n"
         << "                          RTCM SSR source converted/read for PPP use\n"
+        << "  --ssr-rtcm-profile <legacy|has-idd>\n"
+        << "                          RTCM SSR conventions (default: legacy). has-idd = Galileo HAS\n"
+        << "                          Internet Data Distribution: IODE-matched broadcast orbits,\n"
+        << "                          Galileo I/NAV only, held RTCM-signal-ID code biases, and\n"
+        << "                          GPS/Galileo ephemerides merged from the SSR stream\n"
+        << "  --has-pages <file>       Galileo HAS signal-in-space corrections decoded from\n"
+        << "                          E6-B C/NAV pages (UBX RXM-SFRBX, SBF GALRawCNAV or\n"
+        << "                          cssrlib page text); requires --nav, Galileo I/NAV only\n"
+        << "  --has-pages-format <ubx|cssrlib|sbf>\n"
+        << "                          HAS page log format (default: from the file extension)\n"
         << "  --madoca-l6 <file>       Native MADOCA L6E SSR channel (repeatable,\n"
         << "                          e.g. PRN 204 and 206); requires --nav\n"
         << "  --madoca-l6d <file>      Native MADOCA L6D STEC input (repeatable);\n"
@@ -134,6 +221,7 @@ void printUsage(const char* program_name) {
         << "                          Station name to select from the BLQ file\n"
         << "  --ssr-step-seconds <seconds>\n"
         << "                          Sampling step for RTCM SSR conversion (default: 1.0)\n"
+        << "  --elevation-mask <deg>   Satellite elevation mask (default: processor default, 15)\n"
         << "  --out <solution.pos>     Output position file (required)\n"
         << "  --summary-json <summary.json>\n"
         << "                          Optional machine-readable run summary\n"
@@ -199,7 +287,8 @@ void printUsage(const char* program_name) {
 #endif
         << "  --static                Use a static PPP motion model (default)\n"
         << "  --kinematic             Use a kinematic PPP motion model\n"
-        << "  --use-dynamics-model    Continuous pos/vel dynamics (MRTKLIB accel model)\n"
+        << "  --use-dynamics-model    Position/velocity/acceleration dynamics (RTKLIB\n"
+        << "                          ppp-kine dynamics=on; CLAS: MRTKLIB accel model)\n"
         << "  --emit-epoch-time       Write GPS week/TOW and geodetic columns in .pos output\n"
         << "  --low-dynamics          Keep kinematic PPP anchored for quasi-static motion\n"
         << "  --no-low-dynamics       Disable quasi-static anchoring (default)\n"
@@ -213,6 +302,11 @@ void printUsage(const char* program_name) {
         << "                          Ratio threshold for PPP ambiguity fixing (default: 3.0)\n"
         << "  --ar-method <name>      AR method: iflc, wlnl, per-freq (default: iflc);\n"
         << "                          per-freq enables uncombined estimated-STEC states\n"
+        << "  --process-noise-accel-h <v>\n"
+        << "  --process-noise-accel-v <v>\n"
+        << "                          --use-dynamics-model acceleration random walk,\n"
+        << "                          horizontal / vertical, m/s^2/sqrt(s) (default: 1 / 0.1;\n"
+        << "                          not used with --clas-osr)\n"
         << "  --process-noise-iono <v>\n"
         << "                          KF process noise for per-satellite ionosphere states,\n"
         << "                          m^2/s (default: 1e-4 for MADOCA per-frequency mode,\n"
@@ -264,6 +358,8 @@ void printUsage(const char* program_name) {
         << "  --no-iers-atm-tidal-loading\n"
         << "                          Skip atmospheric tidal loading (default).\n"
         << "  --quiet                  Suppress per-run summary output\n"
+        << "  --progress               Print processing progress to stderr every 10 s\n"
+        << "  --progress-interval <s>  Print processing progress to stderr every <s> seconds\n"
         << "  -h, --help               Show this help\n";
 }
 
@@ -292,6 +388,12 @@ Options parseArguments(int argc, char* argv[]) {
             options.ssr_path = argv[++i];
         } else if (arg == "--ssr-rtcm" && i + 1 < argc) {
             options.ssr_rtcm_path = argv[++i];
+        } else if (arg == "--ssr-rtcm-profile" && i + 1 < argc) {
+            options.ssr_rtcm_profile = argv[++i];
+        } else if (arg == "--has-pages" && i + 1 < argc) {
+            options.has_pages_path = argv[++i];
+        } else if (arg == "--has-pages-format" && i + 1 < argc) {
+            options.has_pages_format = argv[++i];
         } else if (arg == "--madoca-l6" && i + 1 < argc) {
             options.madoca_l6_paths.push_back(argv[++i]);
         } else if (arg == "--madoca-l6d" && i + 1 < argc) {
@@ -336,6 +438,8 @@ Options parseArguments(int argc, char* argv[]) {
             options.convergence_threshold_vertical = std::stod(argv[++i]);
         } else if (arg == "--ssr-step-seconds" && i + 1 < argc) {
             options.ssr_step_seconds = std::stod(argv[++i]);
+        } else if (arg == "--elevation-mask" && i + 1 < argc) {
+            options.elevation_mask_deg = std::stod(argv[++i]);
         } else if (arg == "--no-estimate-troposphere") {
             options.estimate_troposphere = false;
         } else if (arg == "--estimate-troposphere") {
@@ -418,6 +522,10 @@ Options parseArguments(int argc, char* argv[]) {
             options.ar_ratio_threshold = std::stod(argv[++i]);
         } else if (arg == "--ar-method" && i + 1 < argc) {
             options.ar_method = argv[++i];
+        } else if (arg == "--process-noise-accel-h" && i + 1 < argc) {
+            options.process_noise_accel_h = std::stod(argv[++i]);
+        } else if (arg == "--process-noise-accel-v" && i + 1 < argc) {
+            options.process_noise_accel_v = std::stod(argv[++i]);
         } else if (arg == "--process-noise-iono" && i + 1 < argc) {
             options.process_noise_iono = std::stod(argv[++i]);
             options.process_noise_iono_set = true;
@@ -448,6 +556,13 @@ Options parseArguments(int argc, char* argv[]) {
             options.use_iers_atm_tidal_loading = false;
         } else if (arg == "--quiet") {
             options.quiet = true;
+        } else if (arg == "--progress") {
+            options.progress_interval_s = 10.0;
+        } else if (arg == "--progress-interval" && i + 1 < argc) {
+            options.progress_interval_s = std::stod(argv[++i]);
+            if (!(options.progress_interval_s > 0.0)) {
+                argumentError("--progress-interval must be positive", argv[0]);
+            }
         } else {
             argumentError("unknown or incomplete argument: " + arg, argv[0]);
         }
@@ -471,8 +586,31 @@ Options parseArguments(int argc, char* argv[]) {
     if (!options.ssr_rtcm_path.empty() && options.nav_path.empty()) {
         argumentError("--ssr-rtcm requires --nav", argv[0]);
     }
+    if (options.ssr_rtcm_profile != "legacy" && options.ssr_rtcm_profile != "has-idd") {
+        argumentError("--ssr-rtcm-profile must be one of: legacy, has-idd", argv[0]);
+    }
+    if (options.ssr_rtcm_profile != "legacy" && options.ssr_rtcm_path.empty()) {
+        argumentError("--ssr-rtcm-profile requires --ssr-rtcm", argv[0]);
+    }
     if (!options.madoca_l6_paths.empty() && options.nav_path.empty()) {
         argumentError("--madoca-l6 requires --nav (broadcast ephemeris)", argv[0]);
+    }
+    if (!options.has_pages_path.empty()) {
+        if (options.nav_path.empty()) {
+            argumentError("--has-pages requires --nav (broadcast ephemeris)", argv[0]);
+        }
+        if (!options.ssr_path.empty() || !options.ssr_rtcm_path.empty() ||
+            !options.madoca_l6_paths.empty()) {
+            argumentError("--has-pages cannot be combined with --ssr, --ssr-rtcm or --madoca-l6",
+                          argv[0]);
+        }
+        libgnss::io::HasPageInputFormat format;
+        if (!options.has_pages_format.empty() &&
+            !libgnss::io::parseHasPageInputFormat(options.has_pages_format, format)) {
+            argumentError("--has-pages-format must be one of: ubx, cssrlib, sbf", argv[0]);
+        }
+    } else if (!options.has_pages_format.empty()) {
+        argumentError("--has-pages-format requires --has-pages", argv[0]);
     }
     if (!options.madoca_l6d_paths.empty() &&
         !options.madoca_l6d_shadow_paths.empty()) {
@@ -516,6 +654,10 @@ Options parseArguments(int argc, char* argv[]) {
     }
     if (options.ssr_step_seconds <= 0.0) {
         argumentError("--ssr-step-seconds must be positive", argv[0]);
+    }
+    if (options.elevation_mask_deg != -1.0 &&
+        (options.elevation_mask_deg < 0.0 || options.elevation_mask_deg >= 90.0)) {
+        argumentError("--elevation-mask must be in [0, 90) degrees", argv[0]);
     }
 #if GNSSPP_MADOCALIB_ORACLE_CLI
     if (options.madocalib_time_interval_seconds < 0.0) {
@@ -784,6 +926,7 @@ int main(int argc, char* argv[]) {
                 {"--no-ionosphere-free", ""},
                 {"--use-dynamics-model", ""},
                 {"--quiet", ""},
+                {"--progress", ""},
             },
             {
                 {"--estimate-troposphere", "--no-estimate-troposphere"},
@@ -1012,7 +1155,7 @@ int main(int argc, char* argv[]) {
         ppp_config.ssr_file_path = options.ssr_path;
         ppp_config.use_ssr_corrections =
             !options.ssr_path.empty() || !options.ssr_rtcm_path.empty() ||
-            !options.madoca_l6_paths.empty();
+            !options.madoca_l6_paths.empty() || !options.has_pages_path.empty();
         ppp_config.ionex_file_path = options.ionex_path;
         ppp_config.dcb_file_path = options.dcb_path;
         ppp_config.antex_file_path = options.antex_path;
@@ -1074,6 +1217,28 @@ int main(int argc, char* argv[]) {
                 ppp_env_overrides.clas_ar_held_minimum_dd_rows;
             ppp_config.clas_ar_held_maximum_publication_streak =
                 ppp_env_overrides.clas_ar_held_maximum_publication_streak;
+            if (!options.use_clas_osr_filter && options.madoca_l6_paths.empty()) {
+                // Broadcast / SP3 / SSR / HAS: RTKLIB ppp-kine with dynamics
+                // on. Position / velocity / acceleration states with an ENU
+                // acceleration random walk, velocity seeded and updated from
+                // the SPP Doppler solution, and the receiver clock re-seeded
+                // from SPP every epoch (udclk_ppp()). Without the clock
+                // re-seed the broadcast / SSR clock had no process noise and
+                // the filter diverged. CLAS keeps its MRTKLIB dynamics and
+                // clock handling; MADOCA keeps its previous settings until
+                // they are compared with the MADOCALIB bridge.
+                ppp_config.use_pva_dynamics = true;
+                ppp_config.reset_clock_to_spp_each_epoch = true;
+                ppp_config.initial_velocity_variance = 100.0;
+                if (options.process_noise_accel_h >= 0.0) {
+                    ppp_config.process_noise_acceleration_horizontal =
+                        options.process_noise_accel_h;
+                }
+                if (options.process_noise_accel_v >= 0.0) {
+                    ppp_config.process_noise_acceleration_vertical =
+                        options.process_noise_accel_v;
+                }
+            }
         }
         ppp_config.emit_solution_epoch_time = options.emit_epoch_time;
         ppp_config.apply_static_anchor_blend = options.apply_static_anchor_blend;
@@ -1149,6 +1314,7 @@ int main(int argc, char* argv[]) {
             ppp_config.reset_clock_to_spp_each_epoch = false;
             ppp_config.reset_kinematic_position_to_spp_each_epoch = false;
             ppp_config.use_dynamics_model = false;
+            ppp_config.use_pva_dynamics = false;
             ppp_config.process_noise_position = 0.0;
             ppp_config.process_noise_velocity = 1e-8;
         }
@@ -1238,18 +1404,82 @@ int main(int argc, char* argv[]) {
         if (!options.madoca_l6_paths.empty() && ppp_env_overrides.madoca_low_elev) {
             processor_config.elevation_mask = 10.0;
         }
+        if (options.elevation_mask_deg >= 0.0) {
+            processor_config.elevation_mask = options.elevation_mask_deg;
+        }
 
+        const auto init_started = std::chrono::steady_clock::now();
+        if (options.progress_interval_s > 0.0) {
+            std::cerr << "[gnss_ppp] progress: initializing processor (loading corrections)"
+                      << std::endl;
+        }
         libgnss::PPPProcessor processor(ppp_config);
         if (!processor.initialize(processor_config)) {
             std::cerr << "Error: failed to initialize PPP processor\n";
             return 1;
         }
+        if (options.progress_interval_s > 0.0) {
+            std::cerr << std::fixed << std::setprecision(1)
+                      << "[gnss_ppp] progress: processor initialized in "
+                      << std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                                       init_started)
+                             .count()
+                      << " s" << std::endl;
+        }
+        const bool has_idd_profile = options.ssr_rtcm_profile == "has-idd";
+        if (has_idd_profile) {
+            // HAS corrections reference the I/NAV clock and the exact IODE;
+            // the stream carries the ephemerides it refers to.
+            const size_t merged_ephemerides =
+                libgnss::io::mergeRTCMEphemerides(options.ssr_rtcm_path, nav_data);
+            nav_data.setGalileoEphemerisSource(
+                libgnss::NavigationData::GalileoEphemerisSource::INavOnly);
+            if (!options.quiet) {
+                std::cerr << "[gnss_ppp] has-idd: merged " << merged_ephemerides
+                          << " broadcast ephemerides from the SSR stream\n";
+            }
+        }
         if (!options.ssr_rtcm_path.empty() &&
             !processor.loadRTCMSSRProducts(
-                options.ssr_rtcm_path, nav_data, options.ssr_step_seconds)) {
+                options.ssr_rtcm_path, nav_data, options.ssr_step_seconds,
+                has_idd_profile ? libgnss::PPPProcessor::RTCMSSRProfile::GalileoHasIdd
+                                : libgnss::PPPProcessor::RTCMSSRProfile::Legacy)) {
             std::cerr << "Error: failed to load RTCM SSR corrections: "
                       << options.ssr_rtcm_path << "\n";
             return 1;
+        }
+        if (!options.has_pages_path.empty()) {
+            // HAS clocks refer to the I/NAV clock and to the exact IODref.
+            nav_data.setGalileoEphemerisSource(
+                libgnss::NavigationData::GalileoEphemerisSource::INavOnly);
+            libgnss::io::HasPageInputFormat format =
+                libgnss::io::guessHasPageInputFormat(options.has_pages_path);
+            if (!options.has_pages_format.empty()) {
+                libgnss::io::parseHasPageInputFormat(options.has_pages_format, format);
+            }
+            libgnss::io::GalileoHasDecoder::Options decoder_options;
+            decoder_options.keep_messages = false;
+            libgnss::io::GalileoHasDecoder decoder(decoder_options);
+            libgnss::io::HasPageReadStats read_stats;
+            std::string error;
+            if (!libgnss::io::decodeGalileoHasPages(options.has_pages_path, format, decoder,
+                                                    &read_stats, &error)) {
+                std::cerr << "Error: failed to read HAS pages: " << error << "\n";
+                return 1;
+            }
+            const auto& has_stats = decoder.stats();
+            if (!options.quiet) {
+                std::cerr << "[gnss_ppp] has-sis: " << read_stats.pages << " E6-B pages ("
+                          << has_stats.crc_failures << " CRC failures, " << has_stats.dummy_pages
+                          << " dummy), " << has_stats.messages_decoded << " HAS messages, "
+                          << decoder.updates().size() << " held updates\n";
+            }
+            if (!processor.loadGalileoHasSisProducts(decoder.updates(), nav_data,
+                                                     options.ssr_step_seconds)) {
+                std::cerr << "Error: no usable Galileo HAS corrections in "
+                          << options.has_pages_path << "\n";
+                return 1;
+            }
         }
         if (!options.madoca_l6_paths.empty() &&
             !processor.loadMadocaL6Products(options.madoca_l6_paths)) {
@@ -1337,6 +1567,8 @@ int main(int argc, char* argv[]) {
         const char* skip_until_env = std::getenv("GNSS_PPP_SKIP_UNTIL_TOW");
         const double skip_until_tow =
             skip_until_env != nullptr ? std::atof(skip_until_env) : -1.0;
+        ProgressReporter progress(options.progress_interval_s, obs_header.first_obs,
+                                  obs_header.last_obs);
         while ((options.max_epochs == 0 || processed_epochs < options.max_epochs) &&
                obs_reader.readObservationEpoch(observation_data)) {
             if (skip_until_tow >= 0.0 &&
@@ -1384,6 +1616,8 @@ int main(int argc, char* argv[]) {
                 ++clas_hybrid_fallback_reasons[processor.getLastClasHybridFallbackReason()];
             }
             processed_epochs++;
+            progress.update(processed_epochs, observation_data.time, valid_solutions,
+                            ppp_fixed_solutions);
             if (solution.isValid()) {
                 solutions.addSolution(solution);
                 if (live_stream.is_open()) {
@@ -1399,6 +1633,8 @@ int main(int argc, char* argv[]) {
                 }
             }
         }
+
+        progress.finish(processed_epochs, valid_solutions, ppp_fixed_solutions);
 
         if (solutions.isEmpty()) {
             std::cerr << "Error: PPP processing produced no valid solutions\n";
@@ -1505,7 +1741,8 @@ int main(int argc, char* argv[]) {
                     << "  \"ppp_solution_rate_pct\": " << ppp_solution_rate << ",\n"
                     << "  \"ssr_corrections_enabled\": "
                     << ((!options.ssr_path.empty() || !options.ssr_rtcm_path.empty() ||
-                         !options.madoca_l6_paths.empty()) ? "true" : "false") << ",\n"
+                         !options.madoca_l6_paths.empty() || !options.has_pages_path.empty())
+                            ? "true" : "false") << ",\n"
                     << "  \"atmospheric_trop_corrections\": " << atmospheric_trop_corrections << ",\n"
                     << "  \"atmospheric_trop_meters\": " << atmospheric_trop_meters << ",\n"
                     << "  \"atmospheric_iono_corrections\": " << atmospheric_iono_corrections << ",\n"
@@ -1634,7 +1871,8 @@ int main(int argc, char* argv[]) {
             std::cout << "  ambiguity resolution: " << (options.enable_ar ? "on" : "off") << "\n";
             std::cout << "  SSR corrections: "
                       << ((options.ssr_path.empty() && options.ssr_rtcm_path.empty() &&
-                           options.madoca_l6_paths.empty()) ? "off" : "on")
+                           options.madoca_l6_paths.empty() && options.has_pages_path.empty())
+                              ? "off" : "on")
                       << "\n";
             if (!options.madoca_materialization_dump_path.empty()) {
                 std::cout << "  MADOCA materialization dump: "

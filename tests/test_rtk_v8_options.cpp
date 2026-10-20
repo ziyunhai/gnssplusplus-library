@@ -1,0 +1,460 @@
+// velocity_consistency_v8 RTK options (docs/online_pva_candidate_v9.md):
+//   (k) RTKConfig::reject_float_seeded_at_base
+//   (m) RTKConfig::spp_fallback_blank_max_anchor_age_s
+//   (l) PositionSolution::float_prefit_gate_exceeded
+//   (n) RTKProcessor::currentSpp()
+//   RTKConfig::require_spp_for_kinematic_epoch, SPPConfig::max_position_sigma_m
+//   RTKConfig::ins_prior_min_code_rows (INS-time-update-seeded floats)
+// Synthetic observations only (no data files): the receivers and the 24-GPS
+// constellation are modelled with the same geometry the processors use.
+// Public-API-only, like the other RTK unit tests.
+
+#include <gtest/gtest.h>
+
+#include <libgnss++/algorithms/rtk.hpp>
+#include <libgnss++/algorithms/spp.hpp>
+#include <libgnss++/core/constants.hpp>
+#include <libgnss++/core/navigation.hpp>
+#include <libgnss++/core/observation.hpp>
+
+#include "synthetic_rtk_scene.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <memory>
+#include <vector>
+
+using namespace libgnss;
+
+namespace {
+
+using namespace synthetic_rtk_scene;
+
+const Vector3d kBase(6378137.0, 0.0, 0.0);
+const Vector3d kRover = kBase + Vector3d(40.0, 30.0, 10.0);
+
+RTKProcessor::RTKConfig rtkConfig() {
+    RTKProcessor::RTKConfig config;
+    config.position_mode = RTKProcessor::RTKConfig::PositionMode::KINEMATIC;
+    config.elevation_mask = 5.0 * M_PI / 180.0;
+    // The (k)/(m) tests exercise the SPP-less path; the default
+    // require_spp_for_kinematic_epoch would reject that epoch first.
+    config.require_spp_for_kinematic_epoch = false;
+    return config;
+}
+
+ProcessorConfig processorConfig(double spp_elevation_mask_deg) {
+    ProcessorConfig config;
+    config.elevation_mask = spp_elevation_mask_deg;
+    return config;
+}
+
+// RTK processor whose SPP sees no satellite (mask 89 deg) but whose DD filter
+// accepts them (5 deg): the kinematic re-seed falls through to the base.
+std::unique_ptr<RTKProcessor> makeProcessor(const RTKProcessor::RTKConfig& config,
+                                            double spp_mask_deg) {
+    auto processor = std::make_unique<RTKProcessor>(config);
+    EXPECT_TRUE(processor->initialize(processorConfig(spp_mask_deg)));
+    processor->setBasePosition(kBase);
+    return processor;
+}
+
+}  // namespace
+
+TEST(RtkV8OptionsTest, DefaultsAreOff) {
+    const RTKProcessor::RTKConfig config;
+    EXPECT_FALSE(config.reject_float_seeded_at_base);
+    EXPECT_EQ(config.spp_fallback_blank_max_anchor_age_s, 0.0);
+    EXPECT_FALSE(PositionSolution{}.float_prefit_gate_exceeded);
+}
+
+TEST(RtkV8OptionsTest, SyntheticSceneHasEnoughSatellites) {
+    const auto nav = constellation();
+    EXPECT_GE(visible(nav, epochTime(0.0), kBase, 15.0).size(), 6U);
+    EXPECT_GE(visible(nav, epochTime(0.0), kRover, 15.0).size(), 6U);
+}
+
+// ---- (k) reject_float_seeded_at_base ------------------------------------
+
+TEST(RtkV8OptionsTest, BaseSeededFloatIsEmittedByDefaultAndTracked) {
+    const auto nav = constellation();
+    const auto prns = visible(nav, epochTime(0.0), kRover, 15.0);
+    auto processor_owner = makeProcessor(rtkConfig(), 89.0);
+    auto& processor = *processor_owner;
+    const auto solution = processor.processRTKEpoch(
+        observations(nav, epochTime(0.0), kRover, 30.0, prns, 0.0),
+        observations(nav, epochTime(0.0), kBase, 10.0, prns, 500.0), nav);
+    const auto& telemetry = processor.getLastDebugTelemetry();
+    // Nothing is available but the base coordinates, and the epoch tracks it.
+    EXPECT_FALSE(processor.currentSpp().isValid());
+    EXPECT_TRUE(telemetry.rover_seed_from_base_fallback);
+    EXPECT_FALSE(telemetry.float_seeded_at_base_rejected);
+    EXPECT_EQ(solution.status, SolutionStatus::FLOAT);
+    EXPECT_TRUE(solution.isValid());
+}
+
+TEST(RtkV8OptionsTest, BaseSeededFloatReturnsThroughFallbackAndFilterStaysInitialised) {
+    const auto nav = constellation();
+    const auto prns = visible(nav, epochTime(0.0), kRover, 15.0);
+    auto config = rtkConfig();
+    config.reject_float_seeded_at_base = true;
+    auto processor_owner = makeProcessor(config, 89.0);
+    auto& processor = *processor_owner;
+    const auto solution = processor.processRTKEpoch(
+        observations(nav, epochTime(0.0), kRover, 30.0, prns, 0.0),
+        observations(nav, epochTime(0.0), kBase, 10.0, prns, 500.0), nav);
+    const auto& telemetry = processor.getLastDebugTelemetry();
+    EXPECT_TRUE(telemetry.rover_seed_from_base_fallback);
+    EXPECT_TRUE(telemetry.float_seeded_at_base_rejected);
+    // fallback_spp: the invalid SPP yields no solution; the FLOAT is not emitted.
+    EXPECT_NE(solution.status, SolutionStatus::FLOAT);
+    EXPECT_FALSE(solution.isValid());
+    Vector3d position;
+    Matrix3d covariance;
+    EXPECT_TRUE(processor.getFloatPosteriorPosition(position, covariance));
+}
+
+TEST(RtkV8OptionsTest, BaseSeedFlagClearsOnceARealPositionSeedsTheFilter) {
+    const auto nav = constellation();
+    const auto prns = visible(nav, epochTime(0.0), kRover, 15.0);
+    auto config = rtkConfig();
+    config.reject_float_seeded_at_base = true;
+    auto processor_owner = makeProcessor(config, 89.0);
+    auto& processor = *processor_owner;
+    // Epochs 0 and 1: base seed, rejected each time (nothing is remembered).
+    for (int i = 0; i < 2; ++i) {
+        const double t = 0.2 * i;
+        const auto solution = processor.processRTKEpoch(
+            observations(nav, epochTime(t), kRover, 30.0, prns, 0.0),
+            observations(nav, epochTime(t), kBase, 10.0, prns, 500.0), nav);
+        EXPECT_TRUE(processor.getLastDebugTelemetry().float_seeded_at_base_rejected) << i;
+        EXPECT_FALSE(solution.isValid()) << i;
+    }
+    // Epoch 2: the rover header position is now available as a seed.
+    auto rover = observations(nav, epochTime(0.4), kRover, 30.0, prns, 0.0);
+    rover.receiver_position = kRover;
+    const auto solution = processor.processRTKEpoch(
+        rover, observations(nav, epochTime(0.4), kBase, 10.0, prns, 500.0), nav);
+    EXPECT_FALSE(processor.getLastDebugTelemetry().rover_seed_from_base_fallback);
+    EXPECT_FALSE(processor.getLastDebugTelemetry().float_seeded_at_base_rejected);
+    EXPECT_EQ(solution.status, SolutionStatus::FLOAT);
+    // The float seeded at the real position is nowhere near the base.
+    EXPECT_LT((solution.position_ecef - kRover).norm(), 50.0);
+}
+
+TEST(RtkV8OptionsTest, RealSeedIsNeverRejectedEvenWithTheOptionOn) {
+    const auto nav = constellation();
+    const auto prns = visible(nav, epochTime(0.0), kRover, 15.0);
+    auto config = rtkConfig();
+    config.reject_float_seeded_at_base = true;
+    auto processor_owner = makeProcessor(config, 5.0);
+    auto& processor = *processor_owner;  // SPP is valid
+    const auto solution = processor.processRTKEpoch(
+        observations(nav, epochTime(0.0), kRover, 30.0, prns, 0.0),
+        observations(nav, epochTime(0.0), kBase, 10.0, prns, 500.0), nav);
+    EXPECT_TRUE(processor.currentSpp().isValid());
+    EXPECT_FALSE(processor.getLastDebugTelemetry().rover_seed_from_base_fallback);
+    EXPECT_FALSE(processor.getLastDebugTelemetry().float_seeded_at_base_rejected);
+    EXPECT_EQ(solution.status, SolutionStatus::FLOAT);
+}
+
+// ---- require_spp_for_kinematic_epoch --------------------------------------
+
+TEST(RtkV8OptionsTest, KinematicEpochWithoutSppIsRejectedByDefault) {
+    EXPECT_TRUE(RTKProcessor::RTKConfig{}.require_spp_for_kinematic_epoch);
+    const auto nav = constellation();
+    const auto prns = visible(nav, epochTime(0.0), kRover, 15.0);
+    auto solve = [&](bool require_spp, double spp_mask_deg, bool& rejected,
+                     bool& filter_initialised) {
+        auto config = rtkConfig();
+        config.require_spp_for_kinematic_epoch = require_spp;
+        config.reject_float_seeded_at_base = false;  // isolate the new gate
+        auto processor = makeProcessor(config, spp_mask_deg);
+        const auto solution = processor->processRTKEpoch(
+            observations(nav, epochTime(0.0), kRover, 30.0, prns, 0.0),
+            observations(nav, epochTime(0.0), kBase, 10.0, prns, 500.0), nav);
+        rejected = processor->getLastDebugTelemetry().spp_unavailable_rejected;
+        Vector3d position;
+        Matrix3d covariance;
+        filter_initialised = processor->getFloatPosteriorPosition(position, covariance);
+        return solution;
+    };
+    bool rejected = false;
+    bool initialised = false;
+    // SPP sees no satellite (mask 89 deg): default -> no solution, filter kept.
+    auto solution = solve(true, 89.0, rejected, initialised);
+    EXPECT_TRUE(rejected);
+    EXPECT_FALSE(solution.isValid());
+    EXPECT_TRUE(initialised);
+    // Option off -> the base-seeded float is emitted as before.
+    solution = solve(false, 89.0, rejected, initialised);
+    EXPECT_FALSE(rejected);
+    EXPECT_EQ(solution.status, SolutionStatus::FLOAT);
+    // SPP available -> the gate never fires.
+    solution = solve(true, 5.0, rejected, initialised);
+    EXPECT_FALSE(rejected);
+    EXPECT_EQ(solution.status, SolutionStatus::FLOAT);
+}
+
+// ---- SPPConfig::max_position_sigma_m -----------------------------------------
+
+TEST(RtkV8OptionsTest, SppPositionSigmaGateRejectsOnlyWhenEnabled) {
+    // The gate uses sqrt(trace(position_covariance)), i.e. the formal sigma of
+    // the design matrix that was solved (inter-system-bias columns included).
+    EXPECT_EQ(SPPProcessor::SPPConfig{}.max_position_sigma_m, 0.0);  // default: off
+
+    const auto nav = constellation();
+    const auto prns = visible(nav, epochTime(0.0), kRover, 15.0);
+    const auto rover = observations(nav, epochTime(0.0), kRover, 30.0, prns, 0.0);
+    auto solve = [&](double max_sigma_m) {
+        SPPProcessor::SPPConfig config;
+        config.max_position_sigma_m = max_sigma_m;
+        SPPProcessor spp(config);
+        EXPECT_TRUE(spp.initialize(processorConfig(5.0)));
+        return spp.processEpoch(rover, nav);
+    };
+    const auto baseline = solve(0.0);
+    ASSERT_TRUE(baseline.isValid());
+    const double sigma = std::sqrt(baseline.position_covariance.trace());
+    ASSERT_TRUE(std::isfinite(sigma));
+    ASSERT_GT(sigma, 0.0);
+
+    const auto accepted = solve(2.0 * sigma);
+    ASSERT_TRUE(accepted.isValid());
+    EXPECT_TRUE(accepted.position_ecef.isApprox(baseline.position_ecef, 1e-9));
+    EXPECT_FALSE(solve(0.5 * sigma).isValid());
+}
+
+// ---- (n) currentSpp() ------------------------------------------------------
+
+TEST(RtkV8OptionsTest, CurrentSppExposesTheEpochSolutionAndNeverGoesStale) {
+    const auto nav = constellation();
+    const auto prns = visible(nav, epochTime(0.0), kRover, 15.0);
+    auto with_doppler = [&](double t) {
+        return observations(nav, epochTime(t), kRover, 30.0, prns, 0.0, true);
+    };
+    auto processor_owner = makeProcessor(rtkConfig(), 5.0);
+    auto& processor = *processor_owner;
+    EXPECT_FALSE(processor.currentSpp().isValid());
+    processor.processRTKEpoch(with_doppler(0.0),
+                              observations(nav, epochTime(0.0), kBase, 10.0, prns, 500.0), nav);
+    const auto& first = processor.currentSpp();
+    ASSERT_TRUE(first.isValid());
+    EXPECT_NEAR((first.position_ecef - kRover).norm(), 0.0, 30.0);
+    EXPECT_TRUE(first.has_velocity);
+    EXPECT_TRUE(first.velocity_ecef.allFinite());
+    EXPECT_TRUE(first.velocity_covariance.allFinite());
+    EXPECT_GT(first.velocity_covariance.trace(), 0.0);
+    // processEpoch() (the missing-base path of the online processor) sets it too.
+    const auto spp = processor.processEpoch(with_doppler(0.2), nav);
+    ASSERT_TRUE(spp.isValid());
+    EXPECT_EQ(processor.currentSpp().time, spp.time);
+    EXPECT_TRUE(processor.currentSpp().position_ecef.isApprox(spp.position_ecef, 0.0));
+    // A later epoch without any usable rover observation replaces it.
+    processor.processRTKEpoch(ObservationData(epochTime(0.4)),
+                              observations(nav, epochTime(0.4), kBase, 10.0, prns, 500.0), nav);
+    EXPECT_FALSE(processor.currentSpp().isValid());
+    processor.processEpoch(ObservationData(epochTime(0.6)), nav);
+    EXPECT_FALSE(processor.currentSpp().isValid());
+}
+
+// ---- (m) spp_fallback_blank_max_anchor_age_s ---------------------------------
+
+namespace {
+// Epoch 0: DD FLOAT with all satellites (sets the trusted anchor). Epoch 1 at
+// `gap_s`: the rover moved 200 m and the base only matches 3 satellites, so
+// the DD filter has < 4 satellites and the SPP fallback decides. The rover
+// SPP uses exactly five satellites (the blanking rule's "<= 5").
+struct BlankingRun {
+    SolutionStatus status = SolutionStatus::NONE;
+    bool age_limited = false;
+    bool valid = false;
+    int satellites = 0;
+};
+BlankingRun runBlanking(double max_anchor_age_s, double gap_s) {
+    const auto nav = constellation();
+    const auto prns = visible(nav, epochTime(0.0), kRover, 15.0);
+    auto config = rtkConfig();
+    config.spp_fallback_blank_max_anchor_age_s = max_anchor_age_s;
+    auto processor_owner = makeProcessor(config, 15.0);
+    auto& processor = *processor_owner;
+    const auto first = processor.processRTKEpoch(
+        observations(nav, epochTime(0.0), kRover, 30.0, prns, 0.0),
+        observations(nav, epochTime(0.0), kBase, 10.0, prns, 500.0), nav);
+    EXPECT_EQ(first.status, SolutionStatus::FLOAT);
+    // Highest five satellites seen by the moved rover for the SPP.
+    const Vector3d moved = kRover + Vector3d(200.0, 0.0, 0.0);
+    auto moved_prns = visible(nav, epochTime(gap_s), moved, 15.0);
+    std::sort(moved_prns.begin(), moved_prns.end(), [&](uint8_t a, uint8_t b) {
+        return geometry(nav, a, epochTime(gap_s), moved).elevation_rad >
+               geometry(nav, b, epochTime(gap_s), moved).elevation_rad;
+    });
+    EXPECT_GE(moved_prns.size(), 6U);
+    moved_prns.resize(5);
+    std::vector<uint8_t> base_prns(moved_prns.begin(), moved_prns.begin() + 3);
+    const auto second = processor.processRTKEpoch(
+        observations(nav, epochTime(gap_s), moved, 30.0, moved_prns, 0.0),
+        observations(nav, epochTime(gap_s), kBase, 10.0, base_prns, 500.0), nav);
+    BlankingRun run;
+    run.status = second.status;
+    run.valid = second.isValid();
+    run.satellites = second.num_satellites;
+    run.age_limited = processor.getLastDebugTelemetry().spp_blank_age_limited;
+    return run;
+}
+}  // namespace
+
+TEST(RtkV8OptionsTest, SppFallbackBlankingHasNoAgeLimitByDefault) {
+    const auto old_anchor = runBlanking(0.0, 10.0);
+    EXPECT_FALSE(old_anchor.valid);
+    EXPECT_FALSE(old_anchor.age_limited);
+    const auto young_anchor = runBlanking(0.0, 2.0);
+    EXPECT_FALSE(young_anchor.valid);
+}
+
+TEST(RtkV8OptionsTest, SppFallbackBlankingIsBoundedByTheAnchorAge) {
+    // Anchor 10 s old, limit 3 s: the SPP is not blanked.
+    const auto old_anchor = runBlanking(3.0, 10.0);
+    EXPECT_TRUE(old_anchor.age_limited);
+    EXPECT_TRUE(old_anchor.valid);
+    EXPECT_EQ(old_anchor.status, SolutionStatus::SPP);
+    EXPECT_EQ(old_anchor.satellites, 5);
+    // Anchor 2 s old, limit 3 s: the rule still applies.
+    const auto young_anchor = runBlanking(3.0, 2.0);
+    EXPECT_FALSE(young_anchor.age_limited);
+    EXPECT_FALSE(young_anchor.valid);
+    // Exactly at the limit still blanks (age <= limit).
+    const auto at_limit = runBlanking(10.0, 10.0);
+    EXPECT_FALSE(at_limit.valid);
+}
+
+// ---- (l) float_prefit_gate_exceeded ------------------------------------------
+
+TEST(RtkV8OptionsTest, FloatPrefitGateFlagFollowsTheConfiguredLimits) {
+    const auto nav = constellation();
+    const auto prns = visible(nav, epochTime(0.0), kRover, 15.0);
+    auto run = [&](double rms_limit, double max_limit, double rover_code_error_m) {
+        auto config = rtkConfig();
+        config.max_float_prefit_residual_rms_m = rms_limit;
+        config.max_float_prefit_residual_max_m = max_limit;
+        auto processor_owner = makeProcessor(config, 5.0);
+    auto& processor = *processor_owner;
+        auto rover = observations(nav, epochTime(0.0), kRover, 30.0, prns, 0.0);
+        // A pseudorange error on one satellite appears in the DD prefit residual.
+        rover.observations.front().pseudorange += rover_code_error_m;
+        return processor.processRTKEpoch(
+            rover, observations(nav, epochTime(0.0), kBase, 10.0, prns, 500.0), nav);
+    };
+    // Disabled limits (0): never flagged, whatever the residual.
+    const auto disabled = run(0.0, 0.0, 400.0);
+    ASSERT_TRUE(disabled.isValid());
+    EXPECT_FALSE(disabled.float_prefit_gate_exceeded);
+    EXPECT_GT(disabled.rtk_update_prefit_residual_max_m, 10.0);
+    // Enabled limits: flagged exactly when the solution's own residual exceeds one.
+    const auto rms_limited = run(4.0, 0.0, 400.0);
+    EXPECT_EQ(rms_limited.float_prefit_gate_exceeded,
+              rms_limited.rtk_update_prefit_residual_rms_m > 4.0);
+    const auto max_limited = run(0.0, 10.0, 400.0);
+    EXPECT_TRUE(max_limited.float_prefit_gate_exceeded);
+    EXPECT_GT(max_limited.rtk_update_prefit_residual_max_m, 10.0);
+    const auto clean = run(4.0, 10.0, 0.0);
+    ASSERT_TRUE(clean.isValid());
+    EXPECT_FALSE(clean.float_prefit_gate_exceeded);
+    EXPECT_LE(clean.rtk_update_prefit_residual_rms_m, 4.0);
+    EXPECT_LE(clean.rtk_update_prefit_residual_max_m, 10.0);
+}
+
+// ---- ins_prior_min_code_rows -----------------------------------------------
+//
+// An INS-time-update-seeded float whose update kept fewer DD code rows than
+// ins_prior_min_code_rows is the propagated prior itself (the absolute prefit
+// outlier test zeroes every row once the prior is a few metres off). It must
+// not be emitted, and the next epoch must re-seed from SPP rather than
+// propagate that posterior again.
+
+namespace {
+
+struct InsPriorRun {
+    PositionSolution epoch1;
+    PositionSolution epoch2;
+    bool epoch1_rejected = false;
+    int epoch1_retained_code_rows = 0;
+    RTKProcessor::InsTimeUpdateDiagnostics after_epoch2;
+};
+
+// Epoch 0 initialises the filter at kRover. Epoch 1 receives an INS time
+// update whose displacement is `epoch1_error` away from the (static) truth;
+// epoch 2 receives an exact zero displacement.
+InsPriorRun runInsPrior(int min_code_rows, const Vector3d& epoch1_error) {
+    const auto nav = constellation();
+    const auto prns = visible(nav, epochTime(0.0), kRover, 15.0);
+    auto config = rtkConfig();
+    config.require_spp_for_kinematic_epoch = true;  // library default
+    config.use_external_position_time_update = true;
+    config.ins_prior_min_code_rows = min_code_rows;
+    auto processor_owner = makeProcessor(config, 5.0);
+    auto& processor = *processor_owner;
+    auto solve = [&](double t) {
+        return processor.processRTKEpoch(
+            observations(nav, epochTime(t), kRover, 30.0, prns, 0.0),
+            observations(nav, epochTime(t), kBase, 10.0, prns, 500.0), nav);
+    };
+    const Matrix3d noise = Matrix3d::Identity() * 1e-2;
+    EXPECT_TRUE(solve(0.0).isValid());
+    InsPriorRun run;
+    processor.setExternalPositionTimeUpdate(epoch1_error, noise);
+    run.epoch1 = solve(1.0);
+    run.epoch1_rejected = processor.getLastDebugTelemetry().ins_prior_unsupported_rejected;
+    run.epoch1_retained_code_rows = processor.getLastDebugTelemetry().retained_code_rows;
+    processor.setExternalPositionTimeUpdate(Vector3d::Zero(), noise);
+    run.epoch2 = solve(2.0);
+    run.after_epoch2 = processor.getInsTimeUpdateDiagnostics();
+    return run;
+}
+
+}  // namespace
+
+TEST(RtkV8OptionsTest, InsPriorMinCodeRowsDefaultsToFour) {
+    EXPECT_EQ(RTKProcessor::RTKConfig{}.ins_prior_min_code_rows, 4);
+}
+
+TEST(RtkV8OptionsTest, ConsistentInsTimeUpdateKeepsItsFloat) {
+    const auto run = runInsPrior(4, Vector3d::Zero());
+    EXPECT_FALSE(run.epoch1_rejected);
+    EXPECT_GE(run.epoch1_retained_code_rows, 4);
+    EXPECT_EQ(run.epoch1.status, SolutionStatus::FLOAT);
+    EXPECT_LT((run.epoch1.position_ecef - kRover).norm(), 1.0);
+    EXPECT_EQ(run.after_epoch2.applied_count, 2U);
+    EXPECT_EQ(run.after_epoch2.rejected_count, 0U);
+    EXPECT_TRUE(run.after_epoch2.applied_last_epoch);
+}
+
+TEST(RtkV8OptionsTest, UnsupportedInsSeededFloatIsEmittedWhenTheOptionIsOff) {
+    // 10 m along x: every code row's prefit residual exceeds the 3 m outlier
+    // threshold, the update moves nothing and the float is the prior itself.
+    const Vector3d error(10.0, 0.0, 0.0);
+    const auto run = runInsPrior(0, error);
+    EXPECT_FALSE(run.epoch1_rejected);
+    ASSERT_LT(run.epoch1_retained_code_rows, 4);
+    EXPECT_EQ(run.epoch1.status, SolutionStatus::FLOAT);
+    EXPECT_NEAR((run.epoch1.position_ecef - kRover).norm(), error.norm(), 1.0);
+}
+
+TEST(RtkV8OptionsTest, UnsupportedInsSeededFloatFallsBackToSppAndDropsThePrior) {
+    const Vector3d error(10.0, 0.0, 0.0);
+    const auto run = runInsPrior(4, error);
+    EXPECT_TRUE(run.epoch1_rejected);
+    EXPECT_LT(run.epoch1_retained_code_rows, 4);
+    // Epoch 1 is the SPP fallback, which is independent of the INS prior (the
+    // synthetic scene has no atmosphere model, so SPP is a few metres off).
+    EXPECT_EQ(run.epoch1.status, SolutionStatus::SPP);
+    EXPECT_LT((run.epoch1.position_ecef - kRover).norm(), 15.0);
+    // Epoch 2: the supplied time update is dropped (counted as rejected, not
+    // applied) and the filter re-seeds from SPP, so the float is back on the
+    // truth instead of integrating the 10 m error again.
+    EXPECT_EQ(run.after_epoch2.applied_count, 1U);
+    EXPECT_EQ(run.after_epoch2.rejected_count, 1U);
+    EXPECT_FALSE(run.after_epoch2.applied_last_epoch);
+    EXPECT_EQ(run.epoch2.status, SolutionStatus::FLOAT);
+    EXPECT_LT((run.epoch2.position_ecef - kRover).norm(), 5.0);
+}

@@ -68,6 +68,37 @@ struct GlonassCdmaNavigationData {
     std::optional<double> isc_l3ocp;  ///< L3OC A17 ISC_L3OCp; blank is preserved.
 };
 
+/// Bits of the Galileo "data sources" word of a RINEX 3.0x / 4.0x navigation
+/// record (Ephemeris::data_source_code).
+namespace galileo_data_source {
+constexpr int kInavE1B = 1 << 0;      ///< I/NAV E1-B
+constexpr int kFnavE5aI = 1 << 1;     ///< F/NAV E5a-I
+constexpr int kInavE5bI = 1 << 2;     ///< I/NAV E5b-I
+constexpr int kClockE5aE1 = 1 << 8;   ///< af0-af2, Toc, SISA for E5a,E1
+constexpr int kClockE5bE1 = 1 << 9;   ///< af0-af2, Toc, SISA for E5b,E1
+}  // namespace galileo_data_source
+
+/// Galileo SISA index to metres (Galileo OS SIS ICD 2.1, Table 89):
+/// 0-49 -> 1 cm steps up to 0.49 m, 50-74 -> 2 cm steps from 0.5 m,
+/// 75-99 -> 4 cm steps from 1 m, 100-125 -> 16 cm steps from 2 m.
+/// Spare indices (126-254) and 255 (NAPA, no accuracy prediction available)
+/// map to -1, the value RINEX navigation files use for NAPA.
+inline double galileoSisaMeters(uint8_t sisa_index) {
+    if (sisa_index <= 49U) {
+        return 0.01 * static_cast<double>(sisa_index);
+    }
+    if (sisa_index <= 74U) {
+        return 0.5 + 0.02 * static_cast<double>(sisa_index - 50U);
+    }
+    if (sisa_index <= 99U) {
+        return 1.0 + 0.04 * static_cast<double>(sisa_index - 75U);
+    }
+    if (sisa_index <= 125U) {
+        return 2.0 + 0.16 * static_cast<double>(sisa_index - 100U);
+    }
+    return -1.0;
+}
+
 /**
  * @brief Satellite ephemeris data
  */
@@ -125,10 +156,13 @@ struct Ephemeris {
     bool glonass_canonical_geph_data_valid = true;
     int glonass_canonical_geph_reject_reason = 0;
     int glonass_age = 0;
+    /// GLONASS string-3 health flag ln (1 = malfunction).  Only the UBX-RXM-SFRBX decoder fills it;
+    /// RINEX and RTCM records do not carry it and leave 0 (treated as "not present").
+    int glonass_ln = 0;
     
     // Status and accuracy
     uint16_t week;          ///< GPS week number
-    uint8_t health;         ///< Satellite health
+    uint16_t health;        ///< Satellite health word, stored at full width (Galileo E5b HS lives in bits 7-8); 0 = healthy
     double sv_health;       ///< Satellite health (double format)
     double sv_accuracy;     ///< Satellite accuracy
     uint8_t ura;            ///< User range accuracy index
@@ -166,6 +200,29 @@ struct Ephemeris {
      */
     double getAge(const GNSSTime& time) const;
 };
+
+/**
+ * @brief Whether a broadcast ephemeris is marked healthy (RTKLIB satexclude()).
+ *
+ * Healthy means the full-width health word is zero. For QZSS, bit 0 (the L6
+ * LEX health bit) is masked because it does not affect L1/L2/L5 positioning;
+ * any other set bit, or any non-zero health on the other systems, is unhealthy.
+ * No GLONASS special case and no URA/variance rule.
+ *
+ * @param system System whose rule applies (QZSS masks bit 0).
+ */
+inline bool ephemerisHealthy(const Ephemeris& eph, GNSSSystem system) {
+    uint32_t health = eph.health;
+    if (system == GNSSSystem::QZSS) {
+        health &= ~static_cast<uint32_t>(1);
+    }
+    return health == 0;
+}
+
+/// Same as above, taking the system from the ephemeris' own satellite id.
+inline bool ephemerisHealthy(const Ephemeris& eph) {
+    return ephemerisHealthy(eph, eph.satellite.system);
+}
 
 /**
  * @brief Ionospheric model parameters
@@ -241,10 +298,51 @@ public:
      * clear(), or otherwise avoid retaining dependent results.
      */
     std::uint64_t getRevision() const { return revision_; }
+
+    /**
+     * @brief Which Galileo broadcast ephemerides getEphemeris() may select.
+     *
+     * Galileo broadcasts I/NAV (clock referenced to E1/E5b) and F/NAV (E1/E5a)
+     * records with the same IODnav. SSR services that reference the I/NAV
+     * clock (Galileo HAS) must never be paired with an F/NAV record.
+     * Any (default) keeps the historical selection; INavOnly skips records
+     * whose data-source word lacks the I/NAV clock bit (bit 9).
+     */
+    enum class GalileoEphemerisSource { Any, INavOnly };
+    void setGalileoEphemerisSource(GalileoEphemerisSource source);
+    GalileoEphemerisSource galileoEphemerisSource() const { return galileo_ephemeris_source_; }
+
     /**
      * @brief Add ephemeris data
+     *
+     * Each satellite's records are kept sorted by toe, with ties broken by a
+     * fixed total order (Galileo I/NAV before F/NAV, then data_source_code,
+     * iode, iodc, toc, af0..af2, ...), so the stored order, and therefore the
+     * record getEphemeris() picks among equal-toe copies, does not depend on
+     * the order records were added in.
      */
     void addEphemeris(const Ephemeris& eph);
+
+    /**
+     * @brief Add an ephemeris unless an identical broadcast record is present.
+     *
+     * Two records are the same broadcast when satellite, IODE, toe, toc and
+     * (for Galileo) the I/NAV vs F/NAV clock source match. Returns true when added.
+     * Useful when merging ephemerides decoded from a stream that repeats them.
+     */
+    bool addEphemerisIfNew(const Ephemeris& eph);
+
+    /**
+     * @brief Remove exactly one stored record, identified by every field.
+     *
+     * Erases the first record of `eph.satellite` that equals `eph` in every
+     * field (the same total order addEphemeris() sorts by, plus the satellite
+     * and GLONASS ln); a record that merely shares satellite, issue or toe is
+     * left alone.  Returns true when a record was erased.  Used by
+     * `gnss live --ubx-nav` to take back a record it merged and later found
+     * to conflict with a second copy of the same issue; nothing else calls it.
+     */
+    bool removeEphemeris(const Ephemeris& eph);
     
     /**
      * @brief Get best ephemeris for satellite at given time
@@ -298,13 +396,6 @@ public:
                                int desired_iode) const;
     
     /**
-     * @brief Calculate satellite positions for multiple satellites
-     */
-    std::map<SatelliteId, Vector3d> calculateSatellitePositions(
-        const std::vector<SatelliteId>& satellites,
-        const GNSSTime& time) const;
-    
-    /**
      * @brief Calculate elevation and azimuth angles
      */
     struct SatelliteGeometry {
@@ -317,34 +408,9 @@ public:
                                       const Vector3d& satellite_pos) const;
     
     /**
-     * @brief Apply atmospheric corrections
-     */
-    struct AtmosphericCorrections {
-        double ionosphere_delay = 0.0;
-        double troposphere_delay = 0.0;
-        double total_delay = 0.0;
-    };
-    
-    AtmosphericCorrections calculateAtmosphericCorrections(
-        const GeodeticCoord& receiver_pos,
-        const Vector3d& satellite_pos,
-        const GNSSTime& time,
-        double frequency) const;
-    
-    /**
      * @brief Check if navigation data is available for satellite
      */
     bool hasEphemeris(const SatelliteId& sat, const GNSSTime& time) const;
-    
-    /**
-     * @brief Get list of satellites with valid ephemeris
-     */
-    std::vector<SatelliteId> getAvailableSatellites(const GNSSTime& time) const;
-    
-    /**
-     * @brief Remove old ephemeris data
-     */
-    void cleanupOldData(const GNSSTime& current_time, double max_age_hours = 4.0);
     
     /**
      * @brief Clear all navigation data
@@ -369,6 +435,17 @@ public:
     };
     
     NavigationStats getStats(const GNSSTime& current_time) const;
+
+    /**
+     * @brief Bound the satellite-state memo (0 = unbounded, the default).
+     *
+     * Entries are keyed by (satellite, time) and only cleared when an ephemeris is added, so a
+     * long-running consumer that never receives a new ephemeris (for example gnss_live with a
+     * navigation RINEX) would otherwise grow the memo with every epoch. With a limit the memo is
+     * dropped when it reaches that many entries; results are unaffected, only recomputed.
+     */
+    void setSatelliteStateCacheLimit(size_t max_entries) { satellite_state_cache_limit_ = max_entries; }
+    size_t satelliteStateCacheSize() const { return satellite_state_cache_.size(); }
 
 private:
     struct SatelliteStateCacheKey {
@@ -404,6 +481,8 @@ private:
     mutable std::map<SatelliteStateCacheKey, SatelliteStateCacheValue>
         satellite_state_cache_;
     std::uint64_t revision_ = 0;
+    size_t satellite_state_cache_limit_ = 0;
+    GalileoEphemerisSource galileo_ephemeris_source_ = GalileoEphemerisSource::Any;
 };
 
 /**
@@ -427,12 +506,36 @@ struct PreciseOrbitClock {
 };
 
 /**
+ * @brief Periodic relativistic satellite clock correction for precise clocks
+ *
+ * IGS SP3 and RINEX clock products exclude the periodic relativistic effect
+ * of the satellite clock (IGS conventions; IERS Conventions 2010 eq. 10.17),
+ * which users add as dt_rel = -2 (r . v) / c^2 with the satellite position
+ * and velocity in ECEF at transmission time (RTKLIB peph2pos() does the
+ * same). Broadcast clocks carry the equivalent term through the
+ * eccentric-anomaly expression of the navigation message instead.
+ *
+ * @return correction in seconds, to be added to the product clock bias
+ */
+inline double preciseClockRelativisticCorrection(const Vector3d& position,
+                                                 const Vector3d& velocity) {
+    return -2.0 * position.dot(velocity) /
+        (constants::SPEED_OF_LIGHT * constants::SPEED_OF_LIGHT);
+}
+
+/**
  * @brief Precise products manager
  */
 class PreciseProducts {
 public:
     std::map<SatelliteId, std::vector<PreciseOrbitClock>> orbit_clock_data;
-    
+
+    /// SP3 positions refer to the antenna phase centre instead of the
+    /// centre of mass (set by loadSP3File() for an SP3 whose "/*" comment
+    /// says "ANTENNA PHASE CENTER", as `gnss nav-products` writes); PPP then
+    /// skips the satellite PCO.
+    bool orbits_at_antenna_phase_center = false;
+
     /**
      * @brief Add precise orbit/clock data
      */
@@ -440,13 +543,20 @@ public:
     
     /**
      * @brief Interpolate precise orbit and clock
+     *
+     * Returns true when the orbit can be interpolated. The clock is the
+     * product clock as published (SP3 / RINEX clock), i.e. without the
+     * periodic relativistic term; see preciseClockRelativisticCorrection().
+     * When no clock sample is usable for the query, clock_bias and
+     * clock_drift are zero and *clock_available (if given) is false.
      */
     bool interpolateOrbitClock(const SatelliteId& sat,
                              const GNSSTime& time,
                              Vector3d& position,
                              Vector3d& velocity,
                              double& clock_bias,
-                             double& clock_drift) const;
+                             double& clock_drift,
+                             bool* clock_available = nullptr) const;
     
     /**
      * @brief Load SP3 orbit file
@@ -612,6 +722,30 @@ public:
         int network_id,
         GNSSTime* atmos_reference_time = nullptr) const;
 
+    /**
+     * @brief Integer atmosphere keys of one correction row, parsed once.
+     *
+     * Each field reproduces a std::stoi() of the named atmos token (the
+     * *_valid flag is false when the token is absent or stoi() throws).
+     */
+    struct ClasAtmosRowKeys {
+        bool has_trop = false;  ///< atmos_valid row with an atmos_trop_* token
+        bool trop_network_valid = false;
+        int trop_network_id = 0;       ///< atmos_trop_network_id, else atmos_network_id
+        int trop_residual_count = -1;  ///< ';'-separated atmos_trop_residuals_m count, -1 if absent
+        bool atmos_network_valid = false;
+        int atmos_network_id = 0;  ///< atmos_network_id
+        int atmos_grid_count = 0;  ///< atmos_grid_count, 0 when absent or invalid
+    };
+
+    /**
+     * @brief Parsed atmosphere keys aligned with orbit_clock_corrections[sat].
+     *
+     * Returns nullptr when the satellite has no corrections. The index is built
+     * lazily and rebuilt after any mutation through this class.
+     */
+    const std::vector<ClasAtmosRowKeys>* clasAtmosRowKeys(const SatelliteId& sat) const;
+
     bool loadCSVFile(const std::string& filename);
 
     bool hasData(const SatelliteId& sat, const GNSSTime& time) const;
@@ -622,7 +756,49 @@ public:
     void clear();
 
 private:
+    struct HeldTokenCacheEntry {
+        GNSSTime time;
+        double max_age_seconds = 0.0;
+        int network_id = 0;
+        int minimum_grid_count = 0;
+        bool found = false;
+        std::map<std::string, std::string> tokens;
+        GNSSTime reference_time;
+    };
+
+    bool heldAtmosTokensForNetworkUncached(int network_id,
+                                           const GNSSTime& time,
+                                           double max_age_seconds,
+                                           std::map<std::string, std::string>& atmos_tokens,
+                                           GNSSTime* atmos_reference_time) const;
+    bool heldClasTropTokensUncached(const GNSSTime& time,
+                                    double max_age_seconds,
+                                    int network_id,
+                                    int minimum_grid_count,
+                                    std::map<std::string, std::string>& atmos_tokens,
+                                    GNSSTime* atmos_reference_time) const;
+    struct ClasAtmosRowIndex {
+        std::size_t row_count = 0;
+        std::vector<ClasAtmosRowKeys> keys;
+        std::vector<std::size_t> trop_rows;  ///< rows with has_trop, ascending
+    };
+
+    void invalidateHeldTokenCaches() const;
+    const std::map<SatelliteId, ClasAtmosRowIndex>& clasAtmosRowIndex() const;
+
     bool orbit_corrections_are_rac_ = false;
+    // Memoized held-token lookups for the current epoch. The lookups are pure
+    // functions of their arguments and the stored corrections, but CLAS OSR
+    // repeats them per satellite and per filter pass; every mutation of the
+    // correction containers clears these caches.
+    mutable std::vector<HeldTokenCacheEntry> held_atmos_token_cache_;
+    mutable std::vector<HeldTokenCacheEntry> held_trop_token_cache_;
+    // Parsed atmosphere keys for every orbit_clock_corrections row, so CLAS
+    // OSR does not re-run string-keyed token lookups on every row of its
+    // 120 s atmosphere window and 3600 s held-troposphere window at every
+    // receiver epoch. Built lazily and cleared with the held-token caches.
+    mutable std::map<SatelliteId, ClasAtmosRowIndex> clas_atmos_row_index_;
+    mutable bool clas_atmos_row_index_valid_ = false;
 };
 
 /**

@@ -5,13 +5,13 @@
       "base_status_counts": {
         "6": 118
       },
-      "boundary_max_delta_3d_m": 3.4893895548867557,
+      "boundary_max_delta_3d_m": 0.6494075896185958,
       "candidate_only_epochs": 0,
       "candidate_status_counts": {
         "5": 118
       },
-      "delta_max_3d_m": 3.4893895548867557,
-      "delta_rms_3d_m": 1.2890065263482149,
+      "delta_max_3d_m": 2.4484027664977206,
+      "delta_rms_3d_m": 0.5261761800643266,
       "matched_epochs": 118,
       "missed_fixes": 0,
       "native_row_counts": {
@@ -55,13 +55,13 @@
       "base_status_counts": {
         "6": 718
       },
-      "boundary_max_delta_3d_m": 3.4893895548867557,
+      "boundary_max_delta_3d_m": 0.6494075896185958,
       "candidate_only_epochs": 0,
       "candidate_status_counts": {
         "5": 713
       },
-      "delta_max_3d_m": 3.4893895548867557,
-      "delta_rms_3d_m": 0.8830304718044313,
+      "delta_max_3d_m": 2.4484027664977206,
+      "delta_rms_3d_m": 0.21708000702357919,
       "matched_epochs": 713,
       "missed_fixes": 0,
       "native_row_counts": {
@@ -81,16 +81,16 @@
         "1": 108,
         "6": 10
       },
-      "boundary_max_delta_3d_m": 0.049686039760109706,
+      "boundary_max_delta_3d_m": 0.03708872832046166,
       "candidate_only_epochs": 0,
       "candidate_status_counts": {
         "5": 11,
         "6": 107
       },
-      "delta_max_3d_m": 0.4679434691068333,
-      "delta_rms_3d_m": 0.06480974657394407,
+      "delta_max_3d_m": 0.2906968409142755,
+      "delta_rms_3d_m": 0.05316561256319484,
       "matched_epochs": 118,
-      "missed_fixes": 1,
+      "missed_fixes": 2,
       "native_row_counts": {
         "madoca_l6d_constraint_epochs": 1,
         "madoca_l6d_constraint_position_gate_epochs": 117,
@@ -98,11 +98,12 @@
       },
       "native_runtime_s": 9.629612201999407,
       "status_pair_counts": {
-        "1->5": 1,
-        "1->6": 107,
-        "6->5": 10
+        "1->5": 2,
+        "1->6": 106,
+        "6->5": 9,
+        "6->6": 1
       },
-      "wrong_fixes": 0
+      "wrong_fixes": 1
     },
     "alic.pppar-ion.24h": {
       "base_only_epochs": 23,
@@ -139,28 +140,29 @@
         "1": 708,
         "6": 10
       },
-      "boundary_max_delta_3d_m": 0.07188465649969084,
+      "boundary_max_delta_3d_m": 0.03708872832046166,
       "candidate_only_epochs": 0,
       "candidate_status_counts": {
         "5": 11,
         "6": 702
       },
-      "delta_max_3d_m": 0.4679434691068333,
-      "delta_rms_3d_m": 0.06788443368825045,
+      "delta_max_3d_m": 0.2906968409142755,
+      "delta_rms_3d_m": 0.03133118121886324,
       "matched_epochs": 713,
-      "missed_fixes": 1,
+      "missed_fixes": 2,
       "native_row_counts": {
         "madoca_l6d_constraint_epochs": 1,
         "madoca_l6d_constraint_position_gate_epochs": 712,
         "madoca_l6d_constraint_rows": 10
       },
-      "native_runtime_s": 38.80786048999926,
+      "native_runtime_s": 42.7581999740014,
       "status_pair_counts": {
-        "1->5": 1,
-        "1->6": 702,
-        "6->5": 10
+        "1->5": 2,
+        "1->6": 701,
+        "6->5": 9,
+        "6->6": 1
       },
-      "wrong_fixes": 0
+      "wrong_fixes": 1
     },
     "alic.pppar.1h": {
       "base_only_epochs": 0,
@@ -168,14 +170,14 @@
         "1": 99,
         "6": 19
       },
-      "boundary_max_delta_3d_m": 0.06386913021118062,
+      "boundary_max_delta_3d_m": 0.06102581264397135,
       "candidate_only_epochs": 0,
       "candidate_status_counts": {
         "5": 9,
         "6": 109
       },
-      "delta_max_3d_m": 0.5414620290120746,
-      "delta_rms_3d_m": 0.125636073390556,
+      "delta_max_3d_m": 0.4897535009347701,
+      "delta_rms_3d_m": 0.1135746161635366,
       "matched_epochs": 118,
       "missed_fixes": 1,
       "native_row_counts": {
@@ -228,14 +230,14 @@
         "1": 699,
         "6": 19
       },
-      "boundary_max_delta_3d_m": 0.0740519076073963,
+      "boundary_max_delta_3d_m": 0.06102581264397135,
       "candidate_only_epochs": 0,
       "candidate_status_counts": {
         "5": 9,
         "6": 704
       },
-      "delta_max_3d_m": 0.5414620290120746,
-      "delta_rms_3d_m": 0.08203649874343641,
+      "delta_max_3d_m": 0.4897535009347701,
+      "delta_rms_3d_m": 0.05382046978474859,
       "matched_epochs": 713,
       "missed_fixes": 1,
       "native_row_counts": {
@@ -243,7 +245,7 @@
         "madoca_l6d_constraint_position_gate_epochs": 0,
         "madoca_l6d_constraint_rows": 0
       },
-      "native_runtime_s": 41.08398776000013,
+      "native_runtime_s": 42.006080459999794,
       "status_pair_counts": {
         "1->5": 1,
         "1->6": 693,
@@ -257,13 +259,13 @@
       "base_status_counts": {
         "6": 118
       },
-      "boundary_max_delta_3d_m": 4.284246515935533,
+      "boundary_max_delta_3d_m": 1.3951238903048153,
       "candidate_only_epochs": 0,
       "candidate_status_counts": {
         "5": 118
       },
-      "delta_max_3d_m": 4.284246515935533,
-      "delta_rms_3d_m": 1.6156750831405513,
+      "delta_max_3d_m": 4.127704555592162,
+      "delta_rms_3d_m": 0.67847659444547,
       "matched_epochs": 118,
       "missed_fixes": 0,
       "native_row_counts": {
@@ -307,13 +309,13 @@
       "base_status_counts": {
         "6": 718
       },
-      "boundary_max_delta_3d_m": 4.284246515935533,
+      "boundary_max_delta_3d_m": 1.3951238903048153,
       "candidate_only_epochs": 0,
       "candidate_status_counts": {
         "5": 713
       },
-      "delta_max_3d_m": 4.284246515935533,
-      "delta_rms_3d_m": 1.2209054962011483,
+      "delta_max_3d_m": 4.127704555592162,
+      "delta_rms_3d_m": 0.27906451016956346,
       "matched_epochs": 713,
       "missed_fixes": 0,
       "native_row_counts": {
@@ -333,16 +335,16 @@
         "1": 97,
         "6": 21
       },
-      "boundary_max_delta_3d_m": 0.2759272510010001,
+      "boundary_max_delta_3d_m": 0.045386062890617494,
       "candidate_only_epochs": 0,
       "candidate_status_counts": {
-        "5": 29,
-        "6": 89
+        "5": 27,
+        "6": 91
       },
-      "delta_max_3d_m": 0.4826277238332499,
-      "delta_rms_3d_m": 0.25659075945906673,
+      "delta_max_3d_m": 0.3684628355008366,
+      "delta_rms_3d_m": 0.07657356024270036,
       "matched_epochs": 118,
-      "missed_fixes": 8,
+      "missed_fixes": 6,
       "native_row_counts": {
         "madoca_l6d_constraint_epochs": 1,
         "madoca_l6d_constraint_position_gate_epochs": 117,
@@ -350,8 +352,8 @@
       },
       "native_runtime_s": 10.386064764000366,
       "status_pair_counts": {
-        "1->5": 8,
-        "1->6": 89,
+        "1->5": 6,
+        "1->6": 91,
         "6->5": 21
       },
       "wrong_fixes": 0
@@ -391,16 +393,16 @@
         "1": 697,
         "6": 21
       },
-      "boundary_max_delta_3d_m": 0.29478379262475907,
+      "boundary_max_delta_3d_m": 0.045386062890617494,
       "candidate_only_epochs": 0,
       "candidate_status_counts": {
-        "5": 105,
-        "6": 608
+        "5": 27,
+        "6": 686
       },
-      "delta_max_3d_m": 0.4826277238332499,
-      "delta_rms_3d_m": 0.1826056177591525,
+      "delta_max_3d_m": 0.3684628355008366,
+      "delta_rms_3d_m": 0.03920427613661363,
       "matched_epochs": 713,
-      "missed_fixes": 84,
+      "missed_fixes": 6,
       "native_row_counts": {
         "madoca_l6d_constraint_epochs": 1,
         "madoca_l6d_constraint_position_gate_epochs": 712,
@@ -408,8 +410,8 @@
       },
       "native_runtime_s": 38.12038253399987,
       "status_pair_counts": {
-        "1->5": 84,
-        "1->6": 608,
+        "1->5": 6,
+        "1->6": 686,
         "6->5": 21
       },
       "wrong_fixes": 0
@@ -420,14 +422,14 @@
         "1": 108,
         "6": 10
       },
-      "boundary_max_delta_3d_m": 0.2597104677024002,
+      "boundary_max_delta_3d_m": 0.2583661291877305,
       "candidate_only_epochs": 0,
       "candidate_status_counts": {
         "5": 10,
         "6": 108
       },
-      "delta_max_3d_m": 0.47406375508602866,
-      "delta_rms_3d_m": 0.196377796388336,
+      "delta_max_3d_m": 0.2583661291877305,
+      "delta_rms_3d_m": 0.04596562963602313,
       "matched_epochs": 118,
       "missed_fixes": 0,
       "native_row_counts": {
@@ -477,16 +479,16 @@
         "1": 708,
         "6": 10
       },
-      "boundary_max_delta_3d_m": 0.2940535550794953,
+      "boundary_max_delta_3d_m": 0.2583661291877305,
       "candidate_only_epochs": 0,
       "candidate_status_counts": {
-        "5": 86,
-        "6": 627
+        "5": 10,
+        "6": 703
       },
-      "delta_max_3d_m": 0.47406375508602866,
-      "delta_rms_3d_m": 0.16204316868841126,
+      "delta_max_3d_m": 0.2583661291877305,
+      "delta_rms_3d_m": 0.028500695478064435,
       "matched_epochs": 713,
-      "missed_fixes": 76,
+      "missed_fixes": 0,
       "native_row_counts": {
         "madoca_l6d_constraint_epochs": 0,
         "madoca_l6d_constraint_position_gate_epochs": 0,
@@ -494,8 +496,7 @@
       },
       "native_runtime_s": 36.12640814400038,
       "status_pair_counts": {
-        "1->5": 76,
-        "1->6": 627,
+        "1->6": 703,
         "6->5": 10
       },
       "wrong_fixes": 0

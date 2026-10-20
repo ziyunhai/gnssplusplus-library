@@ -10,9 +10,11 @@
 #include <iterator>
 #include <limits>
 #include <string>
+#include <thread>
 
 #ifndef _WIN32
 #include <netdb.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <cerrno>
 #include <fcntl.h>
@@ -26,6 +28,11 @@
 namespace libgnss {
 namespace io {
 using namespace rtcm_internal;
+
+namespace {
+// Poll slice of the opt-in abortable reads (RTCMReader::setAbortable).
+constexpr int kAbortPollSliceMs = 50;
+}  // namespace
 
 bool RTCMReader::open(const std::string& source) {
     close();
@@ -67,12 +74,43 @@ void RTCMReader::close() {
     buffer_.clear();
     buffer_pos_ = 0;
     is_open_ = false;
+    tcp_reconnect_count_ = 0;
+    stall_count_ = 0;
+    last_read_stalled_ = false;
+    abort_requested_.store(false);
+    tcp_last_error_.clear();
     processor_.clear();
     processor_.resetStats();
 }
 
+int waitForReadable(int fd, int timeout_ms) {
+#ifndef _WIN32
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(std::max(timeout_ms, 0));
+    while (true) {
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now());
+        pollfd pfd{};
+        pfd.fd = fd;
+        pfd.events = POLLIN;
+        const int rc = ::poll(&pfd, 1, static_cast<int>(std::max<std::chrono::milliseconds::rep>(remaining.count(), 0)));
+        if (rc < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        return rc > 0 ? 1 : 0;
+    }
+#else
+    (void)fd;
+    (void)timeout_ms;
+    return 1;
+#endif
+}
+
 bool RTCMReader::readMessage(RTCMMessage& message) {
-    if (!is_open_) {
+    last_read_stalled_ = false;
+    if (!is_open_ || (abortable_ && abort_requested_.load())) {
         return false;
     }
 
@@ -110,7 +148,17 @@ bool RTCMReader::readMessage(RTCMMessage& message) {
         return false;
     };
 
-    const int stream_fd =
+#ifndef _WIN32
+    // A tcp:// source with auto-reconnect enabled may have lost its socket after a failed
+    // reconnect attempt; try again here so the caller can simply keep calling readMessage().
+    const bool tcp_reconnecting = auto_reconnect_ && isTcpStream();
+    if (tcp_reconnecting && tcp_fd_ < 0 && !reconnectTcp()) {
+        return false;
+    }
+#else
+    const bool tcp_reconnecting = false;
+#endif
+    int stream_fd =
 #ifndef _WIN32
         (serial_fd_ >= 0 ? serial_fd_ : tcp_fd_);
 #else
@@ -132,17 +180,115 @@ bool RTCMReader::readMessage(RTCMMessage& message) {
             buffer_pos_ = 0;
         }
 
+        // Opt-in stall watchdog: a connected peer that never sends (and never closes) would
+        // otherwise block in read() forever.
+        bool stalled = false;
+        if (abortable_) {
+            // Opt-in: wait in short slices so requestAbort() from another thread ends the wait.
+            const auto wait_begin = std::chrono::steady_clock::now();
+            while (true) {
+                if (waitForReadable(stream_fd, kAbortPollSliceMs) != 0) {
+                    break;
+                }
+                if (abort_requested_.load()) {
+                    return false;
+                }
+                if (stall_timeout_ms_ > 0 &&
+                    std::chrono::steady_clock::now() - wait_begin >=
+                        std::chrono::milliseconds(stall_timeout_ms_)) {
+                    stalled = true;
+                    break;
+                }
+            }
+        } else if (stall_timeout_ms_ > 0 && waitForReadable(stream_fd, stall_timeout_ms_) == 0) {
+            stalled = true;
+        }
+        if (stalled) {
+            ++stall_count_;
+            if (tcp_reconnecting) {
+                tcp_last_error_ = "tcp stalled: no data for " + std::to_string(stall_timeout_ms_) + " ms";
+                reconnectTcp();  // a failed attempt is retried by the next readMessage() call
+            }
+            last_read_stalled_ = true;
+            return false;
+        }
+
         const ssize_t count = ::read(stream_fd, chunk.data(), chunk.size());
         if (count < 0) {
             if (errno == EINTR) {
                 continue;
             }
+            if (tcp_reconnecting) {
+                tcp_last_error_ = "tcp read failed";
+                if (!reconnectTcp()) {
+                    return false;
+                }
+                stream_fd = tcp_fd_;
+                continue;
+            }
             return false;
         }
         if (count == 0) {
+            if (tcp_reconnecting) {
+                tcp_last_error_ = "tcp stream closed";
+                if (!reconnectTcp()) {
+                    return false;
+                }
+                stream_fd = tcp_fd_;
+                continue;
+            }
             return tryDecodeBufferedMessage();
         }
         buffer_.insert(buffer_.end(), chunk.begin(), chunk.begin() + count);
+    }
+#else
+    return false;
+#endif
+}
+
+bool RTCMReader::isLiveStream() const {
+    return is_open_ && (ntrip_client_ != nullptr || serial_fd_ >= 0 || isTcpStream());
+}
+
+bool RTCMReader::isTcpStream() const {
+    return is_open_ && ntrip_client_ == nullptr && serial_fd_ < 0 && rtcm_internal::isTcpSource(source_);
+}
+
+bool RTCMReader::reconnectTcp() {
+#ifndef _WIN32
+    if (tcp_fd_ >= 0) {
+        ::close(tcp_fd_);
+        tcp_fd_ = -1;
+    }
+    // Bytes of a frame cut off by the dropped connection must not be glued to the new stream.
+    buffer_.clear();
+    buffer_pos_ = 0;
+    ++tcp_reconnect_count_;
+    if (abortable_) {
+        for (int slept = 0; slept < reconnect_delay_ms_ && !abort_requested_.load();
+             slept += kAbortPollSliceMs) {
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(std::min(kAbortPollSliceMs, reconnect_delay_ms_ - slept)));
+        }
+        if (abort_requested_.load()) {
+            tcp_last_error_ = "aborted";
+            return false;
+        }
+    } else if (reconnect_delay_ms_ > 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(reconnect_delay_ms_));
+    }
+    try {
+        const int fd = connectTcpSocket(source_);
+        if (fd < 0) {
+            tcp_last_error_ = "failed to reconnect to " + source_;
+            return false;
+        }
+        tcp_fd_ = fd;
+        tcp_last_error_.clear();
+        return true;
+    } catch (const std::exception& e) {
+        tcp_last_error_ = e.what();
+        return false;
     }
 #else
     return false;
@@ -169,6 +315,7 @@ bool RTCMReader::readFromNetwork(const std::string& url) {
         return false;
     }
 
+    ntrip_client_->setAutoReconnect(auto_reconnect_, reconnect_delay_ms_);
     is_open_ = true;
     return true;
 }
@@ -227,21 +374,60 @@ RTCMProcessor::RTCMStats RTCMReader::getStats() const {
 }
 
 void RTCMReader::setAutoReconnect(bool enabled, int delay_ms) {
+    auto_reconnect_ = enabled;
+    reconnect_delay_ms_ = delay_ms < 0 ? 0 : delay_ms;
     if (ntrip_client_) {
         ntrip_client_->setAutoReconnect(enabled, delay_ms);
     }
 }
 
+void RTCMReader::setStallTimeoutMs(int timeout_ms) {
+    stall_timeout_ms_ = timeout_ms < 0 ? 0 : timeout_ms;
+}
+
 int RTCMReader::reconnectCount() const {
-    return ntrip_client_ ? ntrip_client_->reconnectCount() : 0;
+    return ntrip_client_ ? ntrip_client_->reconnectCount() : tcp_reconnect_count_;
 }
 
 bool RTCMReader::isConnected() const {
-    return ntrip_client_ ? ntrip_client_->isConnected() : is_open_;
+    if (ntrip_client_) {
+        return ntrip_client_->isConnected();
+    }
+    return isTcpStream() ? tcp_fd_ >= 0 : is_open_;
 }
 
 std::string RTCMReader::lastError() const {
-    return ntrip_client_ ? ntrip_client_->getLastError() : std::string();
+    return ntrip_client_ ? ntrip_client_->getLastError() : tcp_last_error_;
+}
+
+size_t mergeRTCMEphemerides(const std::string& source, NavigationData& nav) {
+    RTCMReader reader;
+    if (!reader.open(source)) {
+        return 0;
+    }
+    RTCMProcessor processor;
+    RTCMMessage message;
+    size_t added = 0;
+    while (reader.readMessage(message)) {
+        if (message.type != RTCMMessageType::RTCM_1019 &&
+            message.type != RTCMMessageType::RTCM_1045 &&
+            message.type != RTCMMessageType::RTCM_1046) {
+            continue;
+        }
+        NavigationData decoded;
+        if (!processor.decodeNavigationData(message, decoded)) {
+            continue;
+        }
+        for (const auto& [satellite, ephemerides] : decoded.ephemeris_data) {
+            (void)satellite;
+            for (const auto& eph : ephemerides) {
+                if (nav.addEphemerisIfNew(eph)) {
+                    ++added;
+                }
+            }
+        }
+    }
+    return added;
 }
 
 
@@ -281,6 +467,10 @@ std::string getMessageTypeName(RTCMMessageType type) {
         case RTCMMessageType::RTCM_1019: return "GPS Ephemeris";
         case RTCMMessageType::RTCM_1020: return "GLONASS Ephemeris";
         case RTCMMessageType::RTCM_1033: return "Receiver And Antenna Descriptor";
+        case RTCMMessageType::RTCM_1042: return "BeiDou Ephemeris";
+        case RTCMMessageType::RTCM_1044: return "QZSS Ephemeris";
+        case RTCMMessageType::RTCM_1045: return "Galileo F/NAV Ephemeris";
+        case RTCMMessageType::RTCM_1046: return "Galileo I/NAV Ephemeris";
         case RTCMMessageType::RTCM_1057: return "GPS SSR Orbit Correction";
         case RTCMMessageType::RTCM_1058: return "GPS SSR Clock Correction";
         case RTCMMessageType::RTCM_1059: return "GPS SSR Code Bias";
@@ -305,10 +495,18 @@ std::string getMessageTypeName(RTCMMessageType type) {
         case RTCMMessageType::RTCM_1095: return "Galileo MSM5";
         case RTCMMessageType::RTCM_1096: return "Galileo MSM6";
         case RTCMMessageType::RTCM_1097: return "Galileo MSM7";
+        case RTCMMessageType::RTCM_1114: return "QZSS MSM4";
+        case RTCMMessageType::RTCM_1115: return "QZSS MSM5";
+        case RTCMMessageType::RTCM_1116: return "QZSS MSM6";
+        case RTCMMessageType::RTCM_1117: return "QZSS MSM7";
         case RTCMMessageType::RTCM_1124: return "BeiDou MSM4";
         case RTCMMessageType::RTCM_1125: return "BeiDou MSM5";
         case RTCMMessageType::RTCM_1126: return "BeiDou MSM6";
         case RTCMMessageType::RTCM_1127: return "BeiDou MSM7";
+        case RTCMMessageType::RTCM_1134: return "NavIC MSM4";
+        case RTCMMessageType::RTCM_1135: return "NavIC MSM5";
+        case RTCMMessageType::RTCM_1136: return "NavIC MSM6";
+        case RTCMMessageType::RTCM_1137: return "NavIC MSM7";
         case RTCMMessageType::RTCM_1240: return "Galileo SSR Orbit Correction";
         case RTCMMessageType::RTCM_1241: return "Galileo SSR Clock Correction";
         case RTCMMessageType::RTCM_1242: return "Galileo SSR Code Bias";
@@ -339,12 +537,16 @@ bool isObservationMessage(RTCMMessageType type) {
            (type_val >= 1074 && type_val <= 1077) ||
            (type_val >= 1084 && type_val <= 1087) ||
            (type_val >= 1094 && type_val <= 1097) ||
-           (type_val >= 1124 && type_val <= 1127);
+           (type_val >= 1114 && type_val <= 1117) ||
+           (type_val >= 1124 && type_val <= 1127) ||
+           (type_val >= 1134 && type_val <= 1137);
 }
 
 bool isEphemerisMessage(RTCMMessageType type) {
     auto type_val = static_cast<uint16_t>(type);
-    return type_val == 1019 || type_val == 1020;
+    // GPS, GLONASS, BeiDou, QZSS, Galileo F/NAV and Galileo I/NAV ephemerides.
+    return type_val == 1019 || type_val == 1020 || type_val == 1042 ||
+           type_val == 1044 || type_val == 1045 || type_val == 1046;
 }
 
 bool isSSRMessage(RTCMMessageType type) {
@@ -369,12 +571,16 @@ GNSSSystem getSystemFromMessageType(RTCMMessageType type) {
         (type_val >= 1240 && type_val <= 1245)) {
         return GNSSSystem::Galileo;
     }
-    if (type_val >= 1246 && type_val <= 1251) {
+    if ((type_val >= 1114 && type_val <= 1117) ||
+        (type_val >= 1246 && type_val <= 1251)) {
         return GNSSSystem::QZSS;
     }
     if ((type_val >= 1124 && type_val <= 1127) ||
         (type_val >= 1258 && type_val <= 1263)) {
         return GNSSSystem::BeiDou;
+    }
+    if (type_val >= 1134 && type_val <= 1137) {
+        return GNSSSystem::NavIC;
     }
     if (type_val >= 1252 && type_val <= 1257) {
         return GNSSSystem::SBAS;

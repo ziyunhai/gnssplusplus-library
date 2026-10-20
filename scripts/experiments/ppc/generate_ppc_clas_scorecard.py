@@ -355,6 +355,7 @@ def build_gnss_ppp_command(
     ssr_csv: Path,
     out_pos: Path,
     parity: bool = False,
+    progress: bool = True,
 ) -> list[str]:
     cmd = [
         str(gnss_ppp_bin),
@@ -392,6 +393,8 @@ def build_gnss_ppp_command(
                 "2.0",
             ]
         )
+    if progress:
+        cmd.extend(["--progress-interval", "30"])
     return cmd
 
 
@@ -409,24 +412,20 @@ def run_logged(
             parity_keys = [key for key in PARITY_ENV if env.get(key) == "1"]
             if parity_keys:
                 handle.write(f"# env parity keys: {', '.join(parity_keys)}\n")
-    completed = subprocess.run(
-        list(command),
-        cwd=ROOT_DIR,
-        env=dict(env) if env is not None else None,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    elapsed = time.monotonic() - started
-    combined = completed.stdout
-    if completed.stderr:
-        if combined and not combined.endswith("\n"):
-            combined += "\n"
-        combined += completed.stderr
+    # Stream stdout/stderr straight into the log so long runs (e.g. gnss_ppp
+    # --progress) can be followed while they execute.
     with log_path.open("a", encoding="utf-8") as handle:
-        handle.write(combined)
-        if combined and not combined.endswith("\n"):
-            handle.write("\n")
+        completed = subprocess.run(
+            list(command),
+            cwd=ROOT_DIR,
+            env=dict(env) if env is not None else None,
+            text=True,
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+    elapsed = time.monotonic() - started
+    with log_path.open("a", encoding="utf-8") as handle:
         handle.write(f"# exit={completed.returncode} elapsed_s={elapsed:.3f}\n\n")
     return completed
 
@@ -803,6 +802,7 @@ def write_report(
     run_results: list[dict[str, Any]],
     work_dir: Path,
     l6_cache: Path,
+    apply_lever_arm: bool = False,
 ) -> None:
     lines: list[str] = []
     lines.append("# PPC kinematic CLAS PPP-RTK baseline")
@@ -813,7 +813,10 @@ def write_report(
     lines.append(f"- L6 cache: `{l6_cache}` (per-run concatenations under `{work_dir}`)")
     lines.append(f"- SSR CSV recipe: {csv_recipe}")
     lines.append("- Observation rate: 5 Hz (0.2 s); SSR expanded rows are time-stamped (1 s class sampling in compact expansion). MW/AR windows in PPP are time-based on receiver epochs, but any epoch-count heuristics in the CLAS path should be checked against 5 Hz density.")
-    lines.append("- Ground truth: city-specific vehicle/IMU-to-antenna lever arm rotated by each `reference.csv` attitude sample and added to the published ECEF; horizontal error in local ENU at each matched epoch.")
+    if apply_lever_arm:
+        lines.append("- Ground truth: city-specific vehicle/IMU-to-antenna lever arm rotated by each `reference.csv` attitude sample and added to the published ECEF (`--apply-lever-arm`, historical double-corrected mode); horizontal error in local ENU at each matched epoch.")
+    else:
+        lines.append("- Ground truth: raw published `reference.csv` ECEF (already antenna-positioned; no lever-arm transform); horizontal error in local ENU at each matched epoch.")
     lines.append("- PPP `.pos` rows carry GPS week/TOW from the receiver epoch; legacy rows with `GPS_Week=0` fall back to rover.obs `>` header alignment when counts match.")
     lines.append("- Match tolerance: 0.25 s; discard first 60 matched epochs; PPP fixed status = 6; TTFF requires 30 consecutive FIX epochs; 1sigma is the FIX horizontal-error 68th percentile.")
     lines.append("")
@@ -919,26 +922,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--work-dir",
         type=Path,
-        default=Path("/tmp/ppc_clas_baseline"),
+        default=ROOT_DIR / "output" / "ppc_clas_baseline",
         help="Working directory for L6/SSR/pos artifacts.",
     )
     parser.add_argument(
         "--l6-cache",
         type=Path,
-        default=Path("/tmp/ppc_clas_baseline/l6_cache"),
-        help="Shared cache for downloaded hourly QZSS L6 files.",
+        default=None,
+        help="Shared cache for downloaded hourly QZSS L6 files (default: <work-dir>/l6_cache).",
     )
     parser.add_argument(
         "--gnss-ppp",
         type=Path,
-        default=ROOT_DIR / "build" / "apps" / "gnss_ppp",
+        default=ROOT_DIR / "build" / "apps" / ("gnss_ppp.exe" if os.name == "nt" else "gnss_ppp"),
         help="Path to gnss_ppp binary.",
     )
     parser.add_argument(
         "--report",
         type=Path,
-        default=Path("/tmp/gnss_ppc_clas_baseline_report.md"),
-        help="Markdown report output path.",
+        default=None,
+        help="Markdown report output path (default: <work-dir>/scorecard.md).",
     )
     parser.add_argument(
         "--runs",
@@ -958,6 +961,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--force-fetch", action="store_true", help="Re-download L6 even if cached.")
     parser.add_argument("--force-ssr", action="store_true", help="Re-expand SSR CSV.")
     parser.add_argument(
+        "--ssr-only",
+        action="store_true",
+        help="Stop after fetching L6 and expanding the per-run SSR CSVs (no gnss_ppp runs).",
+    )
+    parser.add_argument(
         "--apply-lever-arm",
         action="store_true",
         help=(
@@ -968,12 +976,17 @@ def parse_args() -> argparse.Namespace:
             "historical lever-arm-corrected numbers."
         ),
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.l6_cache is None:
+        args.l6_cache = args.work_dir / "l6_cache"
+    if args.report is None:
+        args.report = args.work_dir / "scorecard.md"
+    return args
 
 
 def main() -> int:
     args = parse_args()
-    if not args.gnss_ppp.exists():
+    if not args.ssr_only and not args.gnss_ppp.exists():
         raise SystemExit(f"gnss_ppp binary not found: {args.gnss_ppp}")
 
     args.work_dir.mkdir(parents=True, exist_ok=True)
@@ -1028,6 +1041,10 @@ def main() -> int:
             )
         else:
             ssr_summary = {"rows_written": "cached", "cached": True}
+
+        if args.ssr_only:
+            print(f"=== {run_key}: SSR ready at {paths.ssr_csv} ===", flush=True)
+            continue
 
         template_config = args.configs[0]
         template_pos = paths.pos_parity if template_config == "parity" else paths.pos_default
@@ -1111,6 +1128,10 @@ def main() -> int:
             }
         )
 
+    if args.ssr_only:
+        print(f"SSR inputs ready under {args.work_dir}", flush=True)
+        return 0
+
     csv_recipe = (
         "apps/gnss_clas_ppp.expand_qzss_l6_source(): decode QZSS L6 via gnss_qzss_l6_info "
         "(default compact policies: lag-tolerant flush, stec-coeff-carry atmos merge, union subtype merge, "
@@ -1125,6 +1146,7 @@ def main() -> int:
         run_results=run_results,
         work_dir=args.work_dir,
         l6_cache=args.l6_cache,
+        apply_lever_arm=args.apply_lever_arm,
     )
     print(f"Wrote report: {args.report}", flush=True)
     return 0

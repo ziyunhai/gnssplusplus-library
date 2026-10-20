@@ -9,17 +9,26 @@
 #include <iterator>
 #include <limits>
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
 #include <libgnss++/algorithms/rtk.hpp>
 #include <libgnss++/core/constants.hpp>
 #include <libgnss++/io/rinex.hpp>
+#include <libgnss++/io/observation_epoch_assembler.hpp>
 #include <libgnss++/io/rtcm.hpp>
+#include <libgnss++/io/rtcm_stream.hpp>
 #include <libgnss++/io/solution_writer.hpp>
 #include <libgnss++/io/ubx.hpp>
 
+#include "navigation_merge.hpp"
+#include "rtcm_frame_common.hpp"
+
 namespace {
+
+using libgnss_apps::buildRtcmFrame;
+using libgnss_apps::mergeNavigationData;
 
 constexpr double kExactTimeToleranceSeconds = 1e-3;
 
@@ -51,11 +60,15 @@ struct ReplayConfig {
     std::string nav_rinex_path;
     std::string output_pos_path = "output/replay_solution.pos";
     libgnss::io::SolutionWriter::Format output_format = libgnss::io::SolutionWriter::Format::POS;
+    bool pos_uncertainty = false;
+    bool pos_fix_diagnostics = false;
     ModeChoice mode = ModeChoice::KINEMATIC;
     bool verbose = false;
     bool quiet = false;
     int max_epochs = -1;
     size_t rtcm_message_limit = 0;
+    // Merge per-constellation MSM messages of one epoch (RTCM multiple-message bit).
+    bool assemble_rtcm_epochs = true;
     bool base_position_override = false;
     Eigen::Vector3d base_position_ecef = Eigen::Vector3d::Zero();
     double ratio_threshold = 3.0;
@@ -65,6 +78,9 @@ struct ReplayConfig {
     int min_satellites_for_ar = 5;
     int min_hold_count = 5;
     double hold_ratio_threshold = 2.0;
+    bool hold_fix_unchanged_set = false;
+    int hold_fix_min_matched_pairs = 4;
+    int min_fix_satellites = 0;
     double min_full_ratio_for_subset_ar = 0.0;
     double max_position_jump_min_m = 0.0;
     double max_position_jump_rate_mps = 0.0;
@@ -91,76 +107,6 @@ struct ReplayConfig {
 
 double timeDiffSeconds(const libgnss::GNSSTime& a, const libgnss::GNSSTime& b) {
     return a - b;
-}
-
-uint32_t crc24q(const uint8_t* data, size_t length) {
-    static const uint32_t table[256] = {
-        0x000000, 0x864CFB, 0x8AD50D, 0x0C99F6, 0x93E6E1, 0x15AA1A, 0x1933EC, 0x9F7F17,
-        0xA18139, 0x27CDC2, 0x2B5434, 0xAD18CF, 0x3267D8, 0xB42B23, 0xB8B2D5, 0x3EFE2E,
-        0xC54E89, 0x430272, 0x4F9B84, 0xC9D77F, 0x56A868, 0xD0E493, 0xDC7D65, 0x5A319E,
-        0x64CFB0, 0xE2834B, 0xEE1ABD, 0x685646, 0xF72951, 0x7165AA, 0x7DFC5C, 0xFBB0A7,
-        0x0CD1E9, 0x8A9D12, 0x8604E4, 0x00481F, 0x9F3708, 0x197BF3, 0x15E205, 0x93AEFE,
-        0xAD50D0, 0x2B1C2B, 0x2785DD, 0xA1C926, 0x3EB631, 0xB8FACA, 0xB4633C, 0x322FC7,
-        0xC99F60, 0x4FD39B, 0x434A6D, 0xC50696, 0x5A7981, 0xDC357A, 0xD0AC8C, 0x56E077,
-        0x681E59, 0xEE52A2, 0xE2CB54, 0x6487AF, 0xFBF8B8, 0x7DB443, 0x712DB5, 0xF7614E,
-        0x19A3D2, 0x9FEF29, 0x9376DF, 0x153A24, 0x8A4533, 0x0C09C8, 0x00903E, 0x86DCC5,
-        0xB822EB, 0x3E6E10, 0x32F7E6, 0xB4BB1D, 0x2BC40A, 0xAD88F1, 0xA11107, 0x275DFC,
-        0xDCED5B, 0x5AA1A0, 0x563856, 0xD074AD, 0x4F0BBA, 0xC94741, 0xC5DEB7, 0x43924C,
-        0x7D6C62, 0xFB2099, 0xF7B96F, 0x71F594, 0xEE8A83, 0x68C678, 0x645F8E, 0xE21375,
-        0x15723B, 0x933EC0, 0x9FA736, 0x19EBCD, 0x8694DA, 0x00D821, 0x0C41D7, 0x8A0D2C,
-        0xB4F302, 0x32BFF9, 0x3E260F, 0xB86AF4, 0x2715E3, 0xA15918, 0xADC0EE, 0x2B8C15,
-        0xD03CB2, 0x567049, 0x5AE9BF, 0xDCA544, 0x43DA53, 0xC596A8, 0xC90F5E, 0x4F43A5,
-        0x71BD8B, 0xF7F170, 0xFB6886, 0x7D247D, 0xE25B6A, 0x641791, 0x688E67, 0xEEC29C,
-        0x3347A4, 0xB50B5F, 0xB992A9, 0x3FDE52, 0xA0A145, 0x26EDBE, 0x2A7448, 0xAC38B3,
-        0x92C69D, 0x148A66, 0x181390, 0x9E5F6B, 0x01207C, 0x876C87, 0x8BF571, 0x0DB98A,
-        0xF6092D, 0x7045D6, 0x7CDC20, 0xFA90DB, 0x65EFCC, 0xE3A337, 0xEF3AC1, 0x69763A,
-        0x578814, 0xD1C4EF, 0xDD5D19, 0x5B11E2, 0xC46EF5, 0x42220E, 0x4EBBF8, 0xC8F703,
-        0x3F964D, 0xB9DAB6, 0xB54340, 0x330FBB, 0xAC70AC, 0x2A3C57, 0x26A5A1, 0xA0E95A,
-        0x9E1774, 0x185B8F, 0x14C279, 0x928E82, 0x0DF195, 0x8BBD6E, 0x872498, 0x016863,
-        0xFAD8C4, 0x7C943F, 0x700DC9, 0xF64132, 0x693E25, 0xEF72DE, 0xE3EB28, 0x65A7D3,
-        0x5B59FD, 0xDD1506, 0xD18CF0, 0x57C00B, 0xC8BF1C, 0x4EF3E7, 0x426A11, 0xC426EA,
-        0x2AE476, 0xACA88D, 0xA0317B, 0x267D80, 0xB90297, 0x3F4E6C, 0x33D79A, 0xB59B61,
-        0x8B654F, 0x0D29B4, 0x01B042, 0x87FCB9, 0x1883AE, 0x9ECF55, 0x9256A3, 0x141A58,
-        0xEFAAFF, 0x69E604, 0x657FF2, 0xE33309, 0x7C4C1E, 0xFA00E5, 0xF69913, 0x70D5E8,
-        0x4E2BC6, 0xC8673D, 0xC4FECB, 0x42B230, 0xDDCD27, 0x5B81DC, 0x57182A, 0xD154D1,
-        0x26359F, 0xA07964, 0xACE092, 0x2AAC69, 0xB5D37E, 0x339F85, 0x3F0673, 0xB94A88,
-        0x87B4A6, 0x01F85D, 0x0D61AB, 0x8B2D50, 0x145247, 0x921EBC, 0x9E874A, 0x18CBB1,
-        0xE37B16, 0x6537ED, 0x69AE1B, 0xEFE2E0, 0x709DF7, 0xF6D10C, 0xFA48FA, 0x7C0401,
-        0x42FA2F, 0xC4B6D4, 0xC82F22, 0x4E63D9, 0xD11CCE, 0x575035, 0x5BC9C3, 0xDD8538
-    };
-
-    uint32_t crc = 0;
-    for (size_t i = 0; i < length; ++i) {
-        const uint8_t index = static_cast<uint8_t>(((crc >> 16) ^ data[i]) & 0xFFU);
-        crc = (crc << 8) ^ table[index];
-    }
-    return crc & 0x00FFFFFFU;
-}
-
-std::vector<uint8_t> buildRtcmFrame(const libgnss::io::RTCMMessage& message) {
-    std::vector<uint8_t> frame;
-    frame.reserve(3 + message.data.size() + 3);
-    frame.push_back(0xD3);
-    frame.push_back(static_cast<uint8_t>((message.data.size() >> 8) & 0x03U));
-    frame.push_back(static_cast<uint8_t>(message.data.size() & 0xFFU));
-    frame.insert(frame.end(), message.data.begin(), message.data.end());
-    const uint32_t crc = crc24q(frame.data(), frame.size());
-    frame.push_back(static_cast<uint8_t>((crc >> 16) & 0xFFU));
-    frame.push_back(static_cast<uint8_t>((crc >> 8) & 0xFFU));
-    frame.push_back(static_cast<uint8_t>(crc & 0xFFU));
-    return frame;
-}
-
-void mergeNavigationData(libgnss::NavigationData& dst, const libgnss::NavigationData& src) {
-    for (const auto& [satellite, ephemerides] : src.ephemeris_data) {
-        (void)satellite;
-        for (const auto& eph : ephemerides) {
-            dst.addEphemeris(eph);
-        }
-    }
-    if (src.ionosphere_model.valid) {
-        dst.ionosphere_model = src.ionosphere_model;
-    }
 }
 
 std::string outputFormatString(libgnss::io::SolutionWriter::Format format) {
@@ -190,6 +136,8 @@ void printUsage(const char* argv0) {
         << "  Output\n"
         << "    --out <file>              Output solution file (default: output/replay_solution.pos)\n"
         << "    --format <pos|llh|xyz>    Output format (default: pos)\n"
+        << "    --pos-uncertainty         Append sdn sde sdu sdne sdeu sdun (m) and DiffAge(s) to .pos rows\n"
+        << "    --pos-fix-diagnostics     Append FloatFixH(m) FloatFixU(m) to .pos rows (nan unless FIXED; diagnostic only)\n"
         << "  Solver\n"
         << "    --mode <kinematic|static|moving-base> Replay mode (default: kinematic)\n"
         << "    --ratio <value>           Ambiguity ratio threshold (default: 3.0)\n"
@@ -201,6 +149,9 @@ void printUsage(const char* argv0) {
         << "    --min-ar-sats <n>         Minimum satellites for AR (default: 5)\n"
         << "    --min-hold-count <n>      Consecutive fixes before hold ambiguity is allowed (default: 5)\n"
         << "    --hold-ratio-threshold <v> Ratio threshold used while hold ambiguity is active (default: 2.0)\n"
+        << "    --hold-fix-unchanged-set  Reject the hold-fix fallback when a DD pair has no held integer (default: off)\n"
+        << "    --hold-fix-min-matched-pairs <n> Min held DD pairs for the hold-fix fallback (default: 4)\n"
+        << "    --min-fix-satellites <k>  Min non-reference satellites in an ambiguity-resolution FIX (default: 0 = off)\n"
         << "    --min-full-ratio-for-subset-ar <v> Min full-constellation LAMBDA ratio to accept a subset-AR fix (0=off)\n"
         << "    --max-pos-jump-min <m>    Floor of the motion-aware fixed-jump gate [m] (0=static gate)\n"
         << "    --max-pos-jump-rate <m/s> Per-second growth of the fixed-jump gate; needed for a moving rover (0=off)\n"
@@ -214,6 +165,8 @@ void printUsage(const char* argv0) {
         << "  Replay\n"
         << "    --max-epochs <n>          Stop after n rover epochs\n"
         << "    --rtcm-message-limit <n>  Stop RTCM ingest after n messages (0 = all)\n"
+        << "    --no-rtcm-epoch-assembly  Treat every base RTCM observation message as its own epoch\n"
+        << "                              (default: merge the per-constellation MSM messages of one epoch)\n"
         << "    --base-ecef <x> <y> <z>   Override base ECEF position\n"
         << "    --quiet                   Suppress per-epoch prints\n"
         << "    --verbose                 Print per-epoch solve details\n"
@@ -329,6 +282,10 @@ ReplayConfig parseArguments(int argc, char** argv) {
             config.output_pos_path = argv[++i];
         } else if (arg == "--format" && i + 1 < argc) {
             config.output_format = parseOutputFormat(argv[++i], argv[0]);
+        } else if (arg == "--pos-uncertainty") {
+            config.pos_uncertainty = true;
+        } else if (arg == "--pos-fix-diagnostics") {
+            config.pos_fix_diagnostics = true;
         } else if (arg == "--mode" && i + 1 < argc) {
             config.mode = parseMode(argv[++i], argv[0]);
         } else if (arg == "--ratio" && i + 1 < argc) {
@@ -354,6 +311,12 @@ ReplayConfig parseArguments(int argc, char** argv) {
         } else if (arg == "--hold-ratio-threshold" && i + 1 < argc) {
             config.hold_ratio_threshold = std::stod(argv[++i]);
             config.hold_ratio_threshold_set = true;
+        } else if (arg == "--hold-fix-unchanged-set") {
+            config.hold_fix_unchanged_set = true;
+        } else if (arg == "--hold-fix-min-matched-pairs" && i + 1 < argc) {
+            config.hold_fix_min_matched_pairs = std::stoi(argv[++i]);
+        } else if (arg == "--min-fix-satellites" && i + 1 < argc) {
+            config.min_fix_satellites = std::stoi(argv[++i]);
         } else if (arg == "--min-full-ratio-for-subset-ar" && i + 1 < argc) {
             config.min_full_ratio_for_subset_ar = std::stod(argv[++i]);
             config.min_full_ratio_for_subset_ar_set = true;
@@ -382,11 +345,18 @@ ReplayConfig parseArguments(int argc, char** argv) {
             config.glonass_ar = parseGlonassARChoice(argv[++i], argv[0]);
         } else if (arg == "--max-epochs" && i + 1 < argc) {
             config.max_epochs = std::stoi(argv[++i]);
+        } else if (arg == "--no-rtcm-epoch-assembly") {
+            config.assemble_rtcm_epochs = false;
         } else if (arg == "--rtcm-message-limit" && i + 1 < argc) {
             config.rtcm_message_limit = static_cast<size_t>(std::stoull(argv[++i]));
         } else if (arg == "--base-ecef" && i + 3 < argc) {
-            config.base_position_ecef =
-                Eigen::Vector3d(std::stod(argv[++i]), std::stod(argv[++i]), std::stod(argv[++i]));
+            // Do not increment i multiple times in constructor arguments: C++
+            // does not guarantee their evaluation order, and MSVC builds read
+            // the supplied XYZ reversed.
+            const double base_x = std::stod(argv[++i]);
+            const double base_y = std::stod(argv[++i]);
+            const double base_z = std::stod(argv[++i]);
+            config.base_position_ecef = Eigen::Vector3d(base_x, base_y, base_z);
             config.base_position_override = true;
         } else if (arg == "--quiet") {
             config.quiet = true;
@@ -428,6 +398,12 @@ ReplayConfig parseArguments(int argc, char** argv) {
     if (config.hold_ratio_threshold <= 0.0) {
         argumentError("--hold-ratio-threshold must be > 0", argv[0]);
     }
+    if (config.hold_fix_min_matched_pairs < 4) {
+        argumentError("--hold-fix-min-matched-pairs must be >= 4", argv[0]);
+    }
+    if (config.min_fix_satellites < 0) {
+        argumentError("--min-fix-satellites must be >= 0", argv[0]);
+    }
     if (config.max_position_jump_min_m < 0.0) {
         argumentError("--max-pos-jump-min must be >= 0", argv[0]);
     }
@@ -442,6 +418,14 @@ ReplayConfig parseArguments(int argc, char** argv) {
     }
     if (config.max_float_prefit_residual_reset_streak < 1) {
         argumentError("--max-float-prefit-reset-streak must be >= 1", argv[0]);
+    }
+    if (config.pos_uncertainty &&
+        config.output_format != libgnss::io::SolutionWriter::Format::POS) {
+        argumentError("--pos-uncertainty requires --format pos", argv[0]);
+    }
+    if (config.pos_fix_diagnostics &&
+        config.output_format != libgnss::io::SolutionWriter::Format::POS) {
+        argumentError("--pos-fix-diagnostics requires --format pos", argv[0]);
     }
     if (!config.base_rtcm_path.empty() &&
         config.base_rtcm_path.rfind("ntrip://", 0) == 0 &&
@@ -567,8 +551,14 @@ bool loadBaseUbx(const std::string& ubx_path,
     return !base_epochs.empty();
 }
 
+// Decodes the base RTCM stream with RTCMStreamDecoder so TOW-only MSM parts get a full GPST week
+// (and GLONASS epochs are dated from the stream, not the host clock), exactly as in gnss_live.
+// `seed` is the latest GPS toe of the --nav-rinex data when one was given; otherwise the decoder
+// seeds itself from the first in-stream GPS/Galileo/BeiDou/QZSS ephemeris.
 bool loadBaseRtcm(const std::string& source,
                   size_t message_limit,
+                  bool assemble_epochs,
+                  const std::optional<libgnss::GNSSTime>& seed,
                   std::vector<libgnss::ObservationData>& base_epochs,
                   libgnss::NavigationData& nav_data,
                   Eigen::Vector3d& base_position,
@@ -578,29 +568,52 @@ bool loadBaseRtcm(const std::string& source,
         return false;
     }
 
-    libgnss::io::RTCMProcessor processor;
+    libgnss::io::RTCMStreamDecoder decoder;
+    if (seed) {
+        decoder.setReferenceTime(*seed);
+    }
+    libgnss::io::ObservationEpochAssembler assembler;
+    // First reference the decoder had; epochs decoded before it existed (head of a stream with
+    // neither a navigation RINEX nor an early ephemeris) are still TOW-only (week 0) and are
+    // resolved against it after the pass, with the same nearest-week rule.
+    std::optional<libgnss::GNSSTime> first_reference = decoder.referenceTime();
     size_t message_count = 0;
     libgnss::io::RTCMMessage raw_message;
+    std::vector<libgnss::io::RTCMStreamDecoder::Event> events;
     while ((message_limit == 0 || message_count < message_limit) && reader.readMessage(raw_message)) {
         ++message_count;
         const auto frame = buildRtcmFrame(raw_message);
-        const auto decoded_messages = processor.decode(frame.data(), frame.size());
-        for (const auto& message : decoded_messages) {
-            if (libgnss::io::rtcm_utils::isObservationMessage(message.type)) {
-                libgnss::ObservationData obs_data;
-                if (processor.decodeObservationData(message, obs_data)) {
-                    base_epochs.push_back(obs_data);
+        decoder.pushFrame(frame.data(), frame.size(), events);
+        for (auto& event : events) {
+            if (event.has_observation) {
+                if (assemble_epochs) {
+                    for (auto& epoch : assembler.push(event.observation, event.observation_more_follows)) {
+                        base_epochs.push_back(std::move(epoch));
+                    }
+                } else {
+                    base_epochs.push_back(event.observation);
                 }
-            } else if (libgnss::io::rtcm_utils::isEphemerisMessage(message.type)) {
-                libgnss::NavigationData increment;
-                if (processor.decodeNavigationData(message, increment)) {
-                    mergeNavigationData(nav_data, increment);
-                }
+            } else if (event.has_navigation) {
+                mergeNavigationData(nav_data, event.navigation);
+            }
+        }
+        if (!first_reference) {
+            first_reference = decoder.referenceTime();
+        }
+    }
+    // A pending (partially assembled) epoch at end of stream is still an epoch.
+    for (auto& epoch : assembler.flush()) {
+        base_epochs.push_back(std::move(epoch));
+    }
+    if (first_reference) {
+        for (auto& epoch : base_epochs) {
+            if (epoch.time.week == 0) {
+                epoch.time = libgnss::io::RTCMStreamDecoder::resolveTowOnlyTime(epoch.time, *first_reference);
             }
         }
     }
-    if (processor.hasReferencePosition()) {
-        base_position = processor.getReferencePosition();
+    if (decoder.hasStationPosition()) {
+        base_position = decoder.getStationPosition();
         have_base_position = true;
     }
     reader.close();
@@ -657,17 +670,27 @@ size_t runReplay(const ReplayConfig& config) {
             throw std::runtime_error("failed to load base UBX observations/navigation");
         }
     } else {
+        // The navigation RINEX is read first (into its own container) only to seed the stream's
+        // GPST reference; it is merged after the in-stream ephemerides, as before.
+        libgnss::NavigationData supplemental_nav;
+        std::optional<libgnss::GNSSTime> stream_reference_seed;
+        if (!config.nav_rinex_path.empty()) {
+            if (!loadNavigationRinex(config.nav_rinex_path, supplemental_nav)) {
+                throw std::runtime_error("failed to load supplemental navigation RINEX");
+            }
+            stream_reference_seed = libgnss::io::RTCMStreamDecoder::referenceFromNavigation(supplemental_nav);
+        }
         if (!loadBaseRtcm(config.base_rtcm_path,
                           config.rtcm_message_limit,
+                          config.assemble_rtcm_epochs,
+                          stream_reference_seed,
                           base_epochs,
                           nav_data,
                           base_position,
                           have_base_position)) {
             throw std::runtime_error("failed to load base RTCM observations");
         }
-        if (!config.nav_rinex_path.empty() && !loadNavigationRinex(config.nav_rinex_path, nav_data)) {
-            throw std::runtime_error("failed to load supplemental navigation RINEX");
-        }
+        mergeNavigationData(nav_data, supplemental_nav);
     }
 
     if (nav_data.ephemeris_data.empty()) {
@@ -697,6 +720,9 @@ size_t runReplay(const ReplayConfig& config) {
     rtk_config.ar_filter_margin = config.ar_filter_margin;
     rtk_config.min_satellites_for_ar = config.min_satellites_for_ar;
     rtk_config.min_hold_count = config.min_hold_count;
+    rtk_config.hold_fix_unchanged_set_only = config.hold_fix_unchanged_set;
+    rtk_config.hold_fix_min_matched_pairs = config.hold_fix_min_matched_pairs;
+    rtk_config.min_fix_satellites = config.min_fix_satellites;
     rtk_config.min_full_ratio_for_subset_ar = config.min_full_ratio_for_subset_ar;
     rtk_config.max_position_jump_min_m = config.max_position_jump_min_m;
     rtk_config.max_position_jump_rate_mps = config.max_position_jump_rate_mps;
@@ -717,7 +743,8 @@ size_t runReplay(const ReplayConfig& config) {
     rtk.setBasePosition(base_position);
 
     libgnss::io::SolutionWriter writer;
-    if (!writer.open(config.output_pos_path, config.output_format)) {
+    if (!writer.open(config.output_pos_path, config.output_format, config.pos_uncertainty,
+                     config.pos_fix_diagnostics)) {
         throw std::runtime_error("failed to open output file: " + config.output_pos_path);
     }
 
@@ -765,7 +792,8 @@ size_t runReplay(const ReplayConfig& config) {
             continue;
         }
 
-        writer.writeEpoch(solution);
+        // Replay only uses exactly aligned base epochs.
+        writer.writeEpoch(solution, timeDiffSeconds(rover_obs.time, base_epochs[base_index].time));
         ++written_solutions;
         if (solution.isFixed()) {
             ++fixed_solutions;

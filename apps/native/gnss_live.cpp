@@ -1,6 +1,7 @@
 #include <Eigen/Dense>
 
 #include <chrono>
+#include <deque>
 #include <cmath>
 #include <cstdint>
 #include <exception>
@@ -8,18 +9,29 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <atomic>
+#include <condition_variable>
+#include <functional>
 #include <limits>
 #include <map>
+#include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <libgnss++/algorithms/rtk.hpp>
+#include <libgnss++/algorithms/rtk_validation.hpp>
+#include <libgnss++/algorithms/spp.hpp>
 #include <libgnss++/core/constants.hpp>
+#include <libgnss++/io/observation_epoch_assembler.hpp>
 #include <libgnss++/io/rinex.hpp>
 #include <libgnss++/io/rtcm.hpp>
 #include <libgnss++/io/rtcm_stream.hpp>
 #include <libgnss++/io/solution_writer.hpp>
 #include <libgnss++/io/ubx.hpp>
+#include <libgnss++/io/ubx_nav_decode.hpp>
 #include <libgnss++/models/troposphere.hpp>
 
 #ifndef _WIN32
@@ -29,11 +41,24 @@
 #include <unistd.h>
 #endif
 
+#include "navigation_merge.hpp"
+#include "rtcm_frame_common.hpp"
+#include "serial_port_common.hpp"
+
 namespace {
+
+using libgnss_apps::buildRtcmFrame;
+using libgnss_apps::mergeNavigationData;
+using libgnss_apps::mergeNavigationDataIfNew;
+#ifndef _WIN32
+using libgnss_apps::baudRateConstant;
+#endif
 
 constexpr double kExactTimeToleranceSeconds = 1e-3;
 constexpr double kMaxBaseInterpolationGapSeconds = 2.0;
 constexpr double kDefaultBaseHoldSeconds = 0.5;
+// A few hundred epochs of satellite states; larger than any single epoch's working set.
+constexpr size_t kSatelliteStateCacheLimit = 16384;
 
 enum class GlonassARChoice {
     OFF,
@@ -58,14 +83,30 @@ struct LiveConfig {
     std::string rover_ubx_path;
     std::string base_rtcm_path;
     std::string nav_rinex_path;
+    // Opt-in (--ubx-nav): decode broadcast ephemerides and the GPS Klobuchar set from the rover's
+    // UBX-RXM-SFRBX and merge them into the navigation database.
+    bool ubx_nav = false;
     std::string output_pos_path = "output/live_solution.pos";
     libgnss::io::SolutionWriter::Format output_format = libgnss::io::SolutionWriter::Format::POS;
+    bool pos_uncertainty = false;
+    bool pos_fix_diagnostics = false;
     int max_epochs = -1;
     size_t rover_message_limit = 0;
     size_t base_message_limit = 0;
     bool quiet = false;
     bool verbose = false;
+    bool reconnect = false;
+    int reconnect_delay_ms = 2000;
+    int reconnect_attempts = 0;
+    // Opt-in stall watchdog for tcp:// and serial/device sources (0 = off, blocking reads).
+    int stall_timeout_ms = 0;
+    // Opt-in (--base-outage-fallback spp): a rover epoch that would be skipped for lack of a
+    // base is solved with SPP and written with status SPP; live sources get reader threads.
+    bool base_outage_fallback = false;
     bool enable_base_interpolation = true;
+    // Merge the per-constellation MSM messages of one epoch (RTCM multiple-message
+    // bit) into a single epoch; --no-rtcm-epoch-assembly restores one epoch per message.
+    bool assemble_rtcm_epochs = true;
     double base_hold_seconds = kDefaultBaseHoldSeconds;
     bool base_position_override = false;
     Eigen::Vector3d base_position_ecef = Eigen::Vector3d::Zero();
@@ -76,6 +117,9 @@ struct LiveConfig {
     int min_satellites_for_ar = 5;
     int min_hold_count = 5;
     double hold_ratio_threshold = 2.0;
+    bool hold_fix_unchanged_set = false;
+    int hold_fix_min_matched_pairs = 4;
+    int min_fix_satellites = 0;
     double min_full_ratio_for_subset_ar = 0.0;
     double max_position_jump_min_m = 0.0;
     double max_position_jump_rate_mps = 0.0;
@@ -86,6 +130,8 @@ struct LiveConfig {
     bool enable_glonass = true;
     bool enable_beidou = true;
     GlonassARChoice glonass_ar = GlonassARChoice::OFF;
+    // Opt-in causal output guard (default off; see printUsage).
+    bool kinematic_post_filter = false;
     ModeChoice mode = ModeChoice::KINEMATIC;
     int rover_ubx_baud = 115200;
     RTKTuningPreset preset = RTKTuningPreset::NONE;
@@ -102,13 +148,145 @@ struct LiveConfig {
     bool max_float_prefit_residual_reset_streak_set = false;
 };
 
+using SteadyClock = std::chrono::steady_clock;
+using Deadline = std::optional<SteadyClock::time_point>;
+
+enum class PopStatus {
+    ITEM,
+    TIMEOUT,
+    CLOSED
+};
+
+// Bounded single-producer/single-consumer hand-off between a reader thread and the main loop.
+// Only used by the opt-in --base-outage-fallback path; without the flag no thread is created.
+// The reader thread does blocking I/O only: every decoder, assembler and solver stays on the
+// main thread.
+template <typename Item>
+class BoundedPump {
+public:
+    explicit BoundedPump(size_t capacity) : capacity_(capacity) {}
+    BoundedPump(const BoundedPump&) = delete;
+    BoundedPump& operator=(const BoundedPump&) = delete;
+    ~BoundedPump() { stop(); }
+
+    void start(std::function<void()> body, std::function<void()> abort_blocking_read) {
+        abort_ = std::move(abort_blocking_read);
+        thread_ = std::thread(std::move(body));
+    }
+
+    // Producer: false when the pump is being stopped.
+    bool push(Item&& item) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        not_full_.wait(lock, [&] { return queue_.size() < capacity_ || stopping_.load(); });
+        if (stopping_.load()) {
+            return false;
+        }
+        queue_.push_back(std::move(item));
+        not_empty_.notify_one();
+        return true;
+    }
+
+    void closeProducer() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            closed_ = true;
+        }
+        not_empty_.notify_all();
+    }
+
+    bool stopRequested() const { return stopping_.load(); }
+
+    // Consumer: queued items are always delivered first; TIMEOUT only when the queue is empty
+    // at the (absolute) deadline; CLOSED when the producer ended and the queue is drained.
+    PopStatus pop(Item& out, const Deadline& deadline) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        const auto ready = [&] { return !queue_.empty() || closed_ || stopping_.load(); };
+        if (deadline) {
+            if (!not_empty_.wait_until(lock, *deadline, ready)) {
+                return PopStatus::TIMEOUT;
+            }
+        } else {
+            not_empty_.wait(lock, ready);
+        }
+        if (queue_.empty()) {
+            return PopStatus::CLOSED;
+        }
+        out = std::move(queue_.front());
+        queue_.pop_front();
+        not_full_.notify_one();
+        return PopStatus::ITEM;
+    }
+
+    // Idempotent: wakes the producer, aborts its blocking read and joins the thread.
+    void stop() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stopping_.store(true);
+        }
+        not_full_.notify_all();
+        not_empty_.notify_all();
+        if (abort_) {
+            abort_();
+        }
+        if (thread_.joinable()) {
+            thread_.join();
+        }
+    }
+
+private:
+    const size_t capacity_;
+    std::mutex mutex_;
+    std::condition_variable not_empty_;
+    std::condition_variable not_full_;
+    std::deque<Item> queue_;
+    bool closed_ = false;
+    std::atomic<bool> stopping_{false};
+    std::function<void()> abort_;
+    std::thread thread_;
+};
+
+constexpr size_t kPumpQueueCapacity = 4096;
+constexpr int kPumpPollSliceMs = 50;
+
+// One RTCMReader::readMessage() result; ok == false is a failed read (EOF, stall, reconnect failure).
+struct RtcmItem {
+    bool ok = false;
+    bool stalled = false;
+    libgnss::io::RTCMMessage message;
+};
+
+// One chunk of rover UBX bytes; eof marks the end of the device (stalled: because of the watchdog).
+struct UbxChunk {
+    std::vector<uint8_t> data;
+    bool eof = false;
+    bool stalled = false;
+};
+
 struct SourceState {
     libgnss::io::RTCMReader reader;
     libgnss::io::RTCMStreamDecoder decoder;
     size_t messages_read = 0;
     size_t message_limit = 0;
     bool eof = false;
+    // RTCM epoch assembly (see LiveConfig::assemble_rtcm_epochs).
+    bool assemble_epochs = true;
+    bool input_ended = false;
+    libgnss::io::ObservationEpochAssembler assembler;
+    std::deque<libgnss::ObservationData> ready_epochs;
+    // --reconnect: keep retrying an NTRIP/tcp:// source that drops or goes quiet instead of
+    // treating the first failed read as the end of the stream (0 attempts = retry forever).
+    bool reconnect = false;
+    int reconnect_attempts = 0;
+    // --base-outage-fallback on a live source: reader thread feeding readNextObservation().
+    // Declared last so it is stopped (joined) before the reader it uses is destroyed.
+    int pump_failed_reads = 0;
+    bool pump_last_stalled = false;
+    std::unique_ptr<BoundedPump<RtcmItem>> pump;
 };
+
+bool sourceLastReadStalled(const SourceState& source) {
+    return source.pump ? source.pump_last_stalled : source.reader.lastReadStalled();
+}
 
 enum class RoverInputKind {
     RTCM,
@@ -122,8 +300,16 @@ struct RoverUbxSource {
     int serial_fd = -1;
 #endif
     size_t bytes_read = 0;
+    // --stall-timeout-ms for a serial/device rover (file input is unaffected).
+    int stall_timeout_ms = 0;
+    int stalls = 0;
+    bool last_read_stalled = false;
     bool serial = false;
     bool eof = false;
+    // A 4096-byte read can complete several RXM-RAWX epochs (a RAWX-only stream, a high rate);
+    // readNextUbxObservation() hands out one epoch per call, so the rest wait here, in order.
+    std::deque<libgnss::ObservationData> pending_observations;
+    std::unique_ptr<BoundedPump<UbxChunk>> pump;
 };
 
 struct DecoderSummaryStats {
@@ -494,76 +680,6 @@ int inferObservationWeekContext(const libgnss::NavigationData& nav_data) {
     return 0;
 }
 
-uint32_t crc24q(const uint8_t* data, size_t length) {
-    static const uint32_t table[256] = {
-        0x000000, 0x864CFB, 0x8AD50D, 0x0C99F6, 0x93E6E1, 0x15AA1A, 0x1933EC, 0x9F7F17,
-        0xA18139, 0x27CDC2, 0x2B5434, 0xAD18CF, 0x3267D8, 0xB42B23, 0xB8B2D5, 0x3EFE2E,
-        0xC54E89, 0x430272, 0x4F9B84, 0xC9D77F, 0x56A868, 0xD0E493, 0xDC7D65, 0x5A319E,
-        0x64CFB0, 0xE2834B, 0xEE1ABD, 0x685646, 0xF72951, 0x7165AA, 0x7DFC5C, 0xFBB0A7,
-        0x0CD1E9, 0x8A9D12, 0x8604E4, 0x00481F, 0x9F3708, 0x197BF3, 0x15E205, 0x93AEFE,
-        0xAD50D0, 0x2B1C2B, 0x2785DD, 0xA1C926, 0x3EB631, 0xB8FACA, 0xB4633C, 0x322FC7,
-        0xC99F60, 0x4FD39B, 0x434A6D, 0xC50696, 0x5A7981, 0xDC357A, 0xD0AC8C, 0x56E077,
-        0x681E59, 0xEE52A2, 0xE2CB54, 0x6487AF, 0xFBF8B8, 0x7DB443, 0x712DB5, 0xF7614E,
-        0x19A3D2, 0x9FEF29, 0x9376DF, 0x153A24, 0x8A4533, 0x0C09C8, 0x00903E, 0x86DCC5,
-        0xB822EB, 0x3E6E10, 0x32F7E6, 0xB4BB1D, 0x2BC40A, 0xAD88F1, 0xA11107, 0x275DFC,
-        0xDCED5B, 0x5AA1A0, 0x563856, 0xD074AD, 0x4F0BBA, 0xC94741, 0xC5DEB7, 0x43924C,
-        0x7D6C62, 0xFB2099, 0xF7B96F, 0x71F594, 0xEE8A83, 0x68C678, 0x645F8E, 0xE21375,
-        0x15723B, 0x933EC0, 0x9FA736, 0x19EBCD, 0x8694DA, 0x00D821, 0x0C41D7, 0x8A0D2C,
-        0xB4F302, 0x32BFF9, 0x3E260F, 0xB86AF4, 0x2715E3, 0xA15918, 0xADC0EE, 0x2B8C15,
-        0xD03CB2, 0x567049, 0x5AE9BF, 0xDCA544, 0x43DA53, 0xC596A8, 0xC90F5E, 0x4F43A5,
-        0x71BD8B, 0xF7F170, 0xFB6886, 0x7D247D, 0xE25B6A, 0x641791, 0x688E67, 0xEEC29C,
-        0x3347A4, 0xB50B5F, 0xB992A9, 0x3FDE52, 0xA0A145, 0x26EDBE, 0x2A7448, 0xAC38B3,
-        0x92C69D, 0x148A66, 0x181390, 0x9E5F6B, 0x01207C, 0x876C87, 0x8BF571, 0x0DB98A,
-        0xF6092D, 0x7045D6, 0x7CDC20, 0xFA90DB, 0x65EFCC, 0xE3A337, 0xEF3AC1, 0x69763A,
-        0x578814, 0xD1C4EF, 0xDD5D19, 0x5B11E2, 0xC46EF5, 0x42220E, 0x4EBBF8, 0xC8F703,
-        0x3F964D, 0xB9DAB6, 0xB54340, 0x330FBB, 0xAC70AC, 0x2A3C57, 0x26A5A1, 0xA0E95A,
-        0x9E1774, 0x185B8F, 0x14C279, 0x928E82, 0x0DF195, 0x8BBD6E, 0x872498, 0x016863,
-        0xFAD8C4, 0x7C943F, 0x700DC9, 0xF64132, 0x693E25, 0xEF72DE, 0xE3EB28, 0x65A7D3,
-        0x5B59FD, 0xDD1506, 0xD18CF0, 0x57C00B, 0xC8BF1C, 0x4EF3E7, 0x426A11, 0xC426EA,
-        0x2AE476, 0xACA88D, 0xA0317B, 0x267D80, 0xB90297, 0x3F4E6C, 0x33D79A, 0xB59B61,
-        0x8B654F, 0x0D29B4, 0x01B042, 0x87FCB9, 0x1883AE, 0x9ECF55, 0x9256A3, 0x141A58,
-        0xEFAAFF, 0x69E604, 0x657FF2, 0xE33309, 0x7C4C1E, 0xFA00E5, 0xF69913, 0x70D5E8,
-        0x4E2BC6, 0xC8673D, 0xC4FECB, 0x42B230, 0xDDCD27, 0x5B81DC, 0x57182A, 0xD154D1,
-        0x26359F, 0xA07964, 0xACE092, 0x2AAC69, 0xB5D37E, 0x339F85, 0x3F0673, 0xB94A88,
-        0x87B4A6, 0x01F85D, 0x0D61AB, 0x8B2D50, 0x145247, 0x921EBC, 0x9E874A, 0x18CBB1,
-        0xE37B16, 0x6537ED, 0x69AE1B, 0xEFE2E0, 0x709DF7, 0xF6D10C, 0xFA48FA, 0x7C0401,
-        0x42FA2F, 0xC4B6D4, 0xC82F22, 0x4E63D9, 0xD11CCE, 0x575035, 0x5BC9C3, 0xDD8538
-    };
-
-    uint32_t crc = 0;
-    for (size_t i = 0; i < length; ++i) {
-        const uint8_t index = static_cast<uint8_t>(((crc >> 16) ^ data[i]) & 0xFFU);
-        crc = (crc << 8) ^ table[index];
-    }
-    return crc & 0x00FFFFFFU;
-}
-
-std::vector<uint8_t> buildRtcmFrame(const libgnss::io::RTCMMessage& message) {
-    std::vector<uint8_t> frame;
-    frame.reserve(3 + message.data.size() + 3);
-    frame.push_back(0xD3);
-    frame.push_back(static_cast<uint8_t>((message.data.size() >> 8) & 0x03U));
-    frame.push_back(static_cast<uint8_t>(message.data.size() & 0xFFU));
-    frame.insert(frame.end(), message.data.begin(), message.data.end());
-    const uint32_t crc = crc24q(frame.data(), frame.size());
-    frame.push_back(static_cast<uint8_t>((crc >> 16) & 0xFFU));
-    frame.push_back(static_cast<uint8_t>((crc >> 8) & 0xFFU));
-    frame.push_back(static_cast<uint8_t>(crc & 0xFFU));
-    return frame;
-}
-
-void mergeNavigationData(libgnss::NavigationData& dst, const libgnss::NavigationData& src) {
-    for (const auto& [satellite, ephemerides] : src.ephemeris_data) {
-        (void)satellite;
-        for (const auto& eph : ephemerides) {
-            dst.addEphemeris(eph);
-        }
-    }
-    if (src.ionosphere_model.valid) {
-        dst.ionosphere_model = src.ionosphere_model;
-    }
-}
-
 std::string outputFormatString(libgnss::io::SolutionWriter::Format format) {
     switch (format) {
         case libgnss::io::SolutionWriter::Format::POS: return "pos";
@@ -580,11 +696,38 @@ void printUsage(const char* argv0) {
         << "  --rover-ubx <path>         Rover UBX stream from file or serial device\n"
         << "  --rover-ubx-baud <baud>    Rover serial baud rate for UBX device input (default: 115200)\n"
         << "  --nav-rinex <file>         Supplemental broadcast navigation RINEX\n"
+        << "  --ubx-nav                  With --rover-ubx: decode the rover's UBX-RXM-SFRBX into broadcast ephemerides\n"
+        << "                            (GPS/QZSS LNAV, Galileo E1-B I/NAV, BeiDou D1/D2, GLONASS) and the GPS Klobuchar set\n"
+        << "                            and merge them like RTCM ephemerides: a record at once, taken back out if a later copy of the\n"
+        << "                            same issue differs (ubx_nav_conflicts, ubx_nav_retracted; that satellite then needs two equal copies\n"
+        << "                            before anything is merged again; ubx_nav_unconfirmed counts records never confirmed). A new issue\n"
+        << "                            of a satellite that already holds a valid record of ours is held until a second copy confirms it\n"
+        << "                            (ubx_nav_held_new_issue), and a confirmation removes the satellite's unconfirmed records of other\n"
+        << "                            issues (counted in ubx_nav_retracted). Records whose health flags mark the satellite unusable are\n"
+        << "                            skipped (ubx_nav_unhealthy_skipped); a --nav-rinex ionosphere model wins (default: off)\n"
         << "  --out <file>               Output solution file (default: output/live_solution.pos)\n"
         << "  --format <pos|llh|xyz>     Output format (default: pos)\n"
+        << "  --pos-uncertainty          Append sdn sde sdu sdne sdeu sdun (m) and DiffAge(s) to .pos rows\n"
+        << "  --pos-fix-diagnostics      Append FloatFixH(m) FloatFixU(m) to .pos rows: horizontal / vertical distance between the\n"
+        << "                            epoch's float and FIXED positions (nan unless FIXED). Diagnostic only, not an integrity bound\n"
         << "  --max-epochs <n>           Stop after n solved epochs\n"
         << "  --rover-message-limit <n>  Stop rover ingest after n RTCM messages (0 = all)\n"
         << "  --base-message-limit <n>   Stop base ingest after n RTCM messages (0 = all)\n"
+        << "  --reconnect                Reconnect NTRIP/tcp:// sources that drop or stall (default: end at the first failed read)\n"
+        << "  --reconnect-delay-ms <ms>  Delay between reconnect attempts (default: 2000)\n"
+        << "  --reconnect-attempts <n>   Give up after n consecutive failed reads/reconnects (0 = never, default: 0)\n"
+        << "  --stall-timeout-ms <ms>    Treat a tcp:// or serial/device source that sends no byte for <ms> as stalled\n"
+        << "                            (default: 0 = off, blocking reads). With --reconnect a stalled tcp:// source is\n"
+        << "                            closed and reconnected (counts as a failed read); otherwise the source ends like EOF.\n"
+        << "                            NTRIP keeps its own timeout; file inputs are unaffected.\n"
+        << "  --base-outage-fallback spp Solve rover epochs that have no usable base with SPP and write them with status SPP\n"
+        << "                            (never FLOAT/FIXED; RTK state untouched; default: off, such epochs are skipped).\n"
+        << "                            On tcp/ntrip/serial sources each live source is read by its own thread, so output\n"
+        << "                            continues while the base is silent; an epoch is baseless after max(1 s,\n"
+        << "                            --base-hold-seconds + base interval) of wall time without a new base epoch.\n"
+        << "                            Adds fallback_spp_epochs= to the summary.\n"
+        << "  --no-rtcm-epoch-assembly   Treat every RTCM observation message as its own epoch (default: merge the\n"
+        << "                            per-constellation MSM messages of one epoch using the multiple-message bit)\n"
         << "  --no-base-interp           Require exact rover/base epoch alignment\n"
         << "  --base-hold-seconds <v>    Reuse the latest base epoch for up to v seconds (default: 0.5)\n"
         << "  --base-ecef <x> <y> <z>    Override base ECEF position\n"
@@ -599,6 +742,9 @@ void printUsage(const char* argv0) {
         << "  --min-ar-sats <n>          Minimum satellites for AR (default: 5)\n"
         << "  --min-hold-count <n>       Consecutive fixes before hold ambiguity is allowed (default: 5)\n"
         << "  --hold-ratio-threshold <v> Ratio threshold used while hold ambiguity is active (default: 2.0)\n"
+        << "  --hold-fix-unchanged-set   Reject the hold-fix fallback when a DD pair has no held integer (default: off)\n"
+        << "  --hold-fix-min-matched-pairs <n> Min held DD pairs for the hold-fix fallback (default: 4)\n"
+        << "  --min-fix-satellites <k>   Min non-reference satellites in an ambiguity-resolution FIX (default: 0 = off)\n"
         << "  --min-full-ratio-for-subset-ar <v> Min full-constellation LAMBDA ratio to accept a subset-AR fix (0=off)\n"
         << "  --max-pos-jump-min <m>     Floor of the motion-aware fixed-jump gate [m] (0=static gate)\n"
         << "  --max-pos-jump-rate <m/s>  Per-second growth of the fixed-jump gate; needed for a moving rover (0=off)\n"
@@ -609,6 +755,10 @@ void printUsage(const char* argv0) {
         << "  --no-glonass               Disable GLONASS carrier processing\n"
         << "  --no-beidou                Disable BeiDou carrier processing\n"
         << "  --glonass-ar <off|on|autocal>\n"
+        << "  --kinematic-post-filter    Causal output guard (default: off): once a FIX has been written, do not\n"
+        << "                            write an epoch whose height differs from the last written epoch by more\n"
+        << "                            than max(1 m, 4 m/s * dt); a dropped epoch does not move the anchor.\n"
+        << "                            Same rule as gnss_solve's kinematic post-filter (shared implementation)\n"
         << "  --quiet                    Suppress per-epoch prints\n"
         << "  --verbose                  Print per-epoch solve details\n"
         << "  -h, --help                 Show this help\n";
@@ -714,23 +864,50 @@ LiveConfig parseArguments(int argc, char** argv) {
             config.base_rtcm_path = argv[++i];
         } else if (arg == "--nav-rinex" && i + 1 < argc) {
             config.nav_rinex_path = argv[++i];
+        } else if (arg == "--ubx-nav") {
+            config.ubx_nav = true;
         } else if (arg == "--out" && i + 1 < argc) {
             config.output_pos_path = argv[++i];
         } else if (arg == "--format" && i + 1 < argc) {
             config.output_format = parseOutputFormat(argv[++i], argv[0]);
+        } else if (arg == "--pos-uncertainty") {
+            config.pos_uncertainty = true;
+        } else if (arg == "--pos-fix-diagnostics") {
+            config.pos_fix_diagnostics = true;
         } else if (arg == "--max-epochs" && i + 1 < argc) {
             config.max_epochs = std::stoi(argv[++i]);
         } else if (arg == "--rover-message-limit" && i + 1 < argc) {
             config.rover_message_limit = static_cast<size_t>(std::stoull(argv[++i]));
         } else if (arg == "--base-message-limit" && i + 1 < argc) {
             config.base_message_limit = static_cast<size_t>(std::stoull(argv[++i]));
+        } else if (arg == "--reconnect") {
+            config.reconnect = true;
+        } else if (arg == "--reconnect-delay-ms" && i + 1 < argc) {
+            config.reconnect_delay_ms = std::stoi(argv[++i]);
+        } else if (arg == "--reconnect-attempts" && i + 1 < argc) {
+            config.reconnect_attempts = std::stoi(argv[++i]);
+        } else if (arg == "--stall-timeout-ms" && i + 1 < argc) {
+            config.stall_timeout_ms = std::stoi(argv[++i]);
+        } else if (arg == "--base-outage-fallback" && i + 1 < argc) {
+            const std::string fallback = argv[++i];
+            if (fallback != "spp") {
+                argumentError("--base-outage-fallback accepts only 'spp'", argv[0]);
+            }
+            config.base_outage_fallback = true;
+        } else if (arg == "--no-rtcm-epoch-assembly") {
+            config.assemble_rtcm_epochs = false;
         } else if (arg == "--no-base-interp") {
             config.enable_base_interpolation = false;
         } else if (arg == "--base-hold-seconds" && i + 1 < argc) {
             config.base_hold_seconds = std::stod(argv[++i]);
         } else if (arg == "--base-ecef" && i + 3 < argc) {
-            config.base_position_ecef =
-                Eigen::Vector3d(std::stod(argv[++i]), std::stod(argv[++i]), std::stod(argv[++i]));
+            // Do not increment i multiple times in constructor arguments: C++
+            // does not guarantee their evaluation order, and MSVC builds read
+            // the supplied XYZ reversed.
+            const double base_x = std::stod(argv[++i]);
+            const double base_y = std::stod(argv[++i]);
+            const double base_z = std::stod(argv[++i]);
+            config.base_position_ecef = Eigen::Vector3d(base_x, base_y, base_z);
             config.base_position_override = true;
         } else if (arg == "--mode" && i + 1 < argc) {
             config.mode = parseModeChoice(argv[++i], argv[0]);
@@ -757,6 +934,12 @@ LiveConfig parseArguments(int argc, char** argv) {
         } else if (arg == "--hold-ratio-threshold" && i + 1 < argc) {
             config.hold_ratio_threshold = std::stod(argv[++i]);
             config.hold_ratio_threshold_set = true;
+        } else if (arg == "--hold-fix-unchanged-set") {
+            config.hold_fix_unchanged_set = true;
+        } else if (arg == "--hold-fix-min-matched-pairs" && i + 1 < argc) {
+            config.hold_fix_min_matched_pairs = std::stoi(argv[++i]);
+        } else if (arg == "--min-fix-satellites" && i + 1 < argc) {
+            config.min_fix_satellites = std::stoi(argv[++i]);
         } else if (arg == "--min-full-ratio-for-subset-ar" && i + 1 < argc) {
             config.min_full_ratio_for_subset_ar = std::stod(argv[++i]);
             config.min_full_ratio_for_subset_ar_set = true;
@@ -783,6 +966,8 @@ LiveConfig parseArguments(int argc, char** argv) {
             config.enable_beidou = false;
         } else if (arg == "--glonass-ar" && i + 1 < argc) {
             config.glonass_ar = parseGlonassARChoice(argv[++i], argv[0]);
+        } else if (arg == "--kinematic-post-filter") {
+            config.kinematic_post_filter = true;
         } else if (arg == "--quiet") {
             config.quiet = true;
         } else if (arg == "--verbose") {
@@ -802,6 +987,9 @@ LiveConfig parseArguments(int argc, char** argv) {
     if (config.base_rtcm_path.empty()) {
         argumentError("--base-rtcm is required", argv[0]);
     }
+    if (config.ubx_nav && !has_rover_ubx) {
+        argumentError("--ubx-nav requires --rover-ubx", argv[0]);
+    }
     if (config.max_epochs == 0) {
         argumentError("--max-epochs must be != 0", argv[0]);
     }
@@ -816,6 +1004,12 @@ LiveConfig parseArguments(int argc, char** argv) {
     }
     if (config.hold_ratio_threshold <= 0.0) {
         argumentError("--hold-ratio-threshold must be > 0", argv[0]);
+    }
+    if (config.hold_fix_min_matched_pairs < 4) {
+        argumentError("--hold-fix-min-matched-pairs must be >= 4", argv[0]);
+    }
+    if (config.min_fix_satellites < 0) {
+        argumentError("--min-fix-satellites must be >= 0", argv[0]);
     }
     if (config.max_position_jump_min_m < 0.0) {
         argumentError("--max-pos-jump-min must be >= 0", argv[0]);
@@ -835,8 +1029,25 @@ LiveConfig parseArguments(int argc, char** argv) {
     if (config.base_hold_seconds < 0.0) {
         argumentError("--base-hold-seconds must be >= 0", argv[0]);
     }
+    if (config.pos_uncertainty &&
+        config.output_format != libgnss::io::SolutionWriter::Format::POS) {
+        argumentError("--pos-uncertainty requires --format pos", argv[0]);
+    }
+    if (config.pos_fix_diagnostics &&
+        config.output_format != libgnss::io::SolutionWriter::Format::POS) {
+        argumentError("--pos-fix-diagnostics requires --format pos", argv[0]);
+    }
     if (config.rover_ubx_baud <= 0) {
         argumentError("--rover-ubx-baud must be > 0", argv[0]);
+    }
+    if (config.reconnect_delay_ms < 0) {
+        argumentError("--reconnect-delay-ms must be >= 0", argv[0]);
+    }
+    if (config.stall_timeout_ms < 0) {
+        argumentError("--stall-timeout-ms must be >= 0", argv[0]);
+    }
+    if (config.reconnect_attempts < 0) {
+        argumentError("--reconnect-attempts must be >= 0", argv[0]);
     }
     return config;
 }
@@ -859,12 +1070,30 @@ bool loadNavigationRinex(const std::string& path, libgnss::NavigationData& nav_d
     return true;
 }
 
-bool openSource(const std::string& path, size_t message_limit, SourceState& source) {
+bool openSource(const std::string& path, size_t message_limit, SourceState& source,
+                const LiveConfig& config) {
     source.messages_read = 0;
     source.message_limit = message_limit;
     source.eof = false;
     source.decoder.clear();
-    return source.reader.open(path);
+    source.assemble_epochs = config.assemble_rtcm_epochs;
+    source.input_ended = false;
+    source.assembler.clear();
+    source.ready_epochs.clear();
+    source.reconnect = false;
+    source.reconnect_attempts = 0;
+    if (!source.reader.open(path)) {
+        return false;
+    }
+    if (config.reconnect && (source.reader.isNtripSource() || source.reader.isTcpStream())) {
+        source.reader.setAutoReconnect(true, config.reconnect_delay_ms);
+        source.reconnect = true;
+        source.reconnect_attempts = config.reconnect_attempts;
+    }
+    if (config.stall_timeout_ms > 0) {
+        source.reader.setStallTimeoutMs(config.stall_timeout_ms);
+    }
+    return true;
 }
 
 std::string resolveSerialPath(const std::string& path) {
@@ -886,19 +1115,6 @@ std::string resolveSerialPath(const std::string& path) {
 }
 
 #ifndef _WIN32
-speed_t baudRateConstant(int baud) {
-    switch (baud) {
-        case 9600: return B9600;
-        case 19200: return B19200;
-        case 38400: return B38400;
-        case 57600: return B57600;
-        case 115200: return B115200;
-        case 230400: return B230400;
-        default:
-            throw std::invalid_argument("unsupported serial baud rate");
-    }
-}
-
 void configureSerialPort(int fd, int baud) {
     termios tio{};
     if (tcgetattr(fd, &tio) != 0) {
@@ -923,7 +1139,10 @@ bool openRoverUbxSource(const std::string& path, int baud, RoverUbxSource& sourc
     source.decoder.clear();
     source.bytes_read = 0;
     source.eof = false;
+    source.stalls = 0;
+    source.last_read_stalled = false;
     source.serial = false;
+    source.pending_observations.clear();
     source.file = std::ifstream();
 #ifndef _WIN32
     if (source.serial_fd >= 0) {
@@ -961,27 +1180,88 @@ bool openRoverUbxSource(const std::string& path, int baud, RoverUbxSource& sourc
 #endif
 }
 
+// deadline/timed_out are only meaningful for a source with a reader thread (--base-outage-fallback):
+// a queue that stays empty until the deadline returns false with *timed_out set, and the source
+// is NOT marked ended. A source without a pump reads (and blocks) exactly as before.
 bool readNextObservation(SourceState& source,
                          libgnss::ObservationData& obs,
-                         std::vector<libgnss::io::RTCMStreamDecoder::Event>& events) {
+                         std::vector<libgnss::io::RTCMStreamDecoder::Event>& events,
+                         const Deadline& deadline = std::nullopt,
+                         bool* timed_out = nullptr) {
     events.clear();
-    libgnss::io::RTCMMessage raw_message;
-    while (source.message_limit == 0 || source.messages_read < source.message_limit) {
-        if (!source.reader.readMessage(raw_message)) {
-            source.eof = true;
+    auto popReady = [&]() {
+        if (source.ready_epochs.empty()) {
             return false;
         }
+        obs = std::move(source.ready_epochs.front());
+        source.ready_epochs.pop_front();
+        return true;
+    };
+    if (popReady()) {
+        return true;
+    }
+    libgnss::io::RTCMMessage raw_message;
+    int local_failed_reads = 0;
+    int& failed_reads = source.pump ? source.pump_failed_reads : local_failed_reads;
+    while (!source.input_ended &&
+           (source.message_limit == 0 || source.messages_read < source.message_limit)) {
+        bool fetched = false;
+        if (source.pump) {
+            RtcmItem item;
+            const PopStatus status = source.pump->pop(item, deadline);
+            if (status == PopStatus::TIMEOUT) {
+                if (timed_out) {
+                    *timed_out = true;
+                }
+                return false;
+            }
+            if (status == PopStatus::CLOSED) {
+                break;
+            }
+            fetched = item.ok;
+            source.pump_last_stalled = item.stalled;
+            raw_message = std::move(item.message);
+        } else {
+            fetched = source.reader.readMessage(raw_message);
+        }
+        if (!fetched) {
+            // With --reconnect an empty read (NTRIP timeout, dropped link being re-established)
+            // is not the end of the stream; keep trying until the attempt budget runs out.
+            if (source.reconnect &&
+                (source.reconnect_attempts == 0 || ++failed_reads < source.reconnect_attempts)) {
+                continue;
+            }
+            break;
+        }
+        failed_reads = 0;
         ++source.messages_read;
         const auto frame = buildRtcmFrame(raw_message);
         std::vector<libgnss::io::RTCMStreamDecoder::Event> frame_events;
         source.decoder.pushFrame(frame.data(), frame.size(), frame_events);
         events.insert(events.end(), frame_events.begin(), frame_events.end());
         for (const auto& event : frame_events) {
-            if (event.has_observation) {
+            if (!event.has_observation) {
+                continue;
+            }
+            if (!source.assemble_epochs) {
                 obs = event.observation;
                 return true;
             }
+            for (auto& epoch : source.assembler.push(event.observation, event.observation_more_follows)) {
+                source.ready_epochs.push_back(std::move(epoch));
+            }
         }
+        if (popReady()) {
+            return true;
+        }
+    }
+    // End of stream: a pending (partially assembled) epoch must still be processed.
+    source.input_ended = true;
+    for (auto& epoch : source.assembler.flush()) {
+        source.ready_epochs.push_back(std::move(epoch));
+    }
+    if (popReady()) {
+        return true;
     }
     source.eof = true;
     return false;
@@ -991,12 +1271,42 @@ bool readNextUbxObservation(RoverUbxSource& source,
                             libgnss::ObservationData& obs,
                             std::vector<libgnss::io::UBXStreamDecoder::Event>& events) {
     events.clear();
+    source.last_read_stalled = false;
+    // Epochs an earlier chunk completed after the one already returned come first, before any
+    // further read (and so before eof or a stall is reported). Their chunk's events went out
+    // with the first epoch, so `events` stays empty here.
+    if (!source.pending_observations.empty()) {
+        obs = std::move(source.pending_observations.front());
+        source.pending_observations.pop_front();
+        return true;
+    }
     std::vector<uint8_t> chunk(4096);
 
     while (true) {
         size_t bytes_read = 0;
-        if (source.serial) {
+        if (source.pump) {
+            UbxChunk item;
+            if (source.pump->pop(item, std::nullopt) != PopStatus::ITEM || item.eof) {
+                if (item.stalled) {
+                    ++source.stalls;
+                    source.last_read_stalled = true;
+                }
+                source.eof = true;
+                return false;
+            }
+            chunk = std::move(item.data);
+            bytes_read = chunk.size();
+        } else if (source.serial) {
 #ifndef _WIN32
+            // Opt-in stall watchdog (same poll() wait as RTCMReader); a serial device cannot be
+            // reconnected, so a stall ends the rover source like EOF.
+            if (source.stall_timeout_ms > 0 &&
+                libgnss::io::waitForReadable(source.serial_fd, source.stall_timeout_ms) == 0) {
+                ++source.stalls;
+                source.last_read_stalled = true;
+                source.eof = true;
+                return false;
+            }
             const ssize_t count = ::read(source.serial_fd, chunk.data(), chunk.size());
             if (count < 0) {
                 if (errno == EINTR) {
@@ -1027,13 +1337,111 @@ bool readNextUbxObservation(RoverUbxSource& source,
         std::vector<libgnss::io::UBXStreamDecoder::Event> chunk_events;
         source.decoder.pushBytes(chunk.data(), bytes_read, chunk_events);
         events.insert(events.end(), chunk_events.begin(), chunk_events.end());
+        bool have_observation = false;
         for (const auto& event : chunk_events) {
-            if (event.has_observation) {
+            if (!event.has_observation) {
+                continue;
+            }
+            if (!have_observation) {
                 obs = event.observation;
-                return true;
+                have_observation = true;
+            } else {
+                source.pending_observations.push_back(event.observation);
             }
         }
+        if (have_observation) {
+            return true;
+        }
     }
+}
+
+// Start the reader thread of a live RTCM source (--base-outage-fallback only).
+void startRtcmPump(SourceState& source) {
+    source.reader.setAbortable(true);
+    source.pump = std::make_unique<BoundedPump<RtcmItem>>(kPumpQueueCapacity);
+    auto* pump = source.pump.get();
+    libgnss::io::RTCMReader* reader = &source.reader;
+    const bool keep_reading_after_failure = source.reconnect;
+    pump->start(
+        [pump, reader, keep_reading_after_failure] {
+            try {
+                while (!pump->stopRequested()) {
+                    RtcmItem item;
+                    item.ok = reader->readMessage(item.message);
+                    item.stalled = reader->lastReadStalled();
+                    if (pump->stopRequested()) {
+                        break;
+                    }
+                    const bool ok = item.ok;
+                    if (!pump->push(std::move(item))) {
+                        break;
+                    }
+                    if (!ok && !keep_reading_after_failure) {
+                        break;
+                    }
+                }
+            } catch (...) {
+                RtcmItem failed;
+                pump->push(std::move(failed));
+            }
+            pump->closeProducer();
+        },
+        [reader] { reader->requestAbort(); });
+}
+
+#ifndef _WIN32
+// Start the reader thread of a serial rover UBX device (--base-outage-fallback only).
+void startUbxPump(RoverUbxSource& source) {
+    source.pump = std::make_unique<BoundedPump<UbxChunk>>(kPumpQueueCapacity);
+    auto* pump = source.pump.get();
+    const int fd = source.serial_fd;
+    const int stall_timeout_ms = source.stall_timeout_ms;
+    pump->start(
+        [pump, fd, stall_timeout_ms] {
+            std::vector<uint8_t> buffer(4096);
+            auto last_data = SteadyClock::now();
+            while (!pump->stopRequested()) {
+                if (libgnss::io::waitForReadable(fd, kPumpPollSliceMs) == 0) {
+                    if (stall_timeout_ms > 0 &&
+                        SteadyClock::now() - last_data >= std::chrono::milliseconds(stall_timeout_ms)) {
+                        UbxChunk stalled;
+                        stalled.eof = true;
+                        stalled.stalled = true;
+                        pump->push(std::move(stalled));
+                        break;
+                    }
+                    continue;
+                }
+                const ssize_t count = ::read(fd, buffer.data(), buffer.size());
+                if (count < 0 && errno == EINTR) {
+                    continue;
+                }
+                UbxChunk chunk;
+                if (count <= 0) {
+                    chunk.eof = true;
+                    pump->push(std::move(chunk));
+                    break;
+                }
+                chunk.data.assign(buffer.begin(), buffer.begin() + count);
+                last_data = SteadyClock::now();
+                if (!pump->push(std::move(chunk))) {
+                    break;
+                }
+            }
+            pump->closeProducer();
+        },
+        {});
+}
+#endif
+
+// The SPP configuration the RTK processor uses for its own seed (rtk_internal::makeRTKSppConfig).
+libgnss::SPPProcessor::SPPConfig makeFallbackSppConfig(const LiveConfig& config) {
+    libgnss::SPPProcessor::SPPConfig spp_config;
+    spp_config.use_multi_constellation = true;
+    spp_config.enable_glonass = config.enable_glonass;
+    spp_config.enable_beidou = config.enable_beidou;
+    spp_config.max_position_sigma_m = 1000.0;
+    return spp_config;
 }
 
 DecoderSummaryStats summarizeRtcmSource(const SourceState& source) {
@@ -1067,7 +1475,7 @@ int main(int argc, char** argv) {
         RoverUbxSource rover_ubx_source;
         SourceState base_source;
         if (rover_input_kind == RoverInputKind::RTCM) {
-            if (!openSource(config.rover_rtcm_path, config.rover_message_limit, rover_rtcm_source)) {
+            if (!openSource(config.rover_rtcm_path, config.rover_message_limit, rover_rtcm_source, config)) {
                 std::cerr << "Error: failed to open rover RTCM source: "
                           << config.rover_rtcm_path << "\n";
                 return 1;
@@ -1078,18 +1486,31 @@ int main(int argc, char** argv) {
                           << config.rover_ubx_path << "\n";
                 return 1;
             }
+            rover_ubx_source.stall_timeout_ms = config.stall_timeout_ms;
         }
-        if (!openSource(config.base_rtcm_path, config.base_message_limit, base_source)) {
+        if (!openSource(config.base_rtcm_path, config.base_message_limit, base_source, config)) {
             std::cerr << "Error: failed to open base RTCM source: "
                       << config.base_rtcm_path << "\n";
             return 1;
         }
 
         libgnss::NavigationData nav_data;
+        // A live run is open-ended: cap the per-(satellite, time) memo so epochs that never see a
+        // new ephemeris (navigation RINEX, or a quiet caster) cannot grow it without bound.
+        nav_data.setSatelliteStateCacheLimit(kSatelliteStateCacheLimit);
         if (!loadNavigationRinex(config.nav_rinex_path, nav_data)) {
             std::cerr << "Error: failed to read navigation RINEX: "
                       << config.nav_rinex_path << "\n";
             return 1;
+        }
+
+        // Seed the RTCM decoders' GPST reference from the navigation RINEX (latest GPS toe) so that
+        // TOW-only parts get their week and GLONASS epochs are dated from the data, not the host clock.
+        if (const auto seed = libgnss::io::RTCMStreamDecoder::referenceFromNavigation(nav_data)) {
+            base_source.decoder.setReferenceTime(*seed);
+            if (rover_input_kind == RoverInputKind::RTCM) {
+                rover_rtcm_source.decoder.setReferenceTime(*seed);
+            }
         }
 
         libgnss::RTKProcessor rtk;
@@ -1105,6 +1526,9 @@ int main(int argc, char** argv) {
         rtk_config.ar_filter_margin = config.ar_filter_margin;
         rtk_config.min_satellites_for_ar = config.min_satellites_for_ar;
         rtk_config.min_hold_count = config.min_hold_count;
+        rtk_config.hold_fix_unchanged_set_only = config.hold_fix_unchanged_set;
+        rtk_config.hold_fix_min_matched_pairs = config.hold_fix_min_matched_pairs;
+        rtk_config.min_fix_satellites = config.min_fix_satellites;
         rtk_config.min_full_ratio_for_subset_ar = config.min_full_ratio_for_subset_ar;
         rtk_config.max_position_jump_min_m = config.max_position_jump_min_m;
         rtk_config.max_position_jump_rate_mps = config.max_position_jump_rate_mps;
@@ -1132,7 +1556,8 @@ int main(int argc, char** argv) {
         }
 
         libgnss::io::SolutionWriter writer;
-        if (!writer.open(config.output_pos_path, config.output_format)) {
+        if (!writer.open(config.output_pos_path, config.output_format, config.pos_uncertainty,
+                         config.pos_fix_diagnostics)) {
             std::cerr << "Error: failed to open output file\n";
             return 1;
         }
@@ -1143,10 +1568,104 @@ int main(int argc, char** argv) {
         std::vector<libgnss::io::RTCMStreamDecoder::Event> base_events;
         std::vector<libgnss::io::UBXStreamDecoder::Event> rover_ubx_events;
 
-        bool rover_ok = rover_input_kind == RoverInputKind::RTCM
-            ? readNextObservation(rover_rtcm_source, rover_obs, rover_events)
-            : readNextUbxObservation(rover_ubx_source, rover_obs, rover_ubx_events);
+        // --ubx-nav: ephemerides and the Klobuchar set decoded from the rover's UBX-RXM-SFRBX. The
+        // decoder's GPST reference is the newest RAWX epoch; events are applied in stream order.
+        libgnss::io::UBXNavDecoder ubx_nav_decoder;
+        libgnss::io::UBXNavAcceptConfirm ubx_nav_merge;
+        std::vector<libgnss::Ephemeris> ubx_nav_new;
+        std::vector<libgnss::io::UBXNavDecoded> ubx_nav_copies;
+        auto applyUbxNavEvents = [&](const std::vector<libgnss::io::UBXStreamDecoder::Event>& events) {
+            if (!config.ubx_nav) {
+                return;
+            }
+            for (const auto& event : events) {
+                if (event.has_observation) {
+                    ubx_nav_decoder.setReferenceTime(event.observation.time);
+                }
+                if (event.has_sfrbx) {
+                    ubx_nav_new.clear();
+                    ubx_nav_copies.clear();
+                    ubx_nav_decoder.pushSfrbx(event.sfrbx, ubx_nav_new, &ubx_nav_copies);
+                    for (const auto& copy : ubx_nav_copies) {
+                        // Accept, then confirm (D4): the first copy of a record is merged at once
+                        // (after the health rule) unless the satellite already holds a valid record
+                        // of ours, in which case a new issue waits for a second copy; a differing
+                        // second copy takes a merged record back out and the satellite waits for two
+                        // equal copies (confirm-twice) before anything is merged for it again; a
+                        // confirmation removes the satellite's unconfirmed records of other issues.
+                        ubx_nav_merge.push(copy, nav_data);
+                    }
+                }
+            }
+            if (!nav_data.ionosphere_model.valid && ubx_nav_decoder.hasKlobuchar()) {
+                nav_data.ionosphere_model = ubx_nav_decoder.klobuchar();
+            }
+        };
+        auto readRoverUbx = [&](libgnss::ObservationData& obs) {
+            const bool ok = readNextUbxObservation(rover_ubx_source, obs, rover_ubx_events);
+            applyUbxNavEvents(rover_ubx_events);
+            return ok;
+        };
+
+        // When one RTCM decoder obtains a GPST reference (ephemerides) and the other has none (the rover
+        // stream usually carries no ephemerides), the other is seeded with it.
+        auto shareReferences = [&]() {
+            if (rover_input_kind != RoverInputKind::RTCM) {
+                return;
+            }
+            const auto rover_ref = rover_rtcm_source.decoder.referenceTime();
+            const auto base_ref = base_source.decoder.referenceTime();
+            if (base_ref && !rover_ref) {
+                rover_rtcm_source.decoder.setReferenceTime(*base_ref);
+            } else if (rover_ref && !base_ref) {
+                base_source.decoder.setReferenceTime(*rover_ref);
+            }
+        };
+        // --base-outage-fallback: each live (tcp/ntrip/serial) source gets a reader thread so that
+        // the rover keeps being read while the base is silent. File sources and the default
+        // (flag off) path read inline and create no thread.
+        const bool fallback_enabled = config.base_outage_fallback;
+        if (fallback_enabled) {
+            if (base_source.reader.isLiveStream()) {
+                startRtcmPump(base_source);
+            }
+            if (rover_input_kind == RoverInputKind::RTCM) {
+                if (rover_rtcm_source.reader.isLiveStream()) {
+                    startRtcmPump(rover_rtcm_source);
+                }
+            }
+#ifndef _WIN32
+            else if (rover_ubx_source.serial) {
+                startUbxPump(rover_ubx_source);
+            }
+#endif
+        }
+        const bool base_threaded = base_source.pump != nullptr;
+        libgnss::SPPProcessor fallback_spp(makeFallbackSppConfig(config));
+
+        // --ubx-nav: a base stream without ephemerides (and no --nav-rinex) gives its decoder no GPST
+        // reference, so its TOW-only epochs would be dated from the host clock and never align with the
+        // rover. The rover's RAWX time is that reference: read the first rover epoch before the base.
+        bool rover_read_first = false;
+        bool rover_ok = false;
+        if (config.ubx_nav && rover_input_kind == RoverInputKind::UBX &&
+            !base_source.decoder.referenceTime()) {
+            rover_ok = readRoverUbx(rover_obs);
+            rover_read_first = true;
+            if (rover_ok && rover_obs.time.week > 0) {
+                base_source.decoder.setReferenceTime(rover_obs.time);
+            }
+        }
+
+        // The base is read first so that its ephemeris burst can seed the rover decoder before the
+        // rover's first epoch is decoded.
         bool base_ok = readNextObservation(base_source, base_obs, base_events);
+        shareReferences();
+        if (!rover_read_first) {
+            rover_ok = rover_input_kind == RoverInputKind::RTCM
+                ? readNextObservation(rover_rtcm_source, rover_obs, rover_events)
+                : readRoverUbx(rover_obs);
+        }
         const bool initial_rover_observation_ok = rover_ok;
         const bool initial_base_observation_ok = base_ok;
 
@@ -1155,8 +1674,11 @@ int main(int argc, char** argv) {
         size_t interpolated_base_epochs = 0;
         size_t held_base_epochs = 0;
         size_t skipped_rover_epochs = 0;
+        size_t fallback_spp_epochs = 0;
         size_t written_solutions = 0;
         size_t fixed_solutions = 0;
+        size_t post_filter_dropped_epochs = 0;
+        libgnss::rtk_validation::KinematicPostFilter kinematic_post_filter;
         size_t nav_event_updates = 0;
         size_t station_position_updates = 0;
         Eigen::Vector3d rover_seed = Eigen::Vector3d::Zero();
@@ -1171,7 +1693,7 @@ int main(int argc, char** argv) {
         auto applyEvents = [&](const std::vector<libgnss::io::RTCMStreamDecoder::Event>& events) {
             for (const auto& event : events) {
                 if (event.has_navigation) {
-                    mergeNavigationData(nav_data, event.navigation);
+                    mergeNavigationDataIfNew(nav_data, event.navigation);
                     ++nav_event_updates;
                 }
                 if (event.has_station_position && !config.base_position_override) {
@@ -1181,15 +1703,65 @@ int main(int argc, char** argv) {
                     ++station_position_updates;
                 }
             }
+            shareReferences();
         };
+        // A week-0 (TOW-only) epoch gets the week nearest to the newest decoder reference; the
+        // oldest-ephemeris week is only the fallback when no decoder has a reference (UBX rover
+        // without a base reference).
         auto normalizeObservationWeek = [&](libgnss::ObservationData& obs) {
             if (obs.time.week != 0) {
+                return;
+            }
+            std::optional<libgnss::GNSSTime> newest = base_source.decoder.referenceTime();
+            if (rover_input_kind == RoverInputKind::RTCM) {
+                const auto rover_ref = rover_rtcm_source.decoder.referenceTime();
+                if (rover_ref && (!newest || *rover_ref - *newest > 0.0)) {
+                    newest = rover_ref;
+                }
+            }
+            if (newest) {
+                obs.time = libgnss::io::RTCMStreamDecoder::resolveTowOnlyTime(obs.time, *newest);
                 return;
             }
             const int week = inferObservationWeekContext(nav_data);
             if (week > 0) {
                 obs.time.week = week;
             }
+        };
+
+        // Base silence clock for --base-outage-fallback (threaded base only): wall time of the newest
+        // base epoch taken from the source, and the base epoch spacing (data time). A rover epoch is
+        // baseless once max(1 s, base hold + base interval) of wall time passed with no newer base epoch.
+        bool base_waiting = false;  // the last base read timed out (source silent, not ended)
+        auto last_base_obs_wall = SteadyClock::now();
+        double base_interval_s = 1.0;
+        bool base_interval_measured = false;
+        bool have_prev_base_time = false;
+        libgnss::GNSSTime prev_base_time;
+        auto noteBaseEpoch = [&](const libgnss::ObservationData& epoch) {
+            if (!base_threaded) {
+                return;
+            }
+            last_base_obs_wall = SteadyClock::now();
+            if (have_prev_base_time) {
+                const double dt = timeDiffSeconds(epoch.time, prev_base_time);
+                // The first spacing sets the interval; later ones count only while within 2x of it
+                // (a gap after an outage must not stretch the timeout).
+                if (dt > 1e-3 && dt <= 60.0 && (!base_interval_measured || dt <= 2.0 * base_interval_s)) {
+                    base_interval_s = dt;
+                    base_interval_measured = true;
+                }
+            }
+            prev_base_time = epoch.time;
+            have_prev_base_time = true;
+        };
+        auto baseDeadline = [&]() -> Deadline {
+            if (!base_threaded) {
+                return std::nullopt;
+            }
+            const double timeout_s = std::max(1.0, config.base_hold_seconds + base_interval_s);
+            return last_base_obs_wall + std::chrono::duration_cast<SteadyClock::duration>(
+                                            std::chrono::duration<double>(timeout_s));
         };
 
         if (rover_ok && rover_input_kind == RoverInputKind::RTCM) {
@@ -1203,9 +1775,25 @@ int main(int argc, char** argv) {
         }
         if (base_ok) {
             normalizeObservationWeek(base_obs);
+            noteBaseEpoch(base_obs);
         }
 
-        while (rover_ok && base_ok && (config.max_epochs < 0 || solved_epochs < config.max_epochs)) {
+        while (rover_ok && (base_ok || base_waiting) &&
+               (config.max_epochs < 0 || solved_epochs < config.max_epochs)) {
+            if (base_waiting) {
+                // The previous base read timed out: look again (blocking only until the silence deadline).
+                bool timed_out = false;
+                base_ok = readNextObservation(base_source, base_obs, base_events, baseDeadline(), &timed_out);
+                if (base_ok) {
+                    applyEvents(base_events);
+                    normalizeObservationWeek(base_obs);
+                    noteBaseEpoch(base_obs);
+                    base_waiting = false;
+                } else if (!timed_out) {
+                    base_waiting = false;  // the base source ended
+                    break;
+                }
+            }
             if (rover_obs.receiver_position.norm() == 0.0) {
                 rover_obs.receiver_position = rover_seed.norm() > 0.0
                     ? rover_seed
@@ -1222,10 +1810,14 @@ int main(int argc, char** argv) {
                 have_lower_base = true;
                 previous_base_obs = base_obs;
                 has_previous_base = true;
-                base_ok = readNextObservation(base_source, base_obs, base_events);
+                bool base_timed_out = false;
+                base_ok = readNextObservation(base_source, base_obs, base_events, baseDeadline(), &base_timed_out);
                 if (base_ok) {
                     applyEvents(base_events);
                     normalizeObservationWeek(base_obs);
+                    noteBaseEpoch(base_obs);
+                } else if (base_timed_out) {
+                    base_waiting = true;
                 }
             }
 
@@ -1233,6 +1825,9 @@ int main(int argc, char** argv) {
             const double exact_dt = base_ok ? std::abs(timeDiffSeconds(base_obs.time, rover_obs.time))
                                             : std::numeric_limits<double>::infinity();
             bool have_aligned_base = false;
+            // Age of differential for --pos-uncertainty: rover time minus the
+            // (older) base observation time actually used.
+            double epoch_differential_age_s = std::numeric_limits<double>::quiet_NaN();
             const double lower_dt = have_lower_base
                 ? timeDiffSeconds(rover_obs.time, lower_base_obs.time)
                 : -std::numeric_limits<double>::infinity();
@@ -1247,6 +1842,7 @@ int main(int argc, char** argv) {
             if (base_ok && exact_dt <= kExactTimeToleranceSeconds) {
                 aligned_base_obs = base_obs;
                 have_aligned_base = true;
+                epoch_differential_age_s = timeDiffSeconds(rover_obs.time, base_obs.time);
                 ++exact_base_epochs;
             } else if (config.enable_base_interpolation && base_ok && have_lower_base &&
                        have_base_position &&
@@ -1261,6 +1857,7 @@ int main(int argc, char** argv) {
                 }
                 if (interpolation_ok) {
                     have_aligned_base = true;
+                    epoch_differential_age_s = lower_dt;
                     ++interpolated_base_epochs;
                 }
             } else if (have_lower_base && have_base_position && config.base_hold_seconds > 0.0) {
@@ -1268,6 +1865,7 @@ int main(int argc, char** argv) {
                 hold_ok = holdBaseEpoch(lower_base_obs, rover_obs.time, config.base_hold_seconds, aligned_base_obs);
                 if (hold_ok) {
                     have_aligned_base = true;
+                    epoch_differential_age_s = lower_dt;
                     ++held_base_epochs;
                 }
             }
@@ -1296,9 +1894,30 @@ int main(int argc, char** argv) {
                               << "\n";
                 }
                 ++skipped_rover_epochs;
+                if (fallback_enabled) {
+                    // No usable base for this rover epoch: a single-point solution, never FLOAT/FIXED.
+                    // The RTK processor, the output guards and the rover seed are not touched.
+                    const auto spp_solution = fallback_spp.processEpoch(rover_obs, nav_data);
+                    if (spp_solution.status == libgnss::SolutionStatus::SPP && spp_solution.isValid()) {
+                        writer.writeEpoch(spp_solution, std::numeric_limits<double>::quiet_NaN());
+                        ++written_solutions;
+                        ++solved_epochs;
+                        ++fallback_spp_epochs;
+                        if (config.verbose && !config.quiet) {
+                            std::cout << "fallback tow=" << std::fixed << std::setprecision(3)
+                                      << spp_solution.time.tow << " status="
+                                      << static_cast<int>(spp_solution.status)
+                                      << " sats=" << spp_solution.num_satellites << "\n";
+                        }
+                        if (config.max_epochs >= 0 && solved_epochs >= config.max_epochs) {
+                            termination_reason = "max_epochs_reached";
+                            break;
+                        }
+                    }
+                }
                 rover_ok = rover_input_kind == RoverInputKind::RTCM
                     ? readNextObservation(rover_rtcm_source, rover_obs, rover_events)
-                    : readNextUbxObservation(rover_ubx_source, rover_obs, rover_ubx_events);
+                    : readRoverUbx(rover_obs);
                 if (rover_ok && rover_input_kind == RoverInputKind::RTCM) {
                     applyEvents(rover_events);
                     normalizeObservationWeek(rover_obs);
@@ -1317,7 +1936,7 @@ int main(int argc, char** argv) {
             if (!have_base_position || nav_data.ephemeris_data.empty()) {
                 rover_ok = rover_input_kind == RoverInputKind::RTCM
                     ? readNextObservation(rover_rtcm_source, rover_obs, rover_events)
-                    : readNextUbxObservation(rover_ubx_source, rover_obs, rover_ubx_events);
+                    : readRoverUbx(rover_obs);
                 if (rover_ok && rover_input_kind == RoverInputKind::RTCM) {
                     applyEvents(rover_events);
                     normalizeObservationWeek(rover_obs);
@@ -1328,8 +1947,17 @@ int main(int argc, char** argv) {
             }
 
             const auto solution = rtk.processRTKEpoch(rover_obs, aligned_base_obs, nav_data);
-            if (solution.isValid()) {
-                writer.writeEpoch(solution);
+            bool write_epoch = solution.isValid();
+            if (write_epoch && config.kinematic_post_filter) {
+                if (kinematic_post_filter.exceedsHeightStep(solution)) {
+                    write_epoch = false;
+                    ++post_filter_dropped_epochs;
+                } else {
+                    kinematic_post_filter.accept(solution);
+                }
+            }
+            if (write_epoch) {
+                writer.writeEpoch(solution, epoch_differential_age_s);
                 ++written_solutions;
                 ++solved_epochs;
                 if (solution.isFixed()) {
@@ -1351,7 +1979,7 @@ int main(int argc, char** argv) {
 
             rover_ok = rover_input_kind == RoverInputKind::RTCM
                 ? readNextObservation(rover_rtcm_source, rover_obs, rover_events)
-                : readNextUbxObservation(rover_ubx_source, rover_obs, rover_ubx_events);
+                : readRoverUbx(rover_obs);
             if (rover_ok && rover_input_kind == RoverInputKind::RTCM) {
                 applyEvents(rover_events);
                 normalizeObservationWeek(rover_obs);
@@ -1360,8 +1988,28 @@ int main(int argc, char** argv) {
             }
         }
 
+        // Stop and join the reader threads (EOF, stall, max-epochs or an ended source): a blocked
+        // read is aborted by RTCMReader::requestAbort() / the pump's stop flag, never left detached.
+        if (base_source.pump) {
+            base_source.pump->stop();
+        }
+        if (rover_rtcm_source.pump) {
+            rover_rtcm_source.pump->stop();
+        }
+        if (rover_ubx_source.pump) {
+            rover_ubx_source.pump->stop();
+        }
+
+        const bool rover_stalled = !rover_ok && (rover_input_kind == RoverInputKind::RTCM
+            ? sourceLastReadStalled(rover_rtcm_source)
+            : rover_ubx_source.last_read_stalled);
+        const bool base_stalled = !base_ok && !base_waiting && sourceLastReadStalled(base_source);
         if (termination_reason == "running") {
-            if (!initial_rover_observation_ok) {
+            if (rover_stalled) {
+                termination_reason = "rover_source_stalled";
+            } else if (base_stalled) {
+                termination_reason = "base_source_stalled";
+            } else if (!initial_rover_observation_ok) {
                 termination_reason = "no_initial_rover_observation";
             } else if (!initial_base_observation_ok) {
                 termination_reason = "no_initial_base_observation";
@@ -1377,6 +2025,20 @@ int main(int argc, char** argv) {
                 termination_reason = "completed";
             }
         }
+
+        // Snapshot decoder statistics before the readers are closed: RTCMReader::close()
+        // resets its counters, which used to make every *_decoder_errors read 0.
+        const DecoderSummaryStats rover_stats =
+            rover_input_kind == RoverInputKind::RTCM
+                ? summarizeRtcmSource(rover_rtcm_source)
+                : summarizeUbxSource(rover_ubx_source);
+        const DecoderSummaryStats base_stats = summarizeRtcmSource(base_source);
+        const int rover_reconnects = rover_rtcm_source.reader.reconnectCount();
+        const int base_reconnects = base_source.reader.reconnectCount();
+        const int rover_stalls = rover_input_kind == RoverInputKind::RTCM
+            ? rover_rtcm_source.reader.stallCount()
+            : rover_ubx_source.stalls;
+        const int base_stalls = base_source.reader.stallCount();
 
         writer.close();
         if (rover_input_kind == RoverInputKind::RTCM) {
@@ -1394,11 +2056,6 @@ int main(int argc, char** argv) {
         }
         base_source.reader.close();
 
-        const DecoderSummaryStats rover_stats =
-            rover_input_kind == RoverInputKind::RTCM
-                ? summarizeRtcmSource(rover_rtcm_source)
-                : summarizeUbxSource(rover_ubx_source);
-        const DecoderSummaryStats base_stats = summarizeRtcmSource(base_source);
         const std::string rover_source_label =
             rover_input_kind == RoverInputKind::RTCM ? "rtcm" : "ubx";
         const auto wall_time_end = std::chrono::steady_clock::now();
@@ -1438,8 +2095,31 @@ int main(int argc, char** argv) {
                   << " realtime_factor=" << realtime_factor
                   << " effective_epoch_rate_hz=" << effective_epoch_rate_hz
                   << " out=" << config.output_pos_path
-                  << " format=" << outputFormatString(config.output_format)
-                  << "\n";
+                  << " format=" << outputFormatString(config.output_format);
+        if (config.kinematic_post_filter) {
+            std::cout << " post_filter_dropped_epochs=" << post_filter_dropped_epochs;
+        }
+        if (config.reconnect) {
+            std::cout << " rover_reconnects=" << rover_reconnects
+                      << " base_reconnects=" << base_reconnects;
+        }
+        if (config.stall_timeout_ms > 0) {
+            std::cout << " rover_stalls=" << rover_stalls
+                      << " base_stalls=" << base_stalls;
+        }
+        if (config.base_outage_fallback) {
+            std::cout << " fallback_spp_epochs=" << fallback_spp_epochs;
+        }
+        if (config.ubx_nav) {
+            std::cout << " ubx_nav_ephemerides=" << ubx_nav_merge.merged()
+                      << " ubx_nav_klobuchar=" << (ubx_nav_decoder.hasKlobuchar() ? 1 : 0)
+                      << " ubx_nav_unhealthy_skipped=" << ubx_nav_merge.unhealthySkipped()
+                      << " ubx_nav_unconfirmed=" << ubx_nav_merge.unconfirmed()
+                      << " ubx_nav_conflicts=" << ubx_nav_merge.conflicts()
+                      << " ubx_nav_retracted=" << ubx_nav_merge.retracted()
+                      << " ubx_nav_held_new_issue=" << ubx_nav_merge.heldNewIssue();
+        }
+        std::cout << "\n";
         return written_solutions > 0 ? 0 : 1;
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << "\n";

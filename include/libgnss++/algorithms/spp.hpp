@@ -1,5 +1,6 @@
 #pragma once
 
+#include "barometer_height.hpp"
 #include "../core/processor.hpp"
 #include "../core/observation.hpp"
 #include "../core/navigation.hpp"
@@ -43,6 +44,12 @@ public:
         double raim_fde_min_rms_improvement_ratio = 0.25; ///< Minimum fractional RMS improvement
         double raim_fde_min_rms_improvement_m = 1.0;  ///< Minimum absolute RMS improvement [m]
         double max_gdop = 50.0;                       ///< Reject solutions above this GDOP (<=0 disables)
+        /// Reject solutions whose own formal position sigma, sqrt(trace(position_covariance)),
+        /// exceeds this [m] (<=0 disables). Unlike the GDOP gate this uses the design matrix
+        /// that was actually solved, i.e. including the inter-system-bias columns, so a
+        /// zero-redundancy multi-GNSS fix whose extra system only contributes one or two
+        /// satellites (reported GDOP ~5, formal sigma ~26 km) is caught.
+        double max_position_sigma_m = 0.0;
         double max_residual_rms = 0.0;                ///< Reject solutions above this RMS [m] (<=0 disables)
         double max_chi_square_per_dof = 0.0;          ///< Reject solutions above reduced chi-square (<=0 disables)
         bool use_variance_model = true;               ///< Use explicit code/elevation/SNR/atmosphere variance
@@ -80,6 +87,33 @@ public:
         bool model_intersystem_bias = true;           ///< Model inter-system clock biases
         bool enable_beidou = true;                    ///< Enable BeiDou SPP support
         bool enable_glonass = true;                   ///< Enable GLONASS SPP support
+
+        /// Barometer-aided height (default OFF: the solver path is then
+        /// bit-identical to the pre-barometer implementation).
+        barometer::BaroHeightConfig baro;
+    };
+
+    /**
+     * @brief Per-epoch barometer-fusion telemetry (valid after processEpoch).
+     */
+    struct BaroEpochDiagnostics {
+        bool baro_available = false;         ///< a fresh causal pressure height existed
+        bool filter_initialized = false;
+        bool initialized_this_epoch = false;
+        bool geometry_good = false;          ///< unconstrained fix passed the geometry gate
+        bool baro_update_accepted = false;
+        bool gnss_update_accepted = false;
+        bool constraint_applied = false;     ///< height row used in the final solve
+        int sample_count = 0;
+        int rebase_count = 0;
+        double baro_height_m = 0.0;          ///< windowed standard-atmosphere height
+        double prior_height_m = 0.0;         ///< KF height before this epoch's GNSS update
+        double prior_sigma_m = 0.0;
+        double bias_m = 0.0;                 ///< KF baro bias after the epoch
+        double bias_sigma_m = 0.0;
+        double unconstrained_height_m = 0.0; ///< SPP height without the constraint
+        double unconstrained_sigma_m = 0.0;  ///< inflated vertical sigma fed to the KF
+        double final_height_m = 0.0;
     };
 
     /**
@@ -99,6 +133,19 @@ public:
         // the GPS clock, while the MRTKLIB IFLC compatibility path preserves
         // a QZSS-specific column.
         GNSSSystem clock_group = GNSSSystem::UNKNOWN;
+        // Raw observables of the source row and the satellite motion, for
+        // external solvers that time-difference carrier phase or use Doppler.
+        double snr = 0.0;                        ///< Signal-to-noise ratio [dB-Hz]
+        double carrier_phase =                   ///< Carrier phase [cycles], NaN if absent
+            std::numeric_limits<double>::quiet_NaN();
+        double doppler =                         ///< Doppler [Hz], NaN if absent
+            std::numeric_limits<double>::quiet_NaN();
+        std::array<double, 3> satellite_velocity{};  ///< Satellite ECEF velocity [m/s], same frame as satellite_ecef
+        double satellite_clock_drift = 0.0;      ///< Satellite clock drift [s/s]
+        double carrier_frequency_hz = 0.0;       ///< Frequency of the raw source carrier, not the IF combination
+        std::uint8_t loss_of_lock_indicator = 0; ///< Source RINEX LLI bits; diagnostic only
+        bool source_loss_of_lock = false;        ///< Source discontinuity flag; diagnostic only
+        std::string carrier_observation_type;    ///< Source tracking identity, e.g. L1C
     };
 
     /**
@@ -192,6 +239,13 @@ public:
         ssr_products_loaded_ = !ssr_products_.orbit_clock_corrections.empty();
     }
 
+    /// Feed one barometer sample (GPST).  Only samples with time <= the
+    /// epoch being solved are ever used (causal).
+    void addBarometerSample(const GNSSTime& time, double pressure_hpa) {
+        baro_samples_.add(time, pressure_hpa);
+    }
+    const BaroEpochDiagnostics& lastBaroDiagnostics() const { return last_baro_diagnostics_; }
+
     bool hasLoadedPreciseProducts() const { return precise_products_loaded_; }
     bool hasLoadedIONEXProducts() const { return ionex_products_loaded_; }
     bool hasLoadedDCBProducts() const { return dcb_products_loaded_; }
@@ -228,8 +282,20 @@ private:
     bool ionex_products_loaded_ = false;
     bool dcb_products_loaded_ = false;
     
+    // Barometer fusion (inactive unless spp_config_.baro.enabled).
+    barometer::BarometerSampleBuffer baro_samples_;
+    barometer::BarometerHeightFilter baro_filter_;
+    BaroEpochDiagnostics last_baro_diagnostics_;
+    bool baro_prior_active_ = false;        ///< transient: add the height row to the LS
+    double baro_prior_height_m_ = 0.0;
+    double baro_prior_sigma_m_ = 1.0;
+
     // State variables
     Vector3d estimated_position_;           ///< Current position estimate (ECEF)
+    /// True while estimated_position_ is only the crude initializePosition()
+    /// linearization point that no solve has confirmed.  The next solve then
+    /// re-seeds and runs as a cold start instead of re-using it (lockout).
+    bool position_is_cold_start_seed_ = false;
     double receiver_clock_bias_;            ///< Receiver clock bias in seconds
     std::map<GNSSSystem, double> system_biases_; ///< Inter-system clock biases
     bool has_last_valid_position_ = false;
@@ -275,6 +341,13 @@ private:
                                  const GNSSTime& time);
 
     /**
+     * @brief Barometer-aided solve: unconstrained fix, causal KF, constrained re-solve
+     */
+    PositionSolution solvePositionBaroAided(const std::vector<SPPObservation>& valid_obs,
+                                            const NavigationData& nav,
+                                            const GNSSTime& time);
+
+    /**
      * @brief Native weighted least-squares solver with atmospheric corrections
      */
     PositionSolution solvePositionLS(const std::vector<SPPObservation>& valid_obs,
@@ -295,20 +368,6 @@ private:
      */
     MatrixXd calculateGeometryMatrix(const Vector3d& receiver_pos,
                                    const std::vector<Vector3d>& satellite_positions) const;
-    
-    /**
-     * @brief Calculate weight matrix based on elevation angles
-     */
-    MatrixXd calculateWeightMatrix(const std::vector<double>& elevations,
-                                 const std::vector<double>& snr_values) const;
-    
-    /**
-     * @brief Apply atmospheric corrections to observations
-     */
-    void applyAtmosphericCorrections(std::vector<Observation>& observations,
-                                   const NavigationData& nav,
-                                   const Vector3d& receiver_pos,
-                                   const GNSSTime& time) const;
     
     /**
      * @brief Detect and remove outlier observations
@@ -357,25 +416,6 @@ private:
         const GNSSTime& time) const;
     
     /**
-     * @brief Apply relativistic corrections
-     */
-    double calculateRelativisticCorrection(const Vector3d& satellite_pos,
-                                         const Vector3d& satellite_vel) const;
-    
-    /**
-     * @brief Calculate Earth rotation correction
-     */
-    Vector3d applyEarthRotationCorrection(const Vector3d& satellite_pos,
-                                        double signal_travel_time) const;
-    
-    /**
-     * @brief Estimate inter-system clock biases
-     */
-    void estimateInterSystemBiases(const std::vector<Observation>& observations,
-                                 const std::map<SatelliteId, SatelliteState>& sat_states,
-                                 const Vector3d& receiver_pos);
-    
-    /**
      * @brief Calculate covariance matrix
      */
     Matrix3d calculatePositionCovariance(const MatrixXd& geometry_matrix,
@@ -413,21 +453,6 @@ namespace spp_utils {
      */
     Vector3d geodeticToEcef(const GeodeticCoord& geodetic_pos);
     
-    /**
-     * @brief Calculate geometric distance
-     */
-    double calculateGeometricDistance(const Vector3d& receiver_pos, const Vector3d& satellite_pos);
-    
-    /**
-     * @brief Apply elevation-dependent weighting
-     */
-    double calculateElevationWeight(double elevation_rad, double min_elevation_rad = 0.0);
-    
-    /**
-     * @brief Apply SNR-dependent weighting
-     */
-    double calculateSNRWeight(double snr_db, double min_snr_db = 35.0);
-
     /** Match the CLAS benchmark rover SNR mask used by MRTKLIB testsnr(). */
     double mrtklibClasSnrThresholdDbHz(double elevation_rad);
 
@@ -479,13 +504,6 @@ namespace spp_utils {
                                const std::vector<double>& candidate_rms_values,
                                double min_improvement_ratio,
                                double min_improvement_m);
-    
-    /**
-     * @brief Check satellite visibility
-     */
-    bool isSatelliteVisible(const Vector3d& receiver_pos, 
-                          const Vector3d& satellite_pos,
-                          double min_elevation_rad);
 }
 
 } // namespace libgnss

@@ -15,6 +15,8 @@ handling without an external RTKLIB runtime.
 - Extras: benchmarks, web dashboard, Python bindings, Docker, ROS 2 playback
 
 [Choose a use case](docs/use_cases.md): [urban RTK + IMU continuity](docs/use_cases/urban_rtk_fgo.md),
+[urban canyon RTK options](docs/use_cases/urban_canyon_rtk_options.md),
+[real-time RTK with `gnss live`](docs/use_cases/realtime_rtk_gnss_live.md),
 [RTKLIB migration](docs/use_cases/rtklib_migration.md),
 [ROS2 receiver/bag replay](docs/use_cases/ros2.md), or [QZSS L6 / CLAS / MADOCA](docs/use_cases/qzss_l6.md).
 
@@ -29,7 +31,7 @@ needed:
 mkdir -p output
 docker run --rm \
   -v "$PWD/output:/workspace/output" \
-  ghcr.io/rsasaki0109/gnssplusplus-library:v0.2.0 \
+  ghcr.io/rsasaki0109/gnssplusplus-library:v0.3.0 \
   demo --output-dir /workspace/output/self-contained-demo
 ```
 
@@ -83,33 +85,49 @@ Build the complete exported library set before installing it:
 [public API header](include/libgnss++/gnss.hpp), and the
 [interface notes](docs/interfaces.md).
 
-See the [v0.2.0 release highlights](docs/releases/v0.2.0.md) and
+See the [v0.3.0 release highlights](docs/releases/v0.3.0.md) and
 [maintainer release runbook](docs/release_runbook.md) for distribution details.
 
 ## Results And Validation Status
 
 | Area | Public comparison | Evidence / status |
 |---|---|---|
-| RTK | PPC Tokyo/Nagoya vs RTKLIB `demo5` | +17.0 pp positioning, +28.1 pp official score, -11.96 m P95 H delta |
-| GNSS/IMU FGO | PPC Tokyo vs `tightly-coupled-gnss-imu-fgo` | Higher <50 cm fraction (avg +5.6 pp) and fix-rate (avg +8.2 pp) on all 3 runs; fixed-only RMS also wins 2 of 3 runs |
-| CLAS PPP | Six PPC Tokyo/Nagoya runs vs MRTKLIB CLAS | 25.121% aggregate FIX, 0.359 m FIX RMS2D, and zero FIX epochs above 3 m across 58,259 scored epochs; every run passes the MRTKLIB v0.4.2 FIX-rate and FIX-RMS2D hard gates |
-| Urban RTK | UrbanNav Tokyo Odaiba vs RTKLIB `demo5` | More fixes, lower Hp95/Vp95; `--preset odaiba` closes Hmed |
-| SPP | PPC SPP adaptive robust + policy gate | No P95 regression with <=1 pp positioning drop |
-| Smartphone GNSS/IMU | Raw-only native FGO, base-surveyed | Sub-meter on all 4 GSDC dev routes (0.30-0.74 m); not a leaderboard result |
+| RTK | PPC Tokyo/Nagoya vs RTKLIB `demo5` b34k | +56.9 pp fix rate, +44.9 pp official score, -11.33 m P95 H delta (six-run average; demo5 publishes mostly FLOAT/SINGLE on more epochs, so Positioning is -9.7 pp) |
+| GNSS/IMU FGO | PPC Tokyo vs `tightly-coupled-gnss-imu-fgo` | Higher fix rate on all 3 runs (avg +10.7 pp); <50 cm fraction higher on 2 of 3 runs (avg +7.9 pp, run1 -1.8 pp); fixed-only RMS wins 2 of 3 runs |
+| CLAS PPP | Six PPC Tokyo/Nagoya runs vs MRTKLIB CLAS | 25.117% aggregate FIX, 0.359 m FIX RMS2D, and zero FIX epochs above 3 m across 58,259 scored epochs; every run passes the MRTKLIB v0.4.2 FIX-rate and FIX-RMS2D hard gates |
+| Urban RTK | UrbanNav Tokyo Odaiba vs RTKLIB `demo5` b34k | 1298 vs 205 fixes, Hp95 4.77 vs 25.62 m, Vp95 11.54 vs 43.37 m; lower Hmed on common epochs (0.298 vs 0.553 m); both solvers use the surveyed base position |
+| SPP | PPC SPP adaptive robust + policy gate (Tokyo run1, Nagoya run1-3) | No P95 H regression with <=1 pp positioning drop on the 4 checked runs |
+| Smartphone GNSS/IMU | GSDC 2023-2024 official submission | **Private 0.984 m / Public 0.915 m**; 40 drives, 71,936 native output rows |
+
+Reproduce: `python3 apps/gnss.py reproduce list` shows one command per row; see [docs/reproduce.md](docs/reproduce.md) for datasets, tool pins, and the latest local results.
 
 ### Smartphone GNSS/IMU
+
+Official Google Smartphone Decimeter Challenge 2023-2024 submission
+**56625084** (2026-09-28) scored **Private 0.984 m / Public 0.915 m**.
+The submitted recipe combines Pixel5 heading initialization with Android clock handling
+and observation-model updates for supported phones. All 40 drives and
+71,936 output rows were checked against native solver results.
+
+The recipe uses raw GNSS/IMU, broadcast navigation, base observations, and
+training-derived height constraints where configured; evaluation ground
+truth is not used during inference. These official scores are separate from
+the development-route measurements below. The 0.928 m Private target remains
+unmet; work is paused at the sub-meter milestone. See the
+[official score record](docs/use_cases/records/gsdc2023_heading_modern_official_readback_20260928.json)
+and [experiment and validation log](docs/gsdc2023_native_taroz_goal.md).
 
 Base-surveyed correction on the GSDC dev routes (Pixel5, `(P50+P95)/2` m):
 
 | route | H | U | A | LAX-T |
 |---|---:|---:|---:|---:|
-| base-surveyed | **0.577** | **0.738** | **0.302** | **0.712** |
+| base-surveyed | **0.576** | **0.740** | **0.303** | **0.716** |
 
 ![GSDC base-surveyed dev routes on OpenStreetMap](docs/gsdc_base_surveyed_osm.png)
 
 Raw GNSS + IMU + broadcast nav only. Dev routes, not a Kaggle leaderboard
-score. Details in the
-[record](docs/use_cases/records/smartphone_base_surveyed_route_results_v1.md).
+score. Reproduce with `gnss reproduce gsdc-dev-routes` (about 23 min); details
+in the [record](docs/use_cases/records/smartphone_base_surveyed_route_results_v1.md).
 
 ### PPC 2024 goal matrix vs Kaiyodai and gici-open
 
@@ -156,6 +174,12 @@ The [Nagoya 3 root-cause analysis](docs/ppc_nagoya3_wrong_fix_root_cause.md)
 documents the catastrophic float-KF wrong basin. See the
 [reproduction commands](docs/ppc_reproduction.md) for the gate design,
 external replay, event ledger, machine-readable metrics, and licensing details.
+`gnss reproduce ppc-goal` rescores this section (about 1 min) from 26
+SHA-256-pinned tier inputs that are not published; see
+[reproduce](docs/reproduce.md#ppc-goal-frozen-inputs). This is a score-only
+reproduction: the upstream solver tiers behind those inputs were produced with
+unrecorded commands and earlier solver revisions, so they cannot be
+regenerated from scratch.
 
 ### GNSS/IMU Tightly-Coupled FGO vs tightly-coupled-gnss-imu-fgo
 
@@ -176,6 +200,10 @@ on the same rover/base/IMU data:
 ![Tokyo run2 GNSS/IMU FGO](docs/gnss_imu_fgo_tokyo_run2.png)
 ![Tokyo run3 GNSS/IMU FGO](docs/gnss_imu_fgo_tokyo_run3.png)
 
+The figures are rendered by
+[`scripts/plot_fgo_parity_runs.py`](scripts/plot_fgo_parity_runs.py) from the
+per-run `gnss_fgo_parity --dump-csv` outputs.
+
 With the geometry-free reset, libgnss++ exceeds the reference on raw FIX rate
 (all runs) and on <50 cm / fixed RMS (two of three), and improves the PPC
 official score:
@@ -184,12 +212,13 @@ official score:
 |---|---:|---:|---:|---:|
 | Tokyo run1 | 25.656% -> **33.322%** | 23.765% -> **21.221%** | 30.823% -> **39.375%** | 14 |
 | Tokyo run2 | 60.304% -> **74.599%** | 12.573% -> **1.386%** | 65.264% -> **81.615%** | 0 |
-| Tokyo run3 | 59.175% -> **65.099%** | 7.918% -> **1.818%** | 64.081% -> **71.207%** | 17 |
-| Aggregate | 49.181% -> **57.409%** | 13.741% -> **7.650%** | 54.178% -> **63.692%** | 31 |
+| Tokyo run3 | 59.712% -> **65.099%** | 7.726% -> **1.818%** | 65.446% -> **71.207%** | 17 |
+| Aggregate | 49.440% -> **57.409%** | 13.649% -> **7.650%** | 54.837% -> **63.692%** | 31 |
 
-Wrong FIX/FIX falls 21.839% -> 11.759%; matched distance is unchanged (99.682%);
-fixed-only RMS/P95 and vertical P95 improve on all runs. Wall times were
-463.5/584.6/844.9 s.
+Wrong FIX/FIX falls 21.634% -> 11.759%; matched distance is unchanged (99.682%);
+fixed-only RMS/P95 and vertical P95 improve on all runs. Reproduce both tables
+with `gnss reproduce fgo-tokyo` ("baseline" is the preset below without
+`--gf-slip-reset`; about 35 min for all six replays on a Windows MSVC build).
 
 Every new behavior is opt-in; non-GTSAM builds are unchanged. Reproduce with
 `gnss_fgo_parity` (GTSAM build) and this preset:
@@ -227,7 +256,9 @@ Ratio-rejected candidates can be rescued by an independent surplus-satellite
 test (excluded DD carrier rows re-differenced against an alternate reference,
 PDOP-scaled nearest-integer aperture, GQEBR->GQ fallback; requires >=10 sats,
 DD-code RMS <=5 m, carrier RMS <=0.05 m). The fixed-lag-5 preset replayed over
-all three Tokyo runs ("Correct"/"wrong" = FIXED 3D error < / >= 0.5 m):
+all three Tokyo runs ("Correct"/"wrong" = FIXED 3D error < / >= 0.5 m). This
+table is a historical record from an earlier preset and solver revision and is
+not regenerated by `gnss reproduce`:
 
 | Run | Correct FIX | Wrong FIX | Fixed horizontal RMS | All epochs 3D <50 cm |
 |---|---:|---:|---:|---:|
@@ -243,9 +274,12 @@ antenna by >=1 m), and `--fix-demote-spp-model-reprieve` (fresh candidate,
 <=2 cm IMU separation, <=8 m SPP separation). Full replays added correct fixes
 with zero wrong; correct-FIX distance reached ~58.28% (+1.2 pp).
 `--surplus-validation-veto` is false-alarm dominated - leave it off;
-`--problem-cache` speeds repeated validation. Counterfactual fixed-lag-QR
-auditing moved `--fix-demote-res` to 40 (tokyo fix 67.23/77.71/75.14%, fixed
-RMS 0.797/0.742/1.054 m).
+`--problem-cache` speeds repeated validation. The tables above use the
+fixed-lag-5 preset shown earlier (`--fix-demote-res 25`). Separately, a
+counterfactual audit of a different fixed-lag-1 `--fixed-lag-qr`
+configuration used `--fix-demote-res 40` (tokyo fix 67.23/77.71/75.14%, fixed
+RMS 0.797/0.742/1.054 m); that setting is not part of the preset or tables
+here.
 
 ### Moving CLAS PPP vs MRTKLIB
 
@@ -267,9 +301,9 @@ Each run has 100% interval coverage and at least 99.95% epoch coverage.
 | Tokyo 2 | **21.859%** | 21.700% | **0.329 m** | 0.514 m | 25.880 m | 18.346 m | 45.128 m | 1.333 m | 0 |
 | Tokyo 3 | **38.378%** | 7.400% | **0.191 m** | 0.801 m | 35.276 m | 19.617 m | 88.519 m | 2.986 m | 0 |
 | Nagoya 1 | **36.923%** | 17.000% | **0.451 m** | 1.105 m | 57.163 m | 7.966 m | 119.111 m | 1.043 m | 0 |
-| Nagoya 2 | **23.969%** | 23.400% | **0.554 m** | 1.119 m | 25.829 m | 16.233 m | 40.405 m | 0.767 m | 0 |
-| Nagoya 3 | **9.010%** | 6.300% | **0.304 m** | 0.318 m | 13.724 m | 14.392 m | 14.380 m | 0.587 m | 0 |
-| **Six-run aggregate** | **25.121%** | — | **0.359 m** | — | **36.522 m** | **16.885 m** | **70.361 m** | **2.986 m** | **0** |
+| Nagoya 2 | **23.948%** | 23.400% | **0.554 m** | 1.119 m | 26.803 m | 16.841 m | 42.023 m | 0.767 m | 0 |
+| Nagoya 3 | **9.010%** | 6.300% | **0.304 m** | 0.318 m | 13.595 m | 14.392 m | 14.056 m | 0.587 m | 0 |
+| **Six-run aggregate** | **25.117%** | — | **0.359 m** | — | **36.631 m** | **16.964 m** | **70.596 m** | **2.986 m** | **0** |
 
 \* libgnss++ precision uses the raw PPC reference point (already
 antenna-positioned; no lever-arm transform is applied — an earlier revision
@@ -282,11 +316,11 @@ RMS2D is now lower than MRTKLIB's on all six runs (bolded above).
 
 ![PPC six-run moving CLAS metric comparison](docs/ppc_clas_full_comparison.png)
 
-Across 58,259 scored epochs, native CLAS produced 14,635 FIX epochs: 176 more
+Across 58,259 scored epochs, native CLAS produced 14,633 FIX epochs: 176 more
 than the fixed baseline, with no lost baseline FIX epochs. Every run meets or
 exceeds the published MRTKLIB v0.4.2 FIX rate, beats its FIX RMS2D, and has
-zero FIX epochs above 3 m. The six-run all-solution RMS2D is 36.522 m; FLOAT
-and SINGLE RMS2D are 16.885 m and 70.361 m respectively. p68 is a soft miss on
+zero FIX epochs above 3 m. The six-run all-solution RMS2D is 36.631 m; FLOAT
+and SINGLE RMS2D are 16.964 m and 70.596 m respectively. p68 is a soft miss on
 Tokyo 2, Tokyo 3, Nagoya 1, and Nagoya 2; TTFF is a soft miss only on Nagoya 3.
 
 The production defaults are held floor 4 and maximum reduced-publication
@@ -313,6 +347,10 @@ Choose the entrypoint that matches your job:
   runs, profile comparisons, Python inspection, and artifact layout.
 - [Self-contained offline demo](docs/self_contained_demo.md): one tracked
   fixture, one command, and `.pos`/KML/JSON artifacts without a download.
+- [Position, velocity and attitude evaluation](docs/online_pva.md): received-event
+  public-log replay, scene scoring and an included hardware-free scoring demo.
+  The online PVA pipeline is experimental; its default attitude is not reliable
+  (see the status section there).
 - [Dataset gallery](docs/dataset_gallery.md): current public dataset lanes and
   the adapter contract for adding more.
 

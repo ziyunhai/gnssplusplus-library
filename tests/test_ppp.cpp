@@ -9,8 +9,10 @@
 #include <libgnss++/core/coordinates.hpp>
 #include <libgnss++/models/troposphere.hpp>
 
+#include "../src/algorithms/ppp_clas_epoch_internal.hpp"
 #include "../src/algorithms/ppp_internal.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -19,6 +21,7 @@
 #include <fstream>
 #include <cstdint>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -137,10 +140,234 @@ TEST(PPPClasSeedFde, MaskedAdmissionFailureCoastsWithTooFewSatellites) {
     EXPECT_FALSE(ppp_shared::shouldCoastClasSeed(false, false, 3));
 }
 
-TEST(PPPFilterIterations, MadocaPerFrequencyCommitsOneUpdatePerEpoch) {
-    EXPECT_EQ(ppp_internal::filterIterationCount(true, false, 8), 1);
-    EXPECT_EQ(ppp_internal::filterIterationCount(false, true, 8), 3);
-    EXPECT_EQ(ppp_internal::filterIterationCount(false, false, 8), 8);
+TEST(PPPFilterIterations, CommitsOneUpdatePerEpoch) {
+    // Static, --low-dynamics and kinematic motion on broadcast, SP3/CLK, HAS /
+    // legacy RTCM SSR and MADOCA (uncombined and ionosphere-free, including
+    // the coherent MADOCA static ionosphere-free release profile).
+    EXPECT_EQ(ppp_internal::kMeasurementUpdatesPerEpoch, 1);
+}
+
+TEST(PPPCycleSlipDetection, CombinationDetectorsCoverStaticIonosphereFree) {
+    // Static ionosphere-free (broadcast, SP3/CLK, SSR) and kinematic motion.
+    EXPECT_TRUE(ppp_internal::useCombinationSlipDetection(false, false, true));
+    EXPECT_TRUE(ppp_internal::useCombinationSlipDetection(true, false, true));
+    EXPECT_TRUE(ppp_internal::useCombinationSlipDetection(true, false, false));
+    // CLAS kinematic OSR has its own detector unless it is ionosphere-free.
+    EXPECT_FALSE(ppp_internal::useCombinationSlipDetection(true, true, false));
+    EXPECT_TRUE(ppp_internal::useCombinationSlipDetection(true, true, true));
+    // Static uncombined (per-frequency) PPP keeps LLI-only detection here.
+    EXPECT_FALSE(ppp_internal::useCombinationSlipDetection(false, false, false));
+}
+
+TEST(PPPSingleFrequency, PreciseProductIonosphereFreeDropsSingleFrequencySatellites) {
+    EXPECT_TRUE(ppp_internal::dropSingleFrequencyPreciseProductSatellite(true, false));
+    // Broadcast-only and SSR paths keep their single-frequency rows.
+    EXPECT_FALSE(ppp_internal::dropSingleFrequencyPreciseProductSatellite(false, false));
+    EXPECT_FALSE(ppp_internal::dropSingleFrequencyPreciseProductSatellite(false, true));
+    EXPECT_FALSE(ppp_internal::dropSingleFrequencyPreciseProductSatellite(true, true));
+}
+
+TEST(PPPPostfitScreening, KinematicNonMadocaNonClasOnly) {
+    EXPECT_TRUE(ppp_internal::usePostfitResidualScreening(true, false, false));
+    EXPECT_FALSE(ppp_internal::usePostfitResidualScreening(false, false, false));
+    EXPECT_FALSE(ppp_internal::usePostfitResidualScreening(true, true, false));
+    EXPECT_FALSE(ppp_internal::usePostfitResidualScreening(true, false, true));
+}
+
+TEST(PPPPostfitScreening, StandardizedResidualFindsCodeOutlier) {
+    // Five code rows observing one clock-like state (prior sigma 10 m, row
+    // sigma 1 m); the last row carries a 20 m NLOS excess delay.
+    const int n = 5;
+    Eigen::MatrixXd H = Eigen::MatrixXd::Ones(n, 1);
+    Eigen::MatrixXd P = Eigen::MatrixXd::Identity(1, 1) * 100.0;
+    Eigen::MatrixXd R = Eigen::MatrixXd::Identity(n, n);
+    const Eigen::MatrixXd S_inv = (H * P * H.transpose() + R).inverse();
+    Eigen::VectorXd r(n);
+    r << 0.3, -0.4, 0.2, -0.1, 20.0;
+    EXPECT_EQ(ppp_internal::worstStandardizedResidualRow(
+                  r, S_inv, ppp_internal::kPostfitRejectSigma),
+              4);
+    r(4) = 0.5;
+    EXPECT_EQ(ppp_internal::worstStandardizedResidualRow(
+                  r, S_inv, ppp_internal::kPostfitRejectSigma),
+              -1);
+}
+
+TEST(PPPPvaDynamics, NonClasKinematicDynamicsModelOnly) {
+    // flag, use_dynamics_model, kinematic, low_dynamics, clas_osr
+    EXPECT_TRUE(ppp_internal::usePvaDynamics(true, true, true, false, false));
+    EXPECT_FALSE(ppp_internal::usePvaDynamics(false, true, true, false, false));
+    EXPECT_FALSE(ppp_internal::usePvaDynamics(true, false, true, false, false));
+    EXPECT_FALSE(ppp_internal::usePvaDynamics(true, true, false, false, false));
+    EXPECT_FALSE(ppp_internal::usePvaDynamics(true, true, true, true, false));
+    // The CLAS OSR filter keeps its MRTKLIB dynamics.
+    EXPECT_FALSE(ppp_internal::usePvaDynamics(true, true, true, false, true));
+}
+
+TEST(PPPPvaDynamics, AccelerationNoiseIsDefinedInLocalEnu) {
+    double lat = 0.0;
+    double lon = 0.0;
+    double height = 0.0;
+    const Eigen::Vector3d position(-3961767.6, 3349008.7, 3698309.8);  // Tokyo
+    ecef2geodetic(position, lat, lon, height);
+    const Eigen::Matrix3d Q =
+        ppp_internal::pvaAccelerationProcessNoiseEcef(position, 1.0, 0.1, 0.2);
+    EXPECT_TRUE(Q.isApprox(Q.transpose(), 1e-12));
+    const Eigen::Vector3d east = enu2ecef(Eigen::Vector3d::UnitX(), lat, lon);
+    const Eigen::Vector3d north = enu2ecef(Eigen::Vector3d::UnitY(), lat, lon);
+    const Eigen::Vector3d up = enu2ecef(Eigen::Vector3d::UnitZ(), lat, lon);
+    EXPECT_NEAR(east.dot(Q * east), 1.0 * 0.2, 1e-12);
+    EXPECT_NEAR(north.dot(Q * north), 1.0 * 0.2, 1e-12);
+    EXPECT_NEAR(up.dot(Q * up), 0.01 * 0.2, 1e-12);
+    EXPECT_NEAR(east.dot(Q * up), 0.0, 1e-12);
+}
+
+TEST(PPPPvaDynamics, SeedDisagreementIsNormalizedByBothCovariances) {
+    const Eigen::Vector3d seed(-3961767.6, 3349008.7, 3698309.8);
+    const Eigen::Matrix3d P = Eigen::Matrix3d::Identity() * 4.0;
+    const Eigen::Matrix3d C = Eigen::Matrix3d::Identity() * 5.0;
+    const Eigen::Vector3d offset(6.0, 0.0, 0.0);
+    EXPECT_NEAR(ppp_internal::seedPositionDisagreement(seed + offset, P, seed, C),
+                36.0 / 9.0, 1e-12);
+    const Eigen::Matrix3d nan_covariance =
+        Eigen::Matrix3d::Constant(std::numeric_limits<double>::quiet_NaN());
+    EXPECT_TRUE(std::isinf(
+        ppp_internal::seedPositionDisagreement(seed, P, seed, nan_covariance)));
+}
+
+TEST(PPPPvaDynamics, DopplerVelocityUpdatesVelocityAndCorrelatedPosition) {
+    ppp_shared::PPPState state;
+    state.total_states = 9;
+    state.state = Eigen::VectorXd::Zero(9);
+    state.covariance = Eigen::MatrixXd::Identity(9, 9) * 100.0;
+    // Position and velocity correlated as after one 1 s prediction.
+    for (int axis = 0; axis < 3; ++axis) {
+        state.covariance(axis, 3 + axis) = 50.0;
+        state.covariance(3 + axis, axis) = 50.0;
+    }
+    const Eigen::Vector3d doppler_velocity(10.0, 0.0, 0.0);
+    const Eigen::Matrix3d R = Eigen::Matrix3d::Identity() * 0.01;
+    ASSERT_TRUE(ppp_internal::applyVelocityMeasurement(state, doppler_velocity, R, 0.0));
+    EXPECT_NEAR(state.state(3), 10.0 * 100.0 / 100.01, 1e-9);
+    EXPECT_NEAR(state.state(0), 10.0 * 50.0 / 100.01, 1e-9);
+    EXPECT_NEAR(state.state(4), 0.0, 1e-12);
+    EXPECT_LT(state.covariance(3, 3), 0.01);
+    EXPECT_TRUE(state.covariance.isApprox(state.covariance.transpose(), 1e-12));
+
+    // The gate leaves the state untouched for an inconsistent velocity.
+    const ppp_shared::PPPState before = state;
+    EXPECT_FALSE(ppp_internal::applyVelocityMeasurement(
+        state, Eigen::Vector3d(30.0, 0.0, 0.0), R, 16.27));
+    EXPECT_EQ(state.state, before.state);
+}
+
+TEST(PPPBroadcastGroupDelay, BeiDouClockReferencedToB3I) {
+    Ephemeris eph;
+    eph.tgd = -45e-9;            // TGD1 of C33 on 2024-07-23
+    eph.tgd_secondary = -20e-9;  // TGD2
+    EXPECT_NEAR(ppp_internal::broadcastBeiDouGroupDelayMeters(SignalType::BDS_B1I, eph),
+                -45e-9 * constants::SPEED_OF_LIGHT, 1e-9);
+    EXPECT_NEAR(ppp_internal::broadcastBeiDouGroupDelayMeters(SignalType::BDS_B2I, eph),
+                -20e-9 * constants::SPEED_OF_LIGHT, 1e-9);
+    EXPECT_EQ(ppp_internal::broadcastBeiDouGroupDelayMeters(SignalType::BDS_B3I, eph), 0.0);
+    const auto& secondary =
+        ppp_internal::broadcastBeiDouSecondarySignals(SatelliteId(GNSSSystem::BeiDou, 14));
+    EXPECT_EQ(std::count(secondary.begin(), secondary.end(), SignalType::BDS_B2A), 0);
+    const auto& primary = ppp_internal::broadcastBeiDouPrimarySignals();
+    ASSERT_EQ(primary.size(), 1U);
+    EXPECT_EQ(primary.front(), SignalType::BDS_B1I);
+}
+
+TEST(PPPBroadcastGroupDelay, BeiDou3PairsB1IWithB3IOnly) {
+    // BDS-2 transmits B2I and broadcasts its TGD2: B2I first, then B3I.
+    const auto& bds2 =
+        ppp_internal::broadcastBeiDouSecondarySignals(SatelliteId(GNSSSystem::BeiDou, 14));
+    ASSERT_EQ(bds2.size(), 2U);
+    EXPECT_EQ(bds2[0], SignalType::BDS_B2I);
+    EXPECT_EQ(bds2[1], SignalType::BDS_B3I);
+    // BDS-3 does not transmit B2I; its band-7 code is B2b (no D1 group delay).
+    for (const int prn : {19, 33, 46, 60}) {
+        const SatelliteId sat(GNSSSystem::BeiDou, static_cast<uint8_t>(prn));
+        EXPECT_TRUE(ppp_internal::isBeiDou3Satellite(sat));
+        const auto& bds3 = ppp_internal::broadcastBeiDouSecondarySignals(sat);
+        ASSERT_EQ(bds3.size(), 1U);
+        EXPECT_EQ(bds3.front(), SignalType::BDS_B3I);
+    }
+    EXPECT_FALSE(ppp_internal::isBeiDou3Satellite(SatelliteId(GNSSSystem::BeiDou, 18)));
+    EXPECT_FALSE(ppp_internal::isBeiDou3Satellite(SatelliteId(GNSSSystem::GPS, 19)));
+}
+
+TEST(PPPBroadcastGroupDelay, BeiDou3SecondaryFallsBackToTrackedB3I) {
+    // A BDS-3 satellite logging C2I, C6I and C7D: the reader's selected
+    // secondary is B2b (band 7, BDS_B2I slot); B3I is only a tracking-code
+    // observation.
+    const SatelliteId bds3(GNSSSystem::BeiDou, 38);
+    ObservationData obs;
+    Observation b1i(bds3, SignalType::BDS_B1I);
+    b1i.valid = true;
+    b1i.has_pseudorange = true;
+    b1i.pseudorange = 2.20e7;
+    obs.addObservation(b1i);
+    Observation b2b(bds3, SignalType::BDS_B2I);
+    b2b.valid = true;
+    b2b.has_pseudorange = true;
+    b2b.pseudorange = 2.20e7 + 3.0;
+    b2b.has_carrier_phase = true;
+    b2b.carrier_phase = 1.0e8;
+    obs.addObservation(b2b);
+    Observation b3i(bds3, SignalType::BDS_B3I);
+    b3i.valid = true;
+    b3i.has_pseudorange = true;
+    b3i.pseudorange = 2.20e7 + 5.0;
+    b3i.has_carrier_phase = true;
+    b3i.carrier_phase = 1.1e8;
+    obs.addRinexTrackingObservation("6I", b3i);
+
+    const Observation* code =
+        ppp_internal::findBroadcastBeiDouSecondaryObservation(obs, bds3, false);
+    ASSERT_NE(code, nullptr);
+    EXPECT_EQ(code->signal, SignalType::BDS_B3I);
+    EXPECT_DOUBLE_EQ(code->pseudorange, 2.20e7 + 5.0);
+    const Observation* carrier =
+        ppp_internal::findBroadcastBeiDouSecondaryObservation(obs, bds3, true);
+    ASSERT_NE(carrier, nullptr);
+    EXPECT_EQ(carrier->signal, SignalType::BDS_B3I);
+
+    // BDS-2 keeps its selected B2I.
+    const SatelliteId bds2(GNSSSystem::BeiDou, 8);
+    Observation b2i(bds2, SignalType::BDS_B2I);
+    b2i.valid = true;
+    b2i.has_pseudorange = true;
+    b2i.pseudorange = 3.0e7;
+    obs.addObservation(b2i);
+    const Observation* bds2_secondary =
+        ppp_internal::findBroadcastBeiDouSecondaryObservation(obs, bds2, false);
+    ASSERT_NE(bds2_secondary, nullptr);
+    EXPECT_EQ(bds2_secondary->signal, SignalType::BDS_B2I);
+}
+
+TEST(PPPBroadcastGroupDelay, SingleFrequencyFollowsSppModel) {
+    Ephemeris eph;
+    eph.tgd = 5e-9;
+    eph.tgd_secondary = 1e-9;
+    const double c = constants::SPEED_OF_LIGHT;
+    EXPECT_NEAR(ppp_internal::broadcastSingleFrequencyGroupDelayMeters(
+                    SatelliteId(GNSSSystem::GPS, 5), SignalType::GPS_L1CA, eph),
+                5e-9 * c, 1e-9);
+    EXPECT_NEAR(ppp_internal::broadcastSingleFrequencyGroupDelayMeters(
+                    SatelliteId(GNSSSystem::BeiDou, 33), SignalType::BDS_B1I, eph),
+                5e-9 * c, 1e-9);
+    EXPECT_EQ(ppp_internal::broadcastSingleFrequencyGroupDelayMeters(
+                  SatelliteId(GNSSSystem::GLONASS, 5), SignalType::GLO_L1CA, eph),
+              0.0);
+}
+
+TEST(PPPBroadcastGroupDelay, OnlyWithoutExternalBiasProducts) {
+    EXPECT_TRUE(ppp_internal::broadcastClockIonosphereFree(true, false, false, false));
+    EXPECT_FALSE(ppp_internal::broadcastClockIonosphereFree(false, false, false, false));
+    EXPECT_FALSE(ppp_internal::broadcastClockIonosphereFree(true, true, false, false));
+    EXPECT_FALSE(ppp_internal::broadcastClockIonosphereFree(true, false, true, false));
+    EXPECT_FALSE(ppp_internal::broadcastClockIonosphereFree(true, false, false, true));
 }
 
 TEST(PPPMadocaL6dConstraints, RemovesIndependentConstellationBiases) {
@@ -737,12 +964,15 @@ Ephemeris makeBroadcastGpsEphemeris(uint8_t prn) {
     return eph;
 }
 
-std::vector<uint8_t> buildGps1060CombinedFrame(uint8_t prn) {
+std::vector<uint8_t> buildGps1060CombinedFrame(uint8_t prn,
+                                               uint32_t tow = 345600,
+                                               uint8_t iode = 77,
+                                               int32_t clock_c0_units = 1200) {
     constexpr int total_bits = 68 + 205;
     std::vector<uint8_t> payload((total_bits + 7) / 8U, 0);
     int bit = 0;
     setUnsignedBits(payload, bit, 12, 1060); bit += 12;
-    setUnsignedBits(payload, bit, 20, 345600); bit += 20;
+    setUnsignedBits(payload, bit, 20, tow); bit += 20;
     setUnsignedBits(payload, bit, 4, 2); bit += 4;
     setUnsignedBits(payload, bit, 1, 0); bit += 1;
     setUnsignedBits(payload, bit, 1, 1); bit += 1;
@@ -751,14 +981,14 @@ std::vector<uint8_t> buildGps1060CombinedFrame(uint8_t prn) {
     setUnsignedBits(payload, bit, 4, 3); bit += 4;
     setUnsignedBits(payload, bit, 6, 1); bit += 6;
     setUnsignedBits(payload, bit, 6, prn); bit += 6;
-    setUnsignedBits(payload, bit, 8, 77); bit += 8;
+    setUnsignedBits(payload, bit, 8, iode); bit += 8;
     setSignedBits(payload, bit, 22, 800); bit += 22;
     setSignedBits(payload, bit, 20, -100); bit += 20;
     setSignedBits(payload, bit, 20, 50); bit += 20;
     setSignedBits(payload, bit, 21, 0); bit += 21;
     setSignedBits(payload, bit, 19, 0); bit += 19;
     setSignedBits(payload, bit, 19, 0); bit += 19;
-    setSignedBits(payload, bit, 22, 1200); bit += 22;
+    setSignedBits(payload, bit, 22, clock_c0_units); bit += 22;
     setSignedBits(payload, bit, 21, 0); bit += 21;
     setSignedBits(payload, bit, 27, 0); bit += 27;
     return buildRtcmFrame(payload);
@@ -783,12 +1013,13 @@ std::vector<uint8_t> buildGps1062HighRateClockFrame(uint8_t prn, int32_t high_ra
 
 std::vector<uint8_t> buildGps1059CodeBiasFrame(uint8_t prn,
                                                uint8_t signal_id,
-                                               int32_t bias_centimeters) {
+                                               int32_t bias_centimeters,
+                                               uint32_t tow = 345600) {
     constexpr int total_bits = 67 + 6 + 5 + 19;
     std::vector<uint8_t> payload((total_bits + 7) / 8U, 0);
     int bit = 0;
     setUnsignedBits(payload, bit, 12, 1059); bit += 12;
-    setUnsignedBits(payload, bit, 20, 345600); bit += 20;
+    setUnsignedBits(payload, bit, 20, tow); bit += 20;
     setUnsignedBits(payload, bit, 4, 2); bit += 4;
     setUnsignedBits(payload, bit, 1, 0); bit += 1;
     setUnsignedBits(payload, bit, 4, 7); bit += 4;
@@ -823,6 +1054,14 @@ double mappingFunction(double elevation) {
     const double sin_elevation = std::max(std::sin(elevation), 0.1);
     return 1.001 / std::sqrt(0.002001 + sin_elevation * sin_elevation);
 }
+
+// Epochs (30 s apart, inside the 600 s synthetic SP3/CLK span) the static
+// synthetic precise-product tests process before checking the float position.
+// The satellites are fixed in ECEF and the observations noise-free, so the
+// position information comes from the repeated code rows alone and the error
+// falls roughly as 1/n (3.2 m after the first epoch, 1.05 m after 8, 0.57 m
+// after 16) with one measurement update per epoch.
+constexpr int kSyntheticPreciseEpochs = 16;
 
 struct SyntheticSatellite {
     SatelliteId id;
@@ -1265,7 +1504,7 @@ TEST(PPPTest, SolidEarthTidesChangeSyntheticPrecisePppSolutionWithoutBreakingIt)
     NavigationData nav_data;
     PositionSolution tides_on_solution;
     PositionSolution tides_off_solution;
-    for (int i = 0; i < 8; ++i) {
+    for (int i = 0; i < kSyntheticPreciseEpochs; ++i) {
         const ObservationData epoch = makeSyntheticEpoch(
             first_time + 30.0 * static_cast<double>(i),
             true_receiver_position,
@@ -1347,7 +1586,7 @@ TEST(PPPTest, IersSolidTideOptInDispatchProducesDistinctSolution) {
     NavigationData nav_data;
     PositionSolution legacy_solution;
     PositionSolution iers_solution;
-    for (int i = 0; i < 8; ++i) {
+    for (int i = 0; i < kSyntheticPreciseEpochs; ++i) {
         const ObservationData epoch = makeSyntheticEpoch(
             first_time + 30.0 * static_cast<double>(i),
             true_receiver_position,
@@ -1432,7 +1671,7 @@ TEST(PPPTest, ReceiverAntexPcoChangesSyntheticPrecisePppSolutionWithoutBreakingI
     NavigationData nav_data;
     PositionSolution plain_solution;
     PositionSolution antex_solution;
-    for (int i = 0; i < 8; ++i) {
+    for (int i = 0; i < kSyntheticPreciseEpochs; ++i) {
         const ObservationData epoch = makeSyntheticEpoch(
             first_time + 30.0 * static_cast<double>(i),
             true_receiver_position,
@@ -1510,7 +1749,7 @@ TEST(PPPTest, OceanLoadingCoefficientsChangeSyntheticPrecisePppSolutionWithoutBr
     NavigationData nav_data;
     PositionSolution base_solution;
     PositionSolution blq_solution;
-    for (int i = 0; i < 8; ++i) {
+    for (int i = 0; i < kSyntheticPreciseEpochs; ++i) {
         const ObservationData epoch = makeSyntheticEpoch(
             first_time + 30.0 * static_cast<double>(i),
             true_receiver_position,
@@ -1632,6 +1871,124 @@ TEST(PPPTest, PreciseProductsInterpolateAtClockOnlyTimestampUsesSP3Bracket) {
 
     std::filesystem::remove(sp3_path);
     std::filesystem::remove(clk_path);
+}
+
+TEST(PPPTest, PreciseClockRelativisticCorrectionMatchesBroadcastEccentricityTerm) {
+    // IGS SP3 / CLK clocks exclude the periodic relativistic effect, which
+    // users add as -2 r.v / c^2. On a Kepler orbit r.v = sqrt(mu a) e sin(E),
+    // so the term must equal the broadcast F e sqrt(A) sin(E) with
+    // F = -2 sqrt(mu) / c^2 = -4.442807633e-10 s/sqrt(m) (IS-GPS-200).
+    constexpr double kMu = 3.986005e14;
+    constexpr double kF = -4.442807633e-10;
+    const double a = 26'560'000.0;
+    const double e = 0.02;
+    const double b = a * std::sqrt(1.0 - e * e);
+    const double mean_motion = std::sqrt(kMu / (a * a * a));
+    // Perifocal -> ECI rotation (argument of perigee, inclination, node).
+    const Eigen::Matrix3d rotation =
+        (Eigen::AngleAxisd(0.7, Vector3d::UnitZ()) *
+         Eigen::AngleAxisd(55.0 * M_PI / 180.0, Vector3d::UnitX()) *
+         Eigen::AngleAxisd(1.1, Vector3d::UnitZ()))
+            .toRotationMatrix();
+    for (const double eccentric_anomaly : {0.0, 0.4, M_PI / 2.0, 2.5, -1.3}) {
+        const double sin_e = std::sin(eccentric_anomaly);
+        const double cos_e = std::cos(eccentric_anomaly);
+        const Vector3d r_pf(a * (cos_e - e), b * sin_e, 0.0);
+        const double e_dot = mean_motion / (1.0 - e * cos_e);
+        const Vector3d v_pf(-a * sin_e * e_dot, b * cos_e * e_dot, 0.0);
+        const Vector3d r_eci = rotation * r_pf;
+        const Vector3d v_eci = rotation * v_pf;
+
+        const double expected = kF * e * std::sqrt(a) * sin_e;
+        EXPECT_NEAR(preciseClockRelativisticCorrection(r_eci, v_eci), expected, 1e-15)
+            << "E=" << eccentric_anomaly;
+
+        // The Earth-rotation part of an ECEF velocity is perpendicular to r,
+        // so the ECEF state gives the same correction.
+        const Vector3d omega(0.0, 0.0, constants::OMEGA_E);
+        const Vector3d v_ecef = v_eci - omega.cross(r_eci);
+        EXPECT_NEAR(preciseClockRelativisticCorrection(r_eci, v_ecef), expected, 1e-15);
+    }
+    // Magnitude check: e = 0.02 at sin(E) = 1 is about -45.8 ns (-13.7 m).
+    const Vector3d r_pf(a * (0.0 - e), b, 0.0);
+    const double e_dot = mean_motion;
+    const Vector3d v_pf(-a * e_dot, 0.0, 0.0);
+    EXPECT_NEAR(preciseClockRelativisticCorrection(r_pf, v_pf) * constants::SPEED_OF_LIGHT,
+                -13.73, 0.01);
+    // Hand-computed state: r.v = 2e10 m^2/s -> -4e10 / c^2 s.
+    EXPECT_NEAR(preciseClockRelativisticCorrection(
+                    Vector3d(15.0e6, 20.0e6, 5.0e6), Vector3d(1000.0, -500.0, 3000.0)),
+                -4.0e10 / (constants::SPEED_OF_LIGHT * constants::SPEED_OF_LIGHT),
+                1e-20);
+}
+
+TEST(PPPTest, PreciseProductsCentralDifferenceVelocityAndClockAvailability) {
+    // Ten 15-min SP3 epochs of a uniformly accelerated track. The central
+    // difference derivative of the interpolating polynomial is exact for it;
+    // the former forward difference was off by a*h/2. Clocks are present
+    // for the first two epochs only (999999.999999 = missing afterwards).
+    const auto sp3_path = tempFilePath("libgnss_ppp_precise_velocity_test.sp3");
+    std::filesystem::remove(sp3_path);
+
+    const Vector3d p0(15'000'000.0, 20'000'000.0, 5'000'000.0);
+    const Vector3d v0(1000.0, -500.0, 3000.0);
+    const Vector3d acc(-0.3, -0.4, -0.1);
+    std::string sp3_text;
+    for (int k = 0; k < 10; ++k) {
+        const double t = 900.0 * k;
+        const Vector3d p = p0 + v0 * t + 0.5 * acc * t * t;
+        const int hour = (15 * k) / 60;
+        const int minute = (15 * k) % 60;
+        char line[160];
+        std::snprintf(line, sizeof(line), "*  2026 03 26 %02d %02d 00.00000000\n", hour, minute);
+        sp3_text += line;
+        const double clock_us = k < 2 ? 100.0 + k : 999999.999999;
+        std::snprintf(line, sizeof(line), "PG01 %14.6f %14.6f %14.6f %14.6f\n",
+                      p.x() / 1000.0, p.y() / 1000.0, p.z() / 1000.0, clock_us);
+        sp3_text += line;
+    }
+    writeTextFile(sp3_path, sp3_text);
+
+    PreciseProducts precise_products;
+    ASSERT_TRUE(precise_products.loadSP3File(sp3_path.string()));
+
+    Vector3d position = Vector3d::Zero();
+    Vector3d velocity = Vector3d::Zero();
+    double clock_bias = 0.0;
+    double clock_drift = 0.0;
+    bool clock_available = false;
+
+    const double t_query = 4.0 * 900.0 + 437.0;
+    ASSERT_TRUE(precise_products.interpolateOrbitClock(
+        SatelliteId(GNSSSystem::GPS, 1), makeTime(2026, 3, 26, 1, 7, 17.0),
+        position, velocity, clock_bias, clock_drift, &clock_available));
+    const Vector3d expected_position = p0 + v0 * t_query + 0.5 * acc * t_query * t_query;
+    const Vector3d expected_velocity = v0 + acc * t_query;
+    EXPECT_LT((position - expected_position).norm(), 1e-3);
+    EXPECT_LT((velocity - expected_velocity).norm(), 1e-5);
+    // No clock sample within 900 s of the query.
+    EXPECT_FALSE(clock_available);
+    EXPECT_EQ(clock_bias, 0.0);
+
+    ASSERT_TRUE(precise_products.interpolateOrbitClock(
+        SatelliteId(GNSSSystem::GPS, 1), makeTime(2026, 3, 26, 0, 7, 30.0),
+        position, velocity, clock_bias, clock_drift, &clock_available));
+    EXPECT_TRUE(clock_available);
+    EXPECT_NEAR(clock_bias, 100.5e-6, 1e-12);
+    // Plain SP3: centre-of-mass orbits.
+    EXPECT_FALSE(precise_products.orbits_at_antenna_phase_center);
+
+    // gnss nav-products marks its broadcast (antenna phase centre) orbits.
+    writeTextFile(sp3_path,
+                  "/* libgnss++ nav-products: broadcast orbits at the ANTENNA PHASE CENTER\n" +
+                      sp3_text);
+    PreciseProducts marked_products;
+    ASSERT_TRUE(marked_products.loadSP3File(sp3_path.string()));
+    EXPECT_TRUE(marked_products.orbits_at_antenna_phase_center);
+    marked_products.clear();
+    EXPECT_FALSE(marked_products.orbits_at_antenna_phase_center);
+
+    std::filesystem::remove(sp3_path);
 }
 
 TEST(PPPTest, CalculatePhaseWindupResolvesAmbiguityAgainstPriorAccumulator) {
@@ -2486,6 +2843,96 @@ TEST(PPPTest, ProcessorLoadsRtcmSsrCodeBiasFromFile) {
     std::filesystem::remove(rtcm_path);
 }
 
+TEST(PPPTest, ProcessorHasIddProfileHoldsIodeTaggedUpdatesAndRtcmCodeBiases) {
+    const auto rtcm_path = tempFilePath("libgnss_ppp_ssr_rtcm_has_idd_test.rtcm3");
+    std::filesystem::remove(rtcm_path);
+
+    NavigationData nav_data;
+    const Ephemeris eph = makeBroadcastGpsEphemeris(1);
+    nav_data.addEphemeris(eph);
+
+    // HAS IDD code-bias messages carry a stale epoch; RTCM SSR signal id 0 is
+    // GPS L1 C/A and must be remapped to the libgnss++ bias key.
+    std::vector<uint8_t> frames = buildGps1059CodeBiasFrame(1, 0, -12, 300000);
+    const auto first = buildGps1060CombinedFrame(1, 345600, 77, 1200);   // 0.12 m
+    const auto second = buildGps1060CombinedFrame(1, 345610, 78, 2400);  // 0.24 m, new IODE
+    frames.insert(frames.end(), first.begin(), first.end());
+    frames.insert(frames.end(), second.begin(), second.end());
+    writeBinaryFile(rtcm_path, frames);
+
+    PPPProcessor processor;
+    ASSERT_TRUE(processor.loadRTCMSSRProducts(
+        rtcm_path.string(), nav_data, 1.0, PPPProcessor::RTCMSSRProfile::GalileoHasIdd));
+
+    const SatelliteId sat(GNSSSystem::GPS, 1);
+    Vector3d orbit = Vector3d::Zero();
+    double clock_m = 0.0;
+    std::map<uint8_t, double> code_bias_m;
+    int iode = -1;
+    const auto query = [&](const PPPProcessor& source, double tow) {
+        code_bias_m.clear();
+        return source.loadedSSRProducts().interpolateCorrection(
+            sat, GNSSTime(eph.toe.week, tow), orbit, clock_m, nullptr, &code_bias_m,
+            nullptr, nullptr, nullptr, nullptr, nullptr, 0, &iode);
+    };
+    // Held (not interpolated toward the next update) with the first IODE.
+    ASSERT_TRUE(query(processor, 345609.0));
+    EXPECT_NEAR(clock_m, 0.12, 1e-9);
+    EXPECT_EQ(iode, 77);
+    // RTCM bias -0.12 m (added to the pseudorange) on L1 C/A -> internal key 2
+    // in the subtract-from-pseudorange convention: +0.12 m.
+    ASSERT_EQ(code_bias_m.size(), 1U);
+    ASSERT_EQ(code_bias_m.count(2U), 1U);
+    EXPECT_NEAR(code_bias_m.at(2U), 0.12, 1e-9);
+    ASSERT_TRUE(query(processor, 345610.0));
+    EXPECT_NEAR(clock_m, 0.24, 1e-9);
+    EXPECT_EQ(iode, 78);
+    // The last update is held for up to kHasIddMaxHoldSeconds.
+    ASSERT_TRUE(query(processor, 345699.0));
+    EXPECT_NEAR(clock_m, 0.24, 1e-9);
+    EXPECT_EQ(iode, 78);
+
+    // The legacy profile keeps the historical conversion (no IODE tag).
+    PPPProcessor legacy;
+    ASSERT_TRUE(legacy.loadRTCMSSRProducts(rtcm_path.string(), nav_data, 1.0));
+    ASSERT_TRUE(query(legacy, 345600.0));
+    EXPECT_EQ(iode, -1);
+
+    std::filesystem::remove(rtcm_path);
+}
+
+TEST(PPPTest, HasIddCodeBiasMappingUsesRtcmSignalIdsAndDropsUnknownIds) {
+    const auto rtcm_path = tempFilePath("libgnss_ppp_ssr_rtcm_has_idd_bias_test.rtcm3");
+    std::filesystem::remove(rtcm_path);
+    NavigationData nav_data;
+    const Ephemeris eph = makeBroadcastGpsEphemeris(1);
+    nav_data.addEphemeris(eph);
+
+    std::vector<uint8_t> frames;
+    for (const auto& frame : {buildGps1059CodeBiasFrame(1, 10, 25, 300000),   // L2 P
+                              buildGps1060CombinedFrame(1, 345600, 77, 0),
+                              buildGps1059CodeBiasFrame(1, 17, 99, 300000),   // L1C (D): unmapped
+                              buildGps1060CombinedFrame(1, 345610, 77, 0)}) {
+        frames.insert(frames.end(), frame.begin(), frame.end());
+    }
+    writeBinaryFile(rtcm_path, frames);
+
+    PPPProcessor processor;
+    ASSERT_TRUE(processor.loadRTCMSSRProducts(
+        rtcm_path.string(), nav_data, 1.0, PPPProcessor::RTCMSSRProfile::GalileoHasIdd));
+    for (const double tow : {345605.0, 345615.0}) {
+        Vector3d orbit = Vector3d::Zero();
+        double clock_m = 0.0;
+        std::map<uint8_t, double> code_bias_m;
+        ASSERT_TRUE(processor.interpolateLoadedSSRCorrection(
+            SatelliteId(GNSSSystem::GPS, 1), GNSSTime(eph.toe.week, tow), orbit, clock_m,
+            nullptr, &code_bias_m));
+        ASSERT_EQ(code_bias_m.size(), 1U) << tow;
+        EXPECT_NEAR(code_bias_m.at(9U), -0.25, 1e-9) << tow;  // GPS_L2P key
+    }
+    std::filesystem::remove(rtcm_path);
+}
+
 TEST(PPPTest, MadocaL6dShadowSelectsFreshCausalSatelliteCorrections) {
     const GNSSTime epoch(2414, 345600.0);
     io::MadocaIonoSnapshot snapshot;
@@ -2567,7 +3014,7 @@ TEST(PPPTest, ProcessorProducesConvergedFloatSolutionWithSyntheticPreciseProduct
 
     NavigationData nav_data;
     PositionSolution last_solution;
-    for (int i = 0; i < 8; ++i) {
+    for (int i = 0; i < kSyntheticPreciseEpochs; ++i) {
         const ObservationData epoch = makeSyntheticEpoch(
             first_time + 30.0 * static_cast<double>(i),
             true_receiver_position,
@@ -2583,8 +3030,8 @@ TEST(PPPTest, ProcessorProducesConvergedFloatSolutionWithSyntheticPreciseProduct
     EXPECT_LT(last_solution.residual_rms, 0.2);
 
     const auto stats = processor.getStats();
-    EXPECT_EQ(stats.total_epochs, 8U);
-    EXPECT_EQ(stats.valid_solutions, 8U);
+    EXPECT_EQ(stats.total_epochs, static_cast<unsigned>(kSyntheticPreciseEpochs));
+    EXPECT_EQ(stats.valid_solutions, static_cast<unsigned>(kSyntheticPreciseEpochs));
 
     std::filesystem::remove(sp3_path);
     std::filesystem::remove(clk_path);
@@ -2774,7 +3221,7 @@ TEST(PPPTest, ProcessorFixesSyntheticAmbiguitiesWithPreciseProducts) {
     bool saw_fixed_solution = false;
     int best_fixed_ambiguities = 0;
     double best_ratio = 0.0;
-    for (int i = 0; i < 8; ++i) {
+    for (int i = 0; i < kSyntheticPreciseEpochs; ++i) {
         const ObservationData epoch = makeSyntheticEpoch(
             first_time + 30.0 * static_cast<double>(i),
             true_receiver_position,
@@ -2939,3 +3386,300 @@ TEST(PPPMultifrequencyTest, MatchesMadocalibExtraWideLaneDoubleDifference) {
                 1e-12);
     EXPECT_NEAR(value, 0.12, 1e-12);
 }
+
+using namespace libgnss::ppp_clas_epoch_internal;
+
+TEST(PPPEnvOverridesTest, ClasReceiverTideKnobsAreOffByDefaultAndStrict) {
+    ScopedEnvironmentVariable tide("GNSS_PPP_CLAS_RECEIVER_TIDE");
+    ScopedEnvironmentVariable permanent("GNSS_PPP_CLAS_TIDE_NO_PERMANENT");
+    ScopedEnvironmentVariable blq("GNSS_PPP_CLAS_GRID_BLQ");
+
+    tide.clear();
+    permanent.clear();
+    blq.clear();
+    auto overrides = PPPEnvOverrides::fromEnvironment();
+    EXPECT_FALSE(overrides.clas_receiver_tide);
+    EXPECT_FALSE(overrides.clas_tide_no_permanent);
+    EXPECT_TRUE(overrides.clas_grid_blq_path.empty());
+
+    for (const char* invalid : {"", "0", "2", "true", "1trailing"}) {
+        tide.set(invalid);
+        permanent.set(invalid);
+        overrides = PPPEnvOverrides::fromEnvironment();
+        EXPECT_FALSE(overrides.clas_receiver_tide) << "value=" << invalid;
+        EXPECT_FALSE(overrides.clas_tide_no_permanent) << "value=" << invalid;
+    }
+
+    tide.set("1");
+    permanent.set("1");
+    blq.set("/tmp/clas_grid.blq");
+    overrides = PPPEnvOverrides::fromEnvironment();
+    EXPECT_TRUE(overrides.clas_receiver_tide);
+    EXPECT_TRUE(overrides.clas_tide_no_permanent);
+    EXPECT_EQ(overrides.clas_grid_blq_path, "/tmp/clas_grid.blq");
+}
+
+TEST(PPPClasTideTest, PermanentDeformationTermMatchesMrtklibOptBit8) {
+    // MRTKLIB tide_solid() adds du=0.1196*(1.5*sin^2(phi)-0.5) up and
+    // dn=0.0247*sin(2*phi) north only when tidedisp() opt has bit 8, which
+    // clas_osr_zdres() (opt=5) never sets.
+    const Vector3d tokyo_ecef(-3961765.5, 3349009.3, 3698311.5);
+    const double mjd_utc = 60514.05;
+    const Vector3d with_term =
+        mrtklibClasSolidTide(tokyo_ecef, mjd_utc, true);
+    const Vector3d without_term =
+        mrtklibClasSolidTide(tokyo_ecef, mjd_utc, false);
+    const double latitude = std::asin(tokyo_ecef.z() / tokyo_ecef.norm());
+    const double longitude = std::atan2(tokyo_ecef.y(), tokyo_ecef.x());
+    const double up = 0.1196 * (1.5 * std::pow(std::sin(latitude), 2) - 0.5);
+    const double north = 0.0247 * std::sin(2.0 * latitude);
+    const Vector3d expected =
+        enu2ecef(Vector3d(0.0, north, up), latitude, longitude);
+    EXPECT_NEAR((with_term - without_term - expected).norm(), 0.0, 1e-12);
+    EXPECT_GT((with_term - without_term).norm(), 0.02);
+    // The default argument keeps the historical behavior.
+    EXPECT_EQ(mrtklibClasSolidTide(tokyo_ecef, mjd_utc), with_term);
+    // MRTKLIB's solid tide at this site/epoch is ~(+0.055 E, -0.021 N,
+    // +0.122 U) m including pole tide: the permanent-free north term is
+    // negative while the legacy term flips it to ~0.
+    const Vector3d enu_without =
+        ecef2enu(without_term, 35.6676 * M_PI / 180.0, 139.7911 * M_PI / 180.0);
+    const Vector3d enu_with =
+        ecef2enu(with_term, 35.6676 * M_PI / 180.0, 139.7911 * M_PI / 180.0);
+    EXPECT_LT(enu_without.y(), -0.01);
+    EXPECT_NEAR(enu_with.y() - enu_without.y(), north, 1e-4);
+}
+
+TEST(PPPClasTideTest, ClasGridBlqParserReadsNetworkGridRecords) {
+    std::istringstream input(
+        "$$ header\n"
+        "$$ END HEADER\n"
+        "$$\n"
+        "  7-17     \n"
+        "$$ FES2004_PP ID: 2020-03-23 09:37:09\n"
+        "$$ 7-17,   RADI TANG  lon/lat:  140.0300   35.8500    0.000\n"
+        "  .00799 .00419 .00123 .00124 .01091 .00848 .00361 .00168 .00034 .00010 .00004\n"
+        "  .00259 .00132 .00034 .00037 .00219 .00179 .00073 .00035 .00010 .00003 .00001\n"
+        "  .00227 .00078 .00047 .00018 .00194 .00147 .00064 .00029 .00004 .00004 .00004\n"
+        "    52.6   72.7   58.9   67.1 -136.5 -154.9 -136.4 -162.6  -13.8  -32.3  -15.2\n"
+        "   -14.0   24.6  -26.2   25.2 -170.7  169.5 -170.4  161.7  -34.5  -49.3  -29.8\n"
+        "   -79.8  -63.6  -90.5  -68.0   86.0   67.5   86.6   56.0   46.9   33.6    4.8\n"
+        "$$\n"
+        "  7-18     \n"
+        "  .1 .2 .3\n"
+        "$$\n"
+        "  11-3     \n"
+        "  .00100 .00100 .00100 .00100 .00100 .00100 .00100 .00100 .00100 .00100 .00100\n"
+        "  .00200 .00200 .00200 .00200 .00200 .00200 .00200 .00200 .00200 .00200 .00200\n"
+        "  .00300 .00300 .00300 .00300 .00300 .00300 .00300 .00300 .00300 .00300 .00300\n"
+        "     1.0    2.0    3.0    4.0    5.0    6.0    7.0    8.0    9.0   10.0   11.0\n"
+        "     1.0    2.0    3.0    4.0    5.0    6.0    7.0    8.0    9.0   10.0   11.0\n"
+        "     1.0    2.0    3.0    4.0    5.0    6.0    7.0    8.0    9.0   10.0   11.0\n");
+    const auto table = parseClasGridBlq(input);
+    // The truncated 7-18 record is dropped, the others are keyed by (net, grid).
+    ASSERT_EQ(table.size(), 2u);
+    ASSERT_EQ(table.count({7, 17}), 1u);
+    ASSERT_EQ(table.count({11, 3}), 1u);
+    EXPECT_EQ(table.count({7, 18}), 0u);
+    // The runtime table reproduces the embedded tokyo/run2 7-17 record.
+    EXPECT_EQ(table.at({7, 17}), kTokyoClasBlq[0]);
+    EXPECT_DOUBLE_EQ(table.at({11, 3})[2][5], 0.003);
+    EXPECT_DOUBLE_EQ(table.at({11, 3})[5][10], 11.0);
+}
+
+TEST(PPPClasTideTest, ReceiverTideStaysDisabledForForeignNetworkByDefault) {
+    if (pppEnvOverrides().clas_receiver_tide) {
+        GTEST_SKIP() << "GNSS_PPP_CLAS_RECEIVER_TIDE is set in this process";
+    }
+    const Vector3d nagoya_ecef(-3810226.6, 3567862.1, 3652911.4);
+    const GNSSTime time(2323, 556000.0);
+    const std::array<double, 4> weights{{0.25, 0.25, 0.25, 0.25}};
+    // Legacy behavior: only network 7 receives a tide displacement.
+    EXPECT_EQ(mrtklibTokyoClasTideDisplacement(nagoya_ecef, time, 8, weights),
+              Vector3d::Zero());
+}
+
+// --- MADOCA per-frequency path: 50 m phase prefit floor + post-fit screening ---
+
+namespace libgnss {
+
+// Befriended by PPPProcessor (see ppp.hpp) to drive formMeasurementEquations
+// with a hand-built filter state.
+struct PPPProcessorTestAccess {
+    using Obs = PPPProcessor::IonosphereFreeObs;
+
+    static PPPProcessor::PPPConfig& config(PPPProcessor& p) { return p.ppp_config_; }
+
+    // One GPS satellite carrying L1/L2/L5 code and phase rows whose code
+    // residuals are zero and whose phase residuals are all `phase_offset_m`.
+    // Returns the phase row bands that survived the prefit gate.
+    static std::vector<std::string> phaseBands(PPPProcessor& p,
+                                               bool madoca,
+                                               bool converged,
+                                               bool kinematic,
+                                               double phase_offset_m) {
+        p.env_overrides_ = PPPEnvOverrides{};
+        p.ppp_config_.use_ionosphere_free = false;
+        p.ppp_config_.estimate_ionosphere = true;
+        p.ppp_config_.use_clas_osr_filter = false;
+        p.ppp_config_.kinematic_mode = kinematic;
+        p.ppp_config_.enable_outlier_detection = true;
+        p.ssr_products_loaded_ = true;
+        p.require_coherent_ssr_ = madoca;
+        p.converged_ = converged;
+
+        const SatelliteId sat(GNSSSystem::GPS, 5);
+        const Vector3d receiver = geodetic2ecef(
+            35.0 * M_PI / 180.0, 139.0 * M_PI / 180.0, 50.0);
+        const Vector3d satellite = receiver + Vector3d(8.0e6, 6.0e6, 20.0e6);
+        const double range = geodist(satellite, receiver);
+
+        auto& fs = p.filter_state_;
+        fs.pos_index = 0;
+        fs.clock_index = 6;
+        fs.trop_index = 8;
+        const int iono_index = 9;
+        const int n1_index = 10;
+        const int n2_index = 11;
+        const int n3_index = 12;
+        const int ifb_index = 13;
+        fs.total_states = 14;
+        fs.state = VectorXd::Zero(fs.total_states);
+        fs.covariance = MatrixXd::Identity(fs.total_states, fs.total_states);
+        fs.ionosphere_indices[sat] = iono_index;
+        fs.ambiguity_indices[sat] = n1_index;
+        fs.ambiguity_l2_indices[sat] = n2_index;
+        fs.additional_ambiguity_indices[{sat, SignalType::GPS_L5}] = n3_index;
+        fs.receiver_frequency_bias_indices
+            [algorithms::ppp_multifrequency::receiverFrequencyBiasKey(sat, 2)] =
+                ifb_index;
+
+        auto& ambiguity = p.ambiguity_states_[sat];
+        ambiguity.needs_reinitialization = false;
+        ambiguity.lock_count = 5;
+        ambiguity.frequency_lifecycle[SignalType::GPS_L5].lock_count = 5;
+
+        Obs obs;
+        obs.satellite = sat;
+        obs.valid = true;
+        obs.has_carrier_phase = true;
+        obs.has_carrier_phase_l2 = true;
+        obs.has_l2 = true;
+        obs.receiver_position = receiver;
+        obs.satellite_position = satellite;
+        obs.elevation = 0.8;
+        obs.trop_mapping = 1.5;
+        obs.freq_l1 = constants::GPS_L1_FREQ;
+        obs.freq_l2 = constants::GPS_L2_FREQ;
+        obs.pseudorange_if = range;
+        obs.carrier_phase_if = range + phase_offset_m;
+        obs.pseudorange_l2 = range;
+        obs.carrier_phase_l2 = range + phase_offset_m;
+        Obs::AdditionalFrequencyObs l5;
+        l5.ordinal = 2;
+        l5.signal = SignalType::GPS_L5;
+        l5.valid = true;
+        l5.has_carrier_phase = true;
+        l5.frequency = 1176.45e6;
+        l5.pseudorange = range;
+        l5.carrier_phase = range + phase_offset_m;
+        obs.additional_frequencies.push_back(l5);
+
+        NavigationData nav;
+        const auto equation = p.formMeasurementEquations(
+            {obs}, nav, GNSSTime(2300, 100.0), true, false);
+        std::vector<std::string> bands;
+        for (size_t i = 0; i < equation.row_is_phase.size(); ++i) {
+            if (equation.row_is_phase[i]) {
+                bands.push_back(equation.row_signal_bands[i]);
+            }
+        }
+        return bands;
+    }
+};
+
+}  // namespace libgnss
+
+namespace {
+
+std::vector<std::string> madocaGatePhaseBands(bool madoca,
+                                              bool converged,
+                                              double phase_offset_m,
+                                              bool kinematic = false) {
+    PPPProcessor processor;
+    return PPPProcessorTestAccess::phaseBands(
+        processor, madoca, converged, kinematic, phase_offset_m);
+}
+
+const std::vector<std::string> kAllPhaseBands = {"L1", "L2", "L3"};
+
+}  // namespace
+
+TEST(PPPMadocaGateScreen, ConvergedMadocaKeepsPhaseRowsBetween20And40Metres) {
+    for (const double offset_m : {20.0, 30.0, 40.0, -35.0}) {
+        EXPECT_EQ(madocaGatePhaseBands(true, true, offset_m), kAllPhaseBands)
+            << "offset " << offset_m;
+        // Kinematic converged floor is 20 m for L1; MADOCA still reaches 50 m.
+        EXPECT_EQ(madocaGatePhaseBands(true, true, offset_m, true), kAllPhaseBands)
+            << "kinematic offset " << offset_m;
+    }
+}
+
+TEST(PPPMadocaGateScreen, MadocaStillRejectsPhaseBeyondMaxInnovation) {
+    EXPECT_TRUE(madocaGatePhaseBands(true, true, 55.0).empty());
+    EXPECT_TRUE(madocaGatePhaseBands(true, false, 55.0).empty());
+}
+
+TEST(PPPMadocaGateScreen, NonMadocaConvergedRejectsPhaseAbove10Metres) {
+    for (const double offset_m : {20.0, 30.0, 40.0}) {
+        EXPECT_TRUE(madocaGatePhaseBands(false, true, offset_m).empty())
+            << "offset " << offset_m;
+    }
+    // Kinematic converged keeps its 20 m L1 floor and the 10 m L2/L3 floors.
+    EXPECT_EQ(madocaGatePhaseBands(false, true, 15.0, true),
+              std::vector<std::string>{"L1"});
+    EXPECT_TRUE(madocaGatePhaseBands(false, true, 30.0, true).empty());
+}
+
+TEST(PPPMadocaGateScreen, NonMadocaKeepsExistingFloorBelowConvergence) {
+    // Unconverged non-kinematic floor is already 50 m; unchanged.
+    EXPECT_EQ(madocaGatePhaseBands(false, false, 30.0), kAllPhaseBands);
+    EXPECT_TRUE(madocaGatePhaseBands(false, false, 55.0).empty());
+    // Within the converged 10 m floor, both paths agree.
+    EXPECT_EQ(madocaGatePhaseBands(false, true, 5.0), kAllPhaseBands);
+    EXPECT_EQ(madocaGatePhaseBands(true, true, 5.0), kAllPhaseBands);
+}
+
+TEST(PPPMadocaGateScreen, FloorHelperRaisesOnlyOnMadocaPerFrequencyPath) {
+    using namespace ppp_internal;
+    EXPECT_DOUBLE_EQ(phaseInnovationFloorM(10.0, true), 50.0);
+    EXPECT_DOUBLE_EQ(phaseInnovationFloorM(20.0, true), 50.0);
+    EXPECT_DOUBLE_EQ(phaseInnovationFloorM(200.0, true), 200.0);
+    EXPECT_DOUBLE_EQ(phaseInnovationFloorM(10.0, false), 10.0);
+    EXPECT_DOUBLE_EQ(phaseInnovationFloorM(200.0, false), 200.0);
+
+    EXPECT_TRUE(madocaPerFrequencyPath(true, true, false, true, false));
+    EXPECT_FALSE(madocaPerFrequencyPath(false, true, false, true, false));
+    EXPECT_FALSE(madocaPerFrequencyPath(true, false, false, true, false));
+    EXPECT_FALSE(madocaPerFrequencyPath(true, true, true, true, false));
+    EXPECT_FALSE(madocaPerFrequencyPath(true, true, false, false, false));
+    EXPECT_FALSE(madocaPerFrequencyPath(true, true, false, true, true));
+}
+
+TEST(PPPMadocaGateScreen, PostfitScreeningEnabledOnMadocaPerFrequencyPath) {
+    using namespace ppp_internal;
+    // MADOCA per-frequency path (kinematic): enabled.
+    EXPECT_TRUE(usePostfitResidualScreening(true, true, false, true));
+    // Coherent MADOCA outside the per-frequency path (e.g. ionosphere-free): still off.
+    EXPECT_FALSE(usePostfitResidualScreening(true, true, false, false));
+    EXPECT_FALSE(usePostfitResidualScreening(true, true, false));
+    // Static / low-dynamics runs stay off.
+    EXPECT_FALSE(usePostfitResidualScreening(false, true, false, true));
+    // Non-MADOCA kinematic keeps screening; CLAS OSR stays off.
+    EXPECT_TRUE(usePostfitResidualScreening(true, false, false));
+    EXPECT_TRUE(usePostfitResidualScreening(true, false, false, false));
+    EXPECT_FALSE(usePostfitResidualScreening(true, false, true));
+    EXPECT_FALSE(usePostfitResidualScreening(true, true, true, true));
+    EXPECT_FALSE(usePostfitResidualScreening(false, false, false));
+}
+

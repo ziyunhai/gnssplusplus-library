@@ -27,10 +27,10 @@ That is it: build, verify your machine, then pick a path below.
 No build, no dependencies — mount only the output directory:
 
 ```bash
-docker pull ghcr.io/rsasaki0109/gnssplusplus-library:v0.2.0
+docker pull ghcr.io/rsasaki0109/gnssplusplus-library:v0.3.0
 mkdir -p output
 docker run --rm -v "$PWD/output:/workspace/output" \
-  ghcr.io/rsasaki0109/gnssplusplus-library:v0.2.0 \
+  ghcr.io/rsasaki0109/gnssplusplus-library:v0.3.0 \
   demo --output-dir /workspace/output/self-contained-demo
 ```
 
@@ -47,6 +47,7 @@ This is an offline plumbing check, not a field-accuracy claim.
 | [Architecture](architecture.md) | [Validation & sign-off](validation.md) | [Interfaces](interfaces.md) |
 | [IMU fusion](imu_fusion.md) | [Benchmarks](benchmarks.md) | [Quick Start commands](quickstart.md) |
 | [Tight coupling](tight_coupling.md) | [PPC reproduction](ppc_reproduction.md) | [Experiments](experiments.md) |
+| | [Real-time stress harness](realtime_stress.md) | |
 
 ## Visuals
 
@@ -55,7 +56,7 @@ This is an offline plumbing check, not a field-accuracy claim.
 
 ## Release & community
 
-- [v0.2.0 release highlights](releases/v0.2.0.md)
+- [v0.3.0 release highlights](releases/v0.3.0.md)
 - [Maintainer release runbook](release_runbook.md)
 - [Community onboarding](community.md) · [Contributing](contributing.md)
 - [Dataset gallery](dataset_gallery.md)

@@ -3,6 +3,7 @@
 #include <deque>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include <Eigen/Dense>
@@ -51,6 +52,9 @@ public:
         double zupt_gnss_speed_gate_threshold_mps = 0.5;
 
         bool nhc_enable = false;  ///< off unless platform == vehicle (docs/design.md 3.8)
+        // Opt-in vehicle experiment: avoid applying body-velocity constraints
+        // while heading is still unobserved. False preserves existing users.
+        bool nhc_require_heading_alignment = false;
         double nhc_sigma_lateral_mps = 0.3;
         double nhc_sigma_vertical_mps = 0.2;
 
@@ -173,6 +177,110 @@ public:
         // Maximum norm of a velocity-only re-anchor correction in m/s. <= 0
         // disables re-anchoring; a large correction is treated as untrusted.
         double max_gnss_velocity_reanchor_mps = 20.0;
+
+        // Opt-in (velocity_consistency_v1): when the GNSS-course heading is
+        // latched, also re-anchor the velocity state to the same epoch's
+        // GNSS antenna velocity (the reanchorVelocityFromGnssSolution()
+        // reset: lever-arm compensated with the NEW attitude, covariance =
+        // GNSS covariance, velocity cross-covariances cleared). The latch
+        // rotates only the attitude; velocity and every velocity/attitude/
+        // bias correlation were produced by a filter running with an
+        // arbitrary pre-latch yaw. False keeps the previous behavior.
+        bool reanchor_velocity_on_heading_latch = false;
+
+        // Opt-in (velocity_consistency_v2): lockout-proof recovery of the
+        // position NIS gate for the precise (RTK FLOAT/FIXED) class. The
+        // consecutive-rejection counter above is shared by every solution
+        // class, reset by any accepted update and (for FLOAT/SPP) zeroed by
+        // every non-FIXED epoch. A coarse SPP update (sigma metres) can
+        // therefore keep passing the gate while every precise FLOAT update
+        // (sigma ~0.1 m) is rejected for the whole run, and once the state
+        // has drifted beyond the SPP gate as well, nothing is accepted.
+        // With a value N > 0, a separate counter counts consecutive gate
+        // rejections of FLOAT/FIXED position updates only; SPP/DGPS epochs
+        // neither advance nor reset it. A FLOAT/FIXED update accepted by the
+        // gate resets it. At N the position-only re-anchor
+        // (reanchorPositionFromFixedSolution(): position set from the
+        // lever-arm compensated GNSS antenna position, covariance = GNSS
+        // covariance + lever-arm attitude term, all position cross-
+        // covariances cleared, attitude/velocity/bias untouched) is applied
+        // from that FLOAT/FIXED solution, then the counter restarts. <= 0
+        // keeps the previous behavior.
+        //
+        // The re-anchor is additionally refused unless the FLOAT/FIXED
+        // position is consistent with the most recent coarse (non-FLOAT/
+        // FIXED) GNSS position no older than float_reanchor_max_coarse_age_s:
+        // NIS of their difference against both covariances, plus the
+        // displacement variance (|velocity| * age)^2, must not exceed
+        // max_position_update_nis_per_observation per axis (no gate value
+        // means no check). A drifting RTK float (observed: 140 m off while
+        // reporting 0.1 m) is otherwise indistinguishable from a recovered
+        // one. With no recent coarse position the re-anchor is not taken.
+        int float_position_reanchor_after_rejections = 0;
+        double float_reanchor_max_coarse_age_s = 1.0;
+
+        // velocity_consistency_v4: post-gap re-anchor. > 0 enables it; the
+        // value is the GNSS-absence duration (s) after which the position
+        // prior is regarded as unverified. Inertial propagation without any
+        // accepted GNSS position update grows the position error through
+        // unmodelled terms (attitude/lever/dynamics error) that the 15-state
+        // covariance does not carry, so the covariance of the prior is only
+        // trustworthy while GNSS keeps verifying it. When a FLOAT/FIXED
+        // position update is rejected by the NIS gate and the last accepted
+        // GNSS position update of any class is older than this value, the
+        // rejection is attributed to the prior (the only element that was
+        // propagated unverified) rather than to the measurement, whose
+        // reported covariance has been checked against the same epoch's SPP
+        // (RTKConfig::ReportedCovarianceMode::SPP_CONSISTENCY_SCALED), and
+        // the position-only re-anchor above is applied at once. The coarse
+        // cross-check of float_position_reanchor_after_rejections cannot be
+        // used here by construction (no coarse position is current after a
+        // gap). Steady-state rejections (a recent update was accepted) are
+        // untouched. <= 0 keeps the previous behavior.
+        double position_reanchor_after_gnss_gap_s = 0.0;
+
+        // velocity_consistency_v8 (l): when true, the FLOAT/FIXED re-anchors
+        // of float_position_reanchor_after_rejections (v2) and
+        // position_reanchor_after_gnss_gap_s (v4) refuse a solution whose
+        // PositionSolution::float_prefit_gate_exceeded is set (its own update
+        // prefit residual failed the RTK processor's configured float prefit
+        // gate). The NIS gate then stands as the decision for that epoch; the
+        // rejection streak and the gap are unchanged. The FIXED-patience
+        // re-anchor (max_consecutive_gate_rejections) is not affected. false
+        // keeps the previous behavior bit-for-bit.
+        bool reanchor_requires_prefit_gate_pass = false;
+
+        // velocity_consistency_v5: direction test at the heading latch. The
+        // GNSS course over ground is the direction of travel, which equals the
+        // body +X axis only when the vehicle moves forward. When true, the
+        // filter integrates a signed longitudinal body velocity from the IMU
+        // (v_long += a_x * dt with a_x = [(accel_raw - accel_bias) +
+        // R_bn^T * (0, 0, -g)]_x, i.e. the body-forward kinematic
+        // acceleration, which depends on roll/pitch but not on the unknown
+        // yaw) and zeroes it whenever the ZUPT stationarity condition
+        // (gnssSpeedGateAllowsZupt() && detectStationary(), evaluated whether
+        // or not zupt_enable is set) holds. v_long is invalid after
+        // (re)initialization until that condition first holds. At the heading
+        // latch, a valid v_long < 0 means the vehicle moves backward and the
+        // latched heading is the tracker's mean course + 180 deg. Latch time,
+        // sigma and velocity re-anchoring are unchanged. False keeps the
+        // previous behavior bit-for-bit.
+        bool heading_latch_direction_test = false;
+
+        // velocity_consistency_v10 (docs/online_pva_candidate_v11.md). While the
+        // heading is not latched the yaw is unobservable (sigma 180 deg, the
+        // error-state linearization about an arbitrary nominal yaw is invalid),
+        // and the measurement updates spread their innovation into roll/pitch
+        // and both IMU biases; the latch resets only the yaw, so the tilt and
+        // bias learned in that regime stay, with a tight and wrong covariance.
+        // When true, every measurement update of this filter (position,
+        // velocity, ZUPT, NHC) made while heading_aligned_ is false is a
+        // Schmidt-Kalman consider update for the attitude and both bias
+        // states: their gain rows are zero, so they are left unchanged, and
+        // the covariance is updated in Joseph form (consistent for any gain).
+        // Updates after the latch are unchanged. False keeps the previous
+        // behavior bit-for-bit.
+        bool consider_attitude_and_biases_before_heading_latch = false;
     };
 
     explicit LooseCouplingProcessor(const Config& config);
@@ -280,6 +388,11 @@ public:
     }
     /** True when the last position correction was a fixed-solution re-anchor. */
     bool lastGnssPositionReanchored() const { return last_gnss_position_reanchored_; }
+    /** True when the last solution would have been re-anchored but
+     * reanchor_requires_prefit_gate_pass refused it. */
+    bool lastGnssPositionReanchorRefusedByPrefitGate() const {
+        return last_gnss_position_reanchor_refused_by_prefit_gate_;
+    }
     /** True when the last velocity correction was a bounded Doppler re-anchor. */
     bool lastGnssVelocityReanchored() const {
         return last_gnss_velocity_reanchored_;
@@ -290,6 +403,36 @@ public:
 
     /** Number of applied loose-coupling ZUPT updates (diagnostic). */
     std::size_t zuptUpdateCount() const { return zupt_updates_; }
+
+    /** Signed longitudinal body velocity integrated for the heading-latch
+     * direction test (Config::heading_latch_direction_test); 0 while the
+     * option is off. Only meaningful when longitudinalVelocityValid(). */
+    double longitudinalVelocityMps() const { return v_long_; }
+    bool longitudinalVelocityValid() const { return v_long_valid_; }
+    /** velocity_consistency_v6: the next static-window initialization sets
+     * the nominal gyro bias to this value instead of the window mean (the
+     * seed is consumed by that initialization). Attitude, accel bias and all
+     * covariances are those of the unseeded initialization. A second call
+     * before the initialization replaces the pending seed. */
+    void seedGyroBiasForNextInitialization(const Eigen::Vector3d& gyro_bias) {
+        pending_gyro_bias_seed_ = gyro_bias;
+    }
+    /** True while a seed is waiting for the next initialization. */
+    bool hasPendingGyroBiasSeed() const { return pending_gyro_bias_seed_.has_value(); }
+    /** True when the most recent initialization used a seeded gyro bias. */
+    bool lastInitializationGyroBiasSeeded() const { return last_init_gyro_bias_seeded_; }
+    /** Window-mean gyro bias of the most recent initialization that applied a
+     * seed (the value the seed replaced); NaN before any seeded one. */
+    const Eigen::Vector3d& lastInitializationWindowGyroBias() const {
+        return last_init_window_gyro_bias_;
+    }
+    /** True when the most recent heading latch used course + 180 deg. */
+    bool lastLatchDirectionFlipped() const { return last_latch_direction_flipped_; }
+    /** Number of heading latches that used course + 180 deg. */
+    std::size_t latchDirectionFlipCount() const { return latch_direction_flip_count_; }
+    /** v_long at the most recent heading latch (NaN before any latch or when
+     * the option is off / v_long was not valid). */
+    double lastLatchLongitudinalVelocityMps() const { return last_latch_v_long_mps_; }
 
 private:
     Config config_;
@@ -311,10 +454,31 @@ private:
     double last_gnss_velocity_speed_mps_ = 0.0;
     std::size_t zupt_updates_ = 0;
 
+    // velocity_consistency_v6 gyro-bias seed for the next initialization.
+    std::optional<Eigen::Vector3d> pending_gyro_bias_seed_;
+    bool last_init_gyro_bias_seeded_ = false;
+    Eigen::Vector3d last_init_window_gyro_bias_ =
+        Eigen::Vector3d::Constant(std::numeric_limits<double>::quiet_NaN());
+
+    // Heading-latch direction test (Config::heading_latch_direction_test).
+    double v_long_ = 0.0;
+    bool v_long_valid_ = false;
+    bool last_latch_direction_flipped_ = false;
+    std::size_t latch_direction_flip_count_ = 0;
+    double last_latch_v_long_mps_ = std::numeric_limits<double>::quiet_NaN();
+
     int position_consecutive_gate_rejections_ = 0;
     int velocity_consecutive_gate_rejections_ = 0;
+    int float_class_consecutive_gate_rejections_ = 0;
+    bool have_coarse_position_ = false;
+    GNSSTime coarse_position_time_;
+    bool have_position_update_time_ = false;
+    GNSSTime last_position_update_time_;
+    Eigen::Vector3d coarse_antenna_position_enu_ = Eigen::Vector3d::Zero();
+    Eigen::Matrix3d coarse_position_covariance_enu_ = Eigen::Matrix3d::Zero();
     bool last_gnss_position_update_applied_ = false;
     bool last_gnss_position_reanchored_ = false;
+    bool last_gnss_position_reanchor_refused_by_prefit_gate_ = false;
     bool last_gnss_velocity_reanchored_ = false;
     Eigen::Vector3d last_gnss_position_correction_enu_ =
         Eigen::Vector3d::Zero();
@@ -342,6 +506,9 @@ private:
     fusion_update::FusionUpdateResult applyUpdateAndInject(
         const fusion_measurement::FusionMeasurementSystem& system, double max_nis_per_observation,
         int& consecutive_gate_rejections);
+    bool floatPositionConsistentWithCoarse(const GNSSTime& time,
+                                           const Eigen::Vector3d& antenna_position_enu,
+                                           const Eigen::Matrix3d& position_covariance_enu) const;
     bool reanchorPositionFromFixedSolution(const Eigen::Vector3d& antenna_position_enu,
                                            const Eigen::Matrix3d& position_covariance_enu);
     bool reanchorVelocityFromGnssSolution(

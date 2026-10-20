@@ -1,6 +1,8 @@
+#include <libgnss++/io/observation_epoch_assembler.hpp>
 #include <libgnss++/io/rinex.hpp>
 #include <libgnss++/io/rtcm.hpp>
 #include <libgnss++/io/ubx.hpp>
+#include <libgnss++/io/ubx_nav_decode.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -23,7 +25,14 @@
 #include <unistd.h>
 #endif
 
+#include "ubx_input_source.hpp"
+
 namespace {
+
+using libgnss_apps::UbxInputSource;
+using libgnss_apps::closeUbxInputSource;
+using libgnss_apps::openUbxInputSource;
+using libgnss_apps::readNextUbxEvents;
 
 enum class InputFormat {
     RTCM,
@@ -35,12 +44,19 @@ struct ConvertConfig {
     std::string obs_out_path;
     std::string nav_out_path;
     std::string sfrbx_out_path;
+    std::string nav_rinex_out_path;
     InputFormat format = InputFormat::RTCM;
     size_t limit = 0;
     bool quiet = false;
+    // RTCM -> RINEX: merge the per-constellation MSM messages of one epoch into one
+    // RINEX epoch (RTCM multiple-message bit). --no-rtcm-epoch-assembly writes one
+    // epoch per message.
+    bool assemble_rtcm_epochs = true;
+    // RTCM carries only the GPS time of week; this supplies the week.
+    bool has_gps_week = false;
+    int gps_week = 0;
 };
 
-constexpr int kDefaultSerialBaud = 115200;
 constexpr double kSemiCircleToRadians = 3.14159265358979323846;
 constexpr double kPow2Neg11 = 4.88281250000000000000e-04;
 constexpr double kPow2Neg5 = 3.12500000000000000000e-02;
@@ -93,6 +109,9 @@ struct BdsD2FrameSet {
 struct GalileoWordSet {
     std::array<std::array<uint8_t, 16>, 6> words{};
     std::array<bool, 6> present = {false, false, false, false, false, false};
+    /// RINEX data-source bit of the signal each word was received on
+    /// (I/NAV E1-B or E5b-I).
+    std::array<int, 6> source = {0, 0, 0, 0, 0, 0};
 };
 
 void printUsage(const char* argv0) {
@@ -100,10 +119,18 @@ void printUsage(const char* argv0) {
         << "Usage: " << argv0
         << " --input <file|ntrip://...|serial://...|tcp://host:port|/dev/tty...> --format <rtcm|ubx> [options]\n"
         << "Options:\n"
-        << "  --obs-out <file>          Export decoded observations to a simple RINEX file\n"
+        << "  --obs-out <file>          Export decoded observations to a RINEX 3.04 observation file\n"
         << "  --nav-out <file>          Export decoded broadcast nav to a RINEX nav file\n"
         << "  --sfrbx-out <file>        Export UBX RXM-SFRBX subframes to CSV\n"
+        << "  --nav-rinex-out <file>    UBX only: decode RXM-SFRBX into broadcast ephemerides (GPS/QZSS LNAV,\n"
+        << "                            Galileo E1-B I/NAV, BeiDou D1/D2, GLONASS) and the GPS Klobuchar set and\n"
+        << "                            write them as a RINEX 3.04 nav file when the input ends (a record is\n"
+        << "                            written once a second transmission produced the same record)\n"
+        << "  --gps-week <week>         RTCM only: GPS week of the data (RTCM messages carry\n"
+        << "                            only the time of week; default: current week)\n"
         << "  --limit <count>           Stop after this many decoded messages (0 = all)\n"
+        << "  --no-rtcm-epoch-assembly  RTCM input: write one RINEX epoch per observation message (default: merge\n"
+        << "                            the per-constellation MSM messages of one epoch using the multiple-message bit)\n"
         << "  --quiet                   Suppress per-message type lines\n"
         << "  --help                    Show this help text\n";
 }
@@ -120,6 +147,8 @@ ConvertConfig parseArguments(int argc, char** argv) {
             config.nav_out_path = argv[++i];
         } else if (arg == "--sfrbx-out" && i + 1 < argc) {
             config.sfrbx_out_path = argv[++i];
+        } else if (arg == "--nav-rinex-out" && i + 1 < argc) {
+            config.nav_rinex_out_path = argv[++i];
         } else if (arg == "--format" && i + 1 < argc) {
             const std::string value = argv[++i];
             if (value == "rtcm") {
@@ -129,8 +158,16 @@ ConvertConfig parseArguments(int argc, char** argv) {
             } else {
                 throw std::invalid_argument("unsupported --format value: " + value);
             }
+        } else if (arg == "--gps-week" && i + 1 < argc) {
+            config.gps_week = std::stoi(argv[++i]);
+            if (config.gps_week < 0) {
+                throw std::invalid_argument("--gps-week must be non-negative");
+            }
+            config.has_gps_week = true;
         } else if (arg == "--limit" && i + 1 < argc) {
             config.limit = static_cast<size_t>(std::stoull(argv[++i]));
+        } else if (arg == "--no-rtcm-epoch-assembly") {
+            config.assemble_rtcm_epochs = false;
         } else if (arg == "--quiet") {
             config.quiet = true;
         } else if (arg == "--help" || arg == "-h") {
@@ -145,8 +182,12 @@ ConvertConfig parseArguments(int argc, char** argv) {
         throw std::invalid_argument("--input is required");
     }
     if (config.obs_out_path.empty() && config.nav_out_path.empty() &&
-        config.sfrbx_out_path.empty()) {
-        throw std::invalid_argument("provide at least one of --obs-out, --nav-out, or --sfrbx-out");
+        config.sfrbx_out_path.empty() && config.nav_rinex_out_path.empty()) {
+        throw std::invalid_argument(
+            "provide at least one of --obs-out, --nav-out, --sfrbx-out, or --nav-rinex-out");
+    }
+    if (!config.nav_rinex_out_path.empty() && config.format != InputFormat::UBX) {
+        throw std::invalid_argument("--nav-rinex-out requires --format ubx");
     }
     return config;
 }
@@ -158,7 +199,8 @@ libgnss::io::RINEXReader::RINEXHeader makeObservationHeader() {
     header.satellite_system = "M";
     header.program = "libgnss++";
     header.run_by = "gnss convert";
-    header.observation_types = {"C1C", "L1C", "D1C", "S1C"};
+    // Observation types, TIME OF FIRST OBS and the like are derived from the
+    // decoded epochs by RINEXWriter; only descriptive fields are set here.
     return header;
 }
 
@@ -186,7 +228,7 @@ const char* systemName(libgnss::GNSSSystem system) {
 }
 
 bool writeSfrbxCsvHeader(std::ofstream& output) {
-    output << "system,sv_id,frequency_id,channel,version,frame_kind,frame_id,page_id,word_count,words_hex\n";
+    output << "system,sv_id,signal_id,frequency_id,channel,version,frame_kind,frame_id,page_id,word_count,words_hex\n";
     return static_cast<bool>(output);
 }
 
@@ -195,6 +237,7 @@ bool writeSfrbxCsvRow(std::ofstream& output, const libgnss::io::UBXSfrbx& sfrbx)
     const bool has_frame_info = libgnss::io::ubx_utils::decodeSfrbxFrameInfo(sfrbx, frame_info);
     output << systemName(sfrbx.system) << ","
            << static_cast<int>(sfrbx.sv_id) << ","
+           << static_cast<int>(sfrbx.signal_id) << ","
            << static_cast<int>(sfrbx.frequency_id) << ","
            << static_cast<int>(sfrbx.channel) << ","
            << static_cast<int>(sfrbx.version) << ","
@@ -331,10 +374,6 @@ libgnss::GNSSTime bdtWeekTowToGpst(int week, double tow) {
     return libgnss::GNSSTime(week + kBdtWeekOffset, tow) + 14.0;
 }
 
-libgnss::GNSSTime gpstToBdt(const libgnss::GNSSTime& time) {
-    return time - 14.0;
-}
-
 int leapSecondsForDate(int year, int month, int day) {
     struct LeapEntry { int year; int month; int day; int leap_seconds; };
     static constexpr LeapEntry kLeapTable[] = {
@@ -453,7 +492,7 @@ bool decodeGpsLnavEphemeris(const libgnss::SatelliteId& satellite,
         eph.ura = static_cast<uint8_t>(readBitsMsbFirst(sf1.data(), sf1.size(), bit, 4));
         eph.sv_accuracy = uraMetersFromIndex(eph.ura);
         bit += 4;
-        eph.health = static_cast<uint8_t>(readBitsMsbFirst(sf1.data(), sf1.size(), bit, 6));
+        eph.health = static_cast<uint16_t>(readBitsMsbFirst(sf1.data(), sf1.size(), bit, 6));
         eph.sv_health = static_cast<double>(eph.health);
         bit += 6;
         const uint16_t iodc_msb = static_cast<uint16_t>(readBitsMsbFirst(sf1.data(), sf1.size(), bit, 2));
@@ -619,7 +658,7 @@ bool decodeGlonassEphemeris(const libgnss::SatelliteId& satellite,
 
     const int frn2 = static_cast<int>(readBitsMsbFirst(frame_bytes.data(), frame_bytes.size(), bit, 4));
     bit += 4;
-    eph.health = static_cast<uint8_t>(
+    eph.health = static_cast<uint16_t>(
         readBitsMsbFirst(frame_bytes.data(), frame_bytes.size(), bit, 3));
     eph.sv_health = static_cast<double>(eph.health);
     bit += 3;
@@ -724,7 +763,7 @@ int32_t mergeSignedFields3(int32_t upper, uint32_t middle, int middle_bits, uint
 bool buildBeiDouD1Subframe(const libgnss::io::UBXSfrbx& sfrbx,
                            std::array<uint8_t, 38>& subframe,
                            int& subframe_id) {
-    if (sfrbx.words.size() < 10 || sfrbx.sv_id <= 5) {
+    if (sfrbx.words.size() < 10 || libgnss::io::ubx_utils::isSfrbxBeiDouD2(sfrbx)) {
         return false;
     }
 
@@ -767,7 +806,7 @@ bool decodeBeiDouD1Ephemeris(const libgnss::SatelliteId& satellite,
 
     eph = libgnss::Ephemeris{};
     eph.satellite = satellite;
-    eph.health = static_cast<uint8_t>(readBitsMsbFirst(sf1.data(), sf1.size(), 42, 1));
+    eph.health = static_cast<uint16_t>(readBitsMsbFirst(sf1.data(), sf1.size(), 42, 1));
     eph.sv_health = static_cast<double>(eph.health);
     eph.iodc = static_cast<uint16_t>(readBitsMsbFirst(sf1.data(), sf1.size(), 43, 5));
     eph.ura = static_cast<uint8_t>(readBitsMsbFirst(sf1.data(), sf1.size(), 48, 4));
@@ -871,7 +910,7 @@ bool decodeBeiDouD1Ephemeris(const libgnss::SatelliteId& satellite,
 bool buildBeiDouD2Page(const libgnss::io::UBXSfrbx& sfrbx,
                        std::array<uint8_t, 38>& page,
                        int& page_id) {
-    if (sfrbx.words.size() < 10 || sfrbx.sv_id > 5) {
+    if (sfrbx.words.size() < 10 || !libgnss::io::ubx_utils::isSfrbxBeiDouD2(sfrbx)) {
         return false;
     }
 
@@ -952,7 +991,7 @@ bool decodeBeiDouD2Ephemeris(const libgnss::SatelliteId& satellite,
 
     eph = libgnss::Ephemeris{};
     eph.satellite = satellite;
-    eph.health = static_cast<uint8_t>(readBitsMsbFirst(p1.data(), p1.size(), 46, 1));
+    eph.health = static_cast<uint16_t>(readBitsMsbFirst(p1.data(), p1.size(), 46, 1));
     eph.sv_health = static_cast<double>(eph.health);
     eph.iodc = static_cast<uint16_t>(readBitsMsbFirst(p1.data(), p1.size(), 47, 5));
     eph.ura = static_cast<uint8_t>(readBitsMsbFirst(p1.data(), p1.size(), 60, 4));
@@ -1170,7 +1209,8 @@ bool decodeGalileoInavEphemeris(const libgnss::SatelliteId& satellite,
     const double crs = static_cast<double>(readSignedBitsMsbFirst(buffer.data(), buffer.size(), bit, 16)) *
                        kPow2Neg5;
     bit += 16;
-    const double sva = static_cast<double>(readBitsMsbFirst(buffer.data(), buffer.size(), bit, 8));
+    const uint8_t sisa_index =
+        static_cast<uint8_t>(readBitsMsbFirst(buffer.data(), buffer.size(), bit, 8));
 
     bit = 512;
     const int type4 = static_cast<int>(readBitsMsbFirst(buffer.data(), buffer.size(), bit, 6));
@@ -1242,13 +1282,16 @@ bool decodeGalileoInavEphemeris(const libgnss::SatelliteId& satellite,
     eph.crs = crs;
     eph.cic = cic;
     eph.cis = cis;
-    eph.sv_accuracy = sva;
+    // RINEX / Ephemeris::sv_accuracy carry SISA in metres, not the index.
+    eph.ura = sisa_index;
+    eph.sv_accuracy = libgnss::galileoSisaMeters(sisa_index);
+    eph.navigation_message_type = libgnss::NavigationMessageType::INAV;
     eph.af0 = af0;
     eph.af1 = af1;
     eph.af2 = af2;
     eph.tgd = bgd_e5a_e1;
     eph.tgd_secondary = bgd_e5b_e1;
-    eph.health = static_cast<uint8_t>((e5b_hs << 7) | (e5b_dvs << 6) | (e1b_hs << 1) | e1b_dvs);
+    eph.health = static_cast<uint16_t>((e5b_hs << 7) | (e5b_dvs << 6) | (e1b_hs << 1) | e1b_dvs);
     eph.sv_health = static_cast<double>(eph.health);
     eph.iode = static_cast<uint16_t>(iod_nav0);
     eph.iodc = static_cast<uint16_t>(iod_nav0);
@@ -1268,169 +1311,6 @@ bool decodeGalileoInavEphemeris(const libgnss::SatelliteId& satellite,
     return true;
 }
 
-struct UbxInputSource {
-    bool serial = false;
-    bool eof = false;
-    std::ifstream file;
-#ifndef _WIN32
-    int serial_fd = -1;
-#endif
-};
-
-std::string resolveSerialPath(const std::string& source) {
-    constexpr const char* kPrefix = "serial://";
-    if (source.rfind(kPrefix, 0) != 0) {
-        return source;
-    }
-
-    std::string path = source.substr(std::char_traits<char>::length(kPrefix));
-    const size_t query_pos = path.find('?');
-    if (query_pos != std::string::npos) {
-        path.resize(query_pos);
-    }
-    if (!path.empty() && path.front() != '/') {
-        return path;
-    }
-    while (path.size() > 1 && path[0] == '/' && path[1] == '/') {
-        path.erase(path.begin());
-    }
-    return path;
-}
-
-int parseSerialBaud(const std::string& source) {
-    constexpr const char* kQuery = "?baud=";
-    const size_t query_pos = source.find(kQuery);
-    if (query_pos == std::string::npos) {
-        return kDefaultSerialBaud;
-    }
-    const std::string baud_text =
-        source.substr(query_pos + std::char_traits<char>::length(kQuery));
-    if (baud_text.empty()) {
-        return kDefaultSerialBaud;
-    }
-    return std::stoi(baud_text);
-}
-
-#ifndef _WIN32
-speed_t baudRateConstant(int baud) {
-    switch (baud) {
-        case 9600: return B9600;
-        case 19200: return B19200;
-        case 38400: return B38400;
-        case 57600: return B57600;
-        case 115200: return B115200;
-        case 230400: return B230400;
-        default:
-            throw std::invalid_argument("unsupported serial baud rate");
-    }
-}
-
-bool configureSerialPort(int fd, int baud) {
-    termios tio{};
-    if (tcgetattr(fd, &tio) != 0) {
-        return false;
-    }
-    cfmakeraw(&tio);
-    const speed_t speed = baudRateConstant(baud);
-    cfsetispeed(&tio, speed);
-    cfsetospeed(&tio, speed);
-    tio.c_cflag |= (CLOCAL | CREAD);
-    tio.c_cflag &= ~CSTOPB;
-    tio.c_cflag &= ~CRTSCTS;
-    tio.c_cc[VMIN] = 1;
-    tio.c_cc[VTIME] = 0;
-    return tcsetattr(fd, TCSANOW, &tio) == 0;
-}
-#endif
-
-void closeUbxInputSource(UbxInputSource& source) {
-    if (source.file.is_open()) {
-        source.file.close();
-    }
-#ifndef _WIN32
-    if (source.serial_fd >= 0) {
-        ::close(source.serial_fd);
-        source.serial_fd = -1;
-    }
-#endif
-    source.serial = false;
-    source.eof = false;
-}
-
-bool openUbxInputSource(const std::string& input_path, UbxInputSource& source) {
-    closeUbxInputSource(source);
-
-    const std::string resolved_path = resolveSerialPath(input_path);
-    std::error_code ec;
-    const auto status = std::filesystem::status(resolved_path, ec);
-    if (!ec && std::filesystem::is_regular_file(status)) {
-        source.file.open(resolved_path, std::ios::binary);
-        return source.file.is_open();
-    }
-
-#ifndef _WIN32
-    const int baud = parseSerialBaud(input_path);
-    const int fd = ::open(resolved_path.c_str(), O_RDONLY | O_NOCTTY);
-    if (fd < 0) {
-        return false;
-    }
-    if (!configureSerialPort(fd, baud)) {
-        ::close(fd);
-        return false;
-    }
-    source.serial = true;
-    source.serial_fd = fd;
-    return true;
-#else
-    (void)input_path;
-    return false;
-#endif
-}
-
-bool readNextUbxEvents(libgnss::io::UBXStreamDecoder& decoder,
-                       UbxInputSource& source,
-                       std::vector<libgnss::io::UBXStreamDecoder::Event>& events) {
-    events.clear();
-    std::array<uint8_t, 4096> chunk{};
-
-    while (true) {
-        size_t bytes_read = 0;
-        if (source.serial) {
-#ifndef _WIN32
-            const ssize_t count = ::read(source.serial_fd, chunk.data(), chunk.size());
-            if (count < 0) {
-                if (errno == EINTR) {
-                    continue;
-                }
-                source.eof = true;
-                return false;
-            }
-            if (count == 0) {
-                source.eof = true;
-                return false;
-            }
-            bytes_read = static_cast<size_t>(count);
-#else
-            source.eof = true;
-            return false;
-#endif
-        } else {
-            source.file.read(reinterpret_cast<char*>(chunk.data()),
-                             static_cast<std::streamsize>(chunk.size()));
-            bytes_read = static_cast<size_t>(source.file.gcount());
-            if (bytes_read == 0) {
-                source.eof = true;
-                return false;
-            }
-        }
-
-        decoder.pushBytes(chunk.data(), bytes_read, events);
-        if (!events.empty()) {
-            return true;
-        }
-    }
-}
-
 int runRTCMConversion(const ConvertConfig& config) {
     libgnss::io::RTCMReader reader;
     if (!reader.open(config.input_path)) {
@@ -1439,6 +1319,17 @@ int runRTCMConversion(const ConvertConfig& config) {
     }
 
     libgnss::io::RTCMProcessor processor;
+    // GPS/Galileo/BeiDou/QZSS observation epochs only have a time of week
+    // (week 0 out of the decoder) and GLONASS epochs are resolved against a
+    // reference time.  Pin both to one week, rolling it over when the time of
+    // week wraps, so the RINEX epochs carry real, consistent dates.
+    const libgnss::GNSSTime start_time =
+        config.has_gps_week ? libgnss::GNSSTime(config.gps_week, kHalfWeekSeconds)
+                            : currentGpstApprox();
+    int resolved_week = start_time.week;
+    bool have_last_tow = false;
+    double last_tow = 0.0;
+    processor.setReferenceTime(start_time);
     libgnss::io::RINEXWriter obs_writer;
     libgnss::io::RINEXWriter nav_writer;
     bool obs_writer_open = false;
@@ -1447,6 +1338,26 @@ int runRTCMConversion(const ConvertConfig& config) {
     size_t exported_obs_epochs = 0;
     size_t exported_nav_messages = 0;
     size_t skipped_nav_messages = 0;
+
+    // Writes one observation epoch, opening the RINEX file on first use.
+    auto writeObsEpoch = [&](const libgnss::ObservationData& epoch) {
+        if (!obs_writer_open) {
+            if (!obs_writer.createObservationFile(config.obs_out_path, makeObservationHeader())) {
+                std::cerr << "Error: failed to create observation RINEX: "
+                          << config.obs_out_path << "\n";
+                return false;
+            }
+            obs_writer_open = true;
+        }
+        if (!obs_writer.writeObservationEpoch(epoch)) {
+            std::cerr << "Error: failed to write observation epoch to "
+                      << config.obs_out_path << "\n";
+            return false;
+        }
+        ++exported_obs_epochs;
+        return true;
+    };
+    libgnss::io::ObservationEpochAssembler assembler;
 
     libgnss::io::RTCMMessage message;
     while ((config.limit == 0 || processed_messages < config.limit) && reader.readMessage(message)) {
@@ -1461,20 +1372,35 @@ int runRTCMConversion(const ConvertConfig& config) {
             libgnss::io::rtcm_utils::isObservationMessage(message.type)) {
             libgnss::ObservationData obs_data;
             if (processor.decodeObservationData(message, obs_data)) {
-                if (!obs_writer_open) {
-                    if (!obs_writer.createObservationFile(config.obs_out_path, makeObservationHeader())) {
-                        std::cerr << "Error: failed to create observation RINEX: "
-                                  << config.obs_out_path << "\n";
-                        return 1;
+                // Week 0 is "time of week only"; week 1 is a BeiDou epoch whose
+                // +14 s BDT->GPST shift wrapped past the end of that week 0.
+                if (obs_data.time.week <= 1) {
+                    const double tow = std::fmod(
+                        obs_data.time.week * libgnss::constants::SECONDS_PER_WEEK +
+                            obs_data.time.tow,
+                        libgnss::constants::SECONDS_PER_WEEK);
+                    // Nearest week to the previous epoch, so messages that
+                    // straddle a week boundary resolve consistently.
+                    if (have_last_tow && tow < last_tow - kHalfWeekSeconds) {
+                        ++resolved_week;
+                    } else if (have_last_tow && tow > last_tow + kHalfWeekSeconds) {
+                        --resolved_week;
                     }
-                    obs_writer_open = true;
+                    have_last_tow = true;
+                    last_tow = tow;
+                    obs_data.time.week = resolved_week;
+                    processor.setReferenceTime(libgnss::GNSSTime(resolved_week, tow));
                 }
-                if (!obs_writer.writeObservationEpoch(obs_data)) {
-                    std::cerr << "Error: failed to write observation epoch to "
-                              << config.obs_out_path << "\n";
+                if (config.assemble_rtcm_epochs) {
+                    for (const auto& epoch :
+                         assembler.push(obs_data, processor.lastObservationMoreFollows())) {
+                        if (!writeObsEpoch(epoch)) {
+                            return 1;
+                        }
+                    }
+                } else if (!writeObsEpoch(obs_data)) {
                     return 1;
                 }
-                ++exported_obs_epochs;
             }
         }
 
@@ -1504,11 +1430,23 @@ int runRTCMConversion(const ConvertConfig& config) {
         }
     }
 
-    if (obs_writer_open) {
-        obs_writer.close();
+    // A pending (partially assembled) epoch at end of stream is still an epoch.
+    if (!config.obs_out_path.empty()) {
+        for (const auto& epoch : assembler.flush()) {
+            if (!writeObsEpoch(epoch)) {
+                return 1;
+            }
+        }
     }
-    if (nav_writer_open) {
-        nav_writer.close();
+
+    bool outputs_ok = true;
+    if (obs_writer_open && !obs_writer.close()) {
+        std::cerr << "Error: failed to write observation RINEX: " << config.obs_out_path << "\n";
+        outputs_ok = false;
+    }
+    if (nav_writer_open && !nav_writer.close()) {
+        std::cerr << "Error: failed to write navigation RINEX: " << config.nav_out_path << "\n";
+        outputs_ok = false;
     }
     reader.close();
 
@@ -1516,7 +1454,7 @@ int runRTCMConversion(const ConvertConfig& config) {
               << " exported_obs_epochs=" << exported_obs_epochs
               << " exported_nav_messages=" << exported_nav_messages
               << " skipped_nav_messages=" << skipped_nav_messages << "\n";
-    return 0;
+    return outputs_ok ? 0 : 1;
 }
 
 int runUBXConversion(const ConvertConfig& config) {
@@ -1544,6 +1482,13 @@ int runUBXConversion(const ConvertConfig& config) {
     std::map<libgnss::SatelliteId, BdsD1FrameSet> bds_d1_frames;
     std::map<libgnss::SatelliteId, BdsD2FrameSet> bds_d2_frames;
     std::map<libgnss::SatelliteId, libgnss::Ephemeris> last_exported_ephemeris;
+    // --nav-rinex-out: library SFRBX decoder; the time reference is the RAWX epoch time.
+    // Records are written once confirmed by a second transmission (UBXNavConfirmTwice), health as received.
+    libgnss::io::UBXNavDecoder nav_rinex_decoder;
+    libgnss::io::UBXNavConfirmTwice nav_rinex_confirm;
+    std::vector<libgnss::Ephemeris> nav_rinex_ephemerides;
+    std::vector<libgnss::Ephemeris> nav_rinex_new;
+    std::vector<libgnss::io::UBXNavDecoded> nav_rinex_copies;
     libgnss::GNSSTime nav_time_hint = currentGpstApprox();
     bool has_nav_time_hint = false;
 
@@ -1584,6 +1529,22 @@ int runUBXConversion(const ConvertConfig& config) {
                 ++exported_sfrbx_messages;
             }
 
+            if (!config.nav_rinex_out_path.empty()) {
+                if (event.has_observation) {
+                    nav_rinex_decoder.setReferenceTime(event.observation.time);
+                }
+                if (event.has_sfrbx) {
+                    nav_rinex_new.clear();
+                    nav_rinex_copies.clear();
+                    nav_rinex_decoder.pushSfrbx(event.sfrbx, nav_rinex_new, &nav_rinex_copies);
+                    for (const auto& copy : nav_rinex_copies) {
+                        if (nav_rinex_confirm.push(copy).accepted) {
+                            nav_rinex_ephemerides.push_back(copy.eph);
+                        }
+                    }
+                }
+            }
+
             if (event.has_nav_pvt && event.nav_pvt.valid_time) {
                 nav_time_hint = event.nav_pvt.time;
                 has_nav_time_hint = true;
@@ -1593,7 +1554,14 @@ int runUBXConversion(const ConvertConfig& config) {
                 has_nav_time_hint = true;
             }
 
-            if (!config.nav_out_path.empty() && event.has_sfrbx &&
+            // Only legacy navigation signals (L1 C/A LNAV, I/NAV, D1/D2,
+            // GLONASS strings) feed the frame decoders below; CNAV, F/NAV,
+            // E6 and B-CNAV subframes share the gnssId but not the layout.
+            const bool legacy_nav_sfrbx =
+                event.has_sfrbx &&
+                libgnss::io::ubx_utils::isSfrbxLegacyNavigation(event.sfrbx);
+
+            if (!config.nav_out_path.empty() && legacy_nav_sfrbx &&
                 (event.sfrbx.system == libgnss::GNSSSystem::GPS ||
                  event.sfrbx.system == libgnss::GNSSSystem::QZSS)) {
                 const libgnss::SatelliteId satellite(event.sfrbx.system, event.sfrbx.sv_id);
@@ -1647,7 +1615,7 @@ int runUBXConversion(const ConvertConfig& config) {
                 }
             }
 
-            if (!config.nav_out_path.empty() && event.has_sfrbx &&
+            if (!config.nav_out_path.empty() && legacy_nav_sfrbx &&
                 event.sfrbx.system == libgnss::GNSSSystem::GLONASS) {
                 const libgnss::SatelliteId satellite(event.sfrbx.system, event.sfrbx.sv_id);
                 std::array<uint8_t, 10> string_data{};
@@ -1715,7 +1683,7 @@ int runUBXConversion(const ConvertConfig& config) {
                 }
             }
 
-            if (!config.nav_out_path.empty() && event.has_sfrbx &&
+            if (!config.nav_out_path.empty() && legacy_nav_sfrbx &&
                 event.sfrbx.system == libgnss::GNSSSystem::Galileo) {
                 const libgnss::SatelliteId satellite(event.sfrbx.system, event.sfrbx.sv_id);
                 std::array<uint8_t, 16> word{};
@@ -1724,11 +1692,21 @@ int runUBXConversion(const ConvertConfig& config) {
                     auto& word_set = galileo_words[satellite];
                     word_set.words[static_cast<size_t>(word_type)] = word;
                     word_set.present[static_cast<size_t>(word_type)] = true;
+                    // u-blox sigId 5 = E5b-I; 1 = E1-B (0 before protocol 27).
+                    word_set.source[static_cast<size_t>(word_type)] =
+                        event.sfrbx.signal_id == 5
+                            ? libgnss::galileo_data_source::kInavE5bI
+                            : libgnss::galileo_data_source::kInavE1B;
 
                     if (std::all_of(word_set.present.begin(), word_set.present.end(),
                                     [](bool present) { return present; })) {
                         libgnss::Ephemeris ephemeris;
                         if (decodeGalileoInavEphemeris(satellite, word_set.words, ephemeris)) {
+                            // I/NAV clock parameters refer to E5b,E1.
+                            ephemeris.data_source_code = libgnss::galileo_data_source::kClockE5bE1;
+                            for (const int source : word_set.source) {
+                                ephemeris.data_source_code |= source;
+                            }
                             const auto last_it = last_exported_ephemeris.find(ephemeris.satellite);
                             const bool duplicate =
                                 last_it != last_exported_ephemeris.end() &&
@@ -1767,9 +1745,9 @@ int runUBXConversion(const ConvertConfig& config) {
                 }
             }
 
-            if (!config.nav_out_path.empty() && event.has_sfrbx &&
+            if (!config.nav_out_path.empty() && legacy_nav_sfrbx &&
                 event.sfrbx.system == libgnss::GNSSSystem::BeiDou &&
-                event.sfrbx.sv_id > 5) {
+                !libgnss::io::ubx_utils::isSfrbxBeiDouD2(event.sfrbx)) {
                 const libgnss::SatelliteId satellite(event.sfrbx.system, event.sfrbx.sv_id);
                 std::array<uint8_t, 38> subframe{};
                 int subframe_id = 0;
@@ -1821,9 +1799,9 @@ int runUBXConversion(const ConvertConfig& config) {
                 }
             }
 
-            if (!config.nav_out_path.empty() && event.has_sfrbx &&
+            if (!config.nav_out_path.empty() && legacy_nav_sfrbx &&
                 event.sfrbx.system == libgnss::GNSSSystem::BeiDou &&
-                event.sfrbx.sv_id <= 5) {
+                libgnss::io::ubx_utils::isSfrbxBeiDouD2(event.sfrbx)) {
                 const libgnss::SatelliteId satellite(event.sfrbx.system, event.sfrbx.sv_id);
                 std::array<uint8_t, 38> page{};
                 int page_id = 0;
@@ -1884,11 +1862,13 @@ int runUBXConversion(const ConvertConfig& config) {
 
             if (!obs_writer_open) {
                 auto header = makeObservationHeader();
+                header.receiver_type = "u-blox";
                 const auto& ubx_decoder = decoder.getDecoder();
                 if (ubx_decoder.hasLastNavPVT()) {
                     const auto nav = ubx_decoder.getLastNavPVT();
                     if (nav.valid_position) {
                         header.approximate_position = nav.position_ecef;
+                        header.has_approximate_position = true;
                     }
                 }
                 if (!obs_writer.createObservationFile(config.obs_out_path, header)) {
@@ -1909,16 +1889,44 @@ int runUBXConversion(const ConvertConfig& config) {
         }
     }
 
-    if (obs_writer_open) {
-        obs_writer.close();
+    bool outputs_ok = true;
+    if (obs_writer_open && !obs_writer.close()) {
+        std::cerr << "Error: failed to write observation RINEX: " << config.obs_out_path << "\n";
+        outputs_ok = false;
     }
-    if (nav_writer_open) {
-        nav_writer.close();
+    if (nav_writer_open && !nav_writer.close()) {
+        std::cerr << "Error: failed to write navigation RINEX: " << config.nav_out_path << "\n";
+        outputs_ok = false;
     }
     if (sfrbx_writer_open) {
         sfrbx_writer.close();
     }
     closeUbxInputSource(input_source);
+
+    if (!config.nav_rinex_out_path.empty()) {
+        libgnss::io::RINEXWriter rinex_nav_writer;
+        bool written = rinex_nav_writer.createNavigationFile(
+            config.nav_rinex_out_path, makeNavigationHeader(), nav_rinex_decoder.klobuchar());
+        for (const auto& ephemeris : nav_rinex_ephemerides) {
+            written = written && rinex_nav_writer.writeNavigationMessage(ephemeris);
+        }
+        written = written && rinex_nav_writer.close();
+        if (!written) {
+            std::cerr << "Error: failed to write navigation RINEX: " << config.nav_rinex_out_path << "\n";
+            outputs_ok = false;
+        }
+        std::map<libgnss::GNSSSystem, size_t> per_system;
+        for (const auto& ephemeris : nav_rinex_ephemerides) {
+            ++per_system[ephemeris.satellite.system];
+        }
+        std::cout << "nav_rinex: ephemerides=" << nav_rinex_ephemerides.size();
+        for (const auto& [system, count] : per_system) {
+            std::cout << " " << systemName(system) << "=" << count;
+        }
+        std::cout << " klobuchar=" << (nav_rinex_decoder.hasKlobuchar() ? 1 : 0)
+                  << " unconfirmed=" << nav_rinex_confirm.unconfirmed()
+                  << " conflicts=" << nav_rinex_confirm.conflicts() << "\n";
+    }
 
     const auto stats = decoder.getStats();
     std::cout << "summary: processed_messages=" << processed_messages
@@ -1928,7 +1936,7 @@ int runUBXConversion(const ConvertConfig& config) {
               << " exported_nav_messages=" << exported_nav_messages
               << " skipped_nav_messages=" << skipped_nav_messages
               << " exported_sfrbx_messages=" << exported_sfrbx_messages << "\n";
-    return 0;
+    return outputs_ok ? 0 : 1;
 }
 
 }  // namespace

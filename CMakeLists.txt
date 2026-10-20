@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(gnss_lib VERSION 0.2.0 LANGUAGES C CXX)
+project(gnss_lib VERSION 0.3.0 LANGUAGES C CXX)
 
 set(GNSSPP_CXX_STANDARD 20 CACHE STRING
     "C++ standard (use 17 with legacy Eigen 3.3 toolchains that reject C++20 rewritten comparisons)")
@@ -79,6 +79,7 @@ add_subdirectory(third_party/ginan-iers2010)
 set(GNSS_SOURCES
     src/gnss.cpp
     src/io/android_raw_gnss.cpp
+    src/io/galileo_has.cpp
     src/io/imu.cpp
     src/io/ntrip.cpp
     src/io/rinex.cpp
@@ -89,7 +90,9 @@ set(GNSS_SOURCES
     src/io/rtcm_decode_nav.cpp
     src/io/rtcm_reader.cpp
     src/io/rtcm_stream.cpp
+    src/io/observation_epoch_assembler.cpp
     src/io/ubx.cpp
+    src/io/ubx_nav_decode.cpp
     src/io/qzss_l6.cpp
     src/io/madoca_l6.cpp
     src/io/madoca_l6d.cpp
@@ -105,6 +108,9 @@ set(GNSS_SOURCES
     src/fusion/fusion_update.cpp
     src/fusion/fusion_initialization.cpp
     src/fusion/fusion_processor.cpp
+    src/fusion/online_rtk_imu.cpp
+    src/algorithms/rtk_base_alignment.cpp
+    src/algorithms/rtk_presets.cpp
     src/fusion/dd_imu_bridge.cpp
     src/algorithms/ppp_ar.cpp
     src/algorithms/ppp_atmosphere.cpp
@@ -156,6 +162,9 @@ set(GNSS_RTK_RUNTIME_SOURCES
     src/algorithms/rtk_ddpr_anchor.cpp
     src/algorithms/rtk_update.cpp
     src/algorithms/rtk_ins_time_update.cpp
+    src/algorithms/rtk_carrier_prior.cpp
+    src/algorithms/rtk_carrier_prior_epoch.cpp
+    src/algorithms/rtk_covariance_consistency.cpp
     src/algorithms/rtk_tdcp_diagnostics.cpp
     src/algorithms/rtk_validation.cpp
     src/algorithms/integrity_consensus.cpp
@@ -170,6 +179,7 @@ set(GNSS_RTK_RUNTIME_SOURCES
     src/algorithms/rtk_ar_resolve.cpp
     src/algorithms/rtk_ar_validate.cpp
     src/algorithms/spp.cpp
+    src/algorithms/barometer_height.cpp
     src/algorithms/spp_velocity.cpp
     src/algorithms/raw_p_seed.cpp
     src/algorithms/lambda.cpp
@@ -341,7 +351,10 @@ target_include_directories(gnss_rtk_runtime PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
-target_link_libraries(gnss_rtk_runtime PUBLIC Eigen3::Eigen)
+# Runtime navigation/SSR and RTK objects also use types and environment helpers
+# defined in gnss_lib. Declare that dependency so single-pass static linkers
+# place gnss_lib after this archive, including for new online-only consumers.
+target_link_libraries(gnss_rtk_runtime PUBLIC gnss_lib Eigen3::Eigen)
 
 # Solver support archive: the shared runtime objects plus FGO. The historical
 # target name "gnss_lib_noopt" referred to its old -O0 build; it is compiled
@@ -351,7 +364,11 @@ target_include_directories(gnss_lib_solvers PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
-target_link_libraries(gnss_lib_solvers PUBLIC Eigen3::Eigen)
+# The solver archive uses types and RINEX/environment helpers defined in
+# gnss_lib.  Declare the dependency (as gnss_rtk_runtime does) so single-pass
+# static linkers place gnss_lib after this archive instead of relying on some
+# earlier object happening to pull the needed gnss_lib members in.
+target_link_libraries(gnss_lib_solvers PUBLIC gnss_lib Eigen3::Eigen)
 if(CHOLMOD_INCLUDE_DIR AND CHOLMOD_LIBRARY)
     target_include_directories(gnss_lib_solvers PRIVATE ${CHOLMOD_INCLUDE_DIR})
     target_compile_definitions(gnss_lib_solvers PRIVATE GNSSPP_HAS_CHOLMOD=1)
@@ -456,7 +473,11 @@ set(CPACK_PACKAGE_VENDOR "libgnss++")
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "GNSS processing library and CLI toolchain")
 set(CPACK_PACKAGE_VERSION ${PROJECT_VERSION})
 set(CPACK_RESOURCE_FILE_LICENSE ${CMAKE_CURRENT_SOURCE_DIR}/LICENSE)
-set(CPACK_GENERATOR "TGZ;DEB")
+if(WIN32)
+    set(CPACK_GENERATOR "ZIP")
+else()
+    set(CPACK_GENERATOR "TGZ;DEB")
+endif()
 set(CPACK_DEBIAN_PACKAGE_MAINTAINER "libgnss++ maintainers")
 set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
 # The installed command surface includes Python-based diagnostics and demo

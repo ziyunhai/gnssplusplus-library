@@ -17,9 +17,14 @@
 #include <set>
 #include <utility>
 
+#include "correction_products_internal.hpp"
+
 namespace libgnss {
 
 namespace {
+
+using correction_products_internal::biasObservationCode;
+using correction_products_internal::ionexPiercePointAndMapping;
 
 constexpr double kDegreesToRadians = M_PI / 180.0;
 
@@ -247,33 +252,6 @@ double groupDelayCorrectionMeters(
     }
 }
 
-std::string biasObservationCode(SignalType signal) {
-    switch (signal) {
-        case SignalType::GPS_L1CA: return "C1C";
-        case SignalType::GPS_L1P: return "C1P";
-        case SignalType::GPS_L2P: return "C2P";
-        case SignalType::GPS_L2C: return "C2W";
-        case SignalType::GPS_L5: return "C5Q";
-        case SignalType::GLO_L1CA: return "C1C";
-        case SignalType::GLO_L1P: return "C1P";
-        case SignalType::GLO_L2CA: return "C2C";
-        case SignalType::GLO_L2P: return "C2P";
-        case SignalType::GAL_E1: return "C1C";
-        case SignalType::GAL_E5A: return "C5Q";
-        case SignalType::GAL_E5B: return "C7Q";
-        case SignalType::GAL_E6: return "C6C";
-        case SignalType::BDS_B1I: return "C2I";
-        case SignalType::BDS_B2I: return "C7I";
-        case SignalType::BDS_B3I: return "C6I";
-        case SignalType::BDS_B1C: return "C1C";
-        case SignalType::BDS_B2A: return "C5Q";
-        case SignalType::QZS_L1CA: return "C1C";
-        case SignalType::QZS_L2C: return "C2L";
-        case SignalType::QZS_L5: return "C5Q";
-        default: return "";
-    }
-}
-
 double dcbEntryBiasMeters(const DCBEntry& entry) {
     std::string unit = entry.unit;
     std::transform(unit.begin(), unit.end(), unit.begin(), [](unsigned char ch) {
@@ -382,65 +360,6 @@ double observationSsrCodeBiasMeters(GNSSSystem system,
     }
     const double secondary_bias_m = ssrBiasLookup(code_bias_m, system, secondary_id);
     return coeff_primary * primary_bias_m + coeff_secondary * secondary_bias_m;
-}
-
-bool ionexPiercePointAndMapping(const IONEXProducts& ionex_products,
-                                const Vector3d& receiver_position,
-                                double azimuth_rad,
-                                double elevation_rad,
-                                double& ipp_lat_deg,
-                                double& ipp_lon_deg,
-                                double& mapping_factor) {
-    if (elevation_rad <= 0.0) {
-        return false;
-    }
-
-    double latitude_rad = 0.0;
-    double longitude_rad = 0.0;
-    double height_m = 0.0;
-    ecef2geodetic(receiver_position, latitude_rad, longitude_rad, height_m);
-
-    const double earth_radius_m =
-        ionex_products.base_radius_km > 0.0
-            ? ionex_products.base_radius_km * 1000.0
-            : constants::WGS84_A;
-    const double shell_height_m =
-        !ionex_products.height_grid.empty()
-            ? ionex_products.height_grid.front() * 1000.0
-            : 450000.0;
-    if (earth_radius_m <= 0.0 || shell_height_m < 0.0) {
-        return false;
-    }
-
-    const double ratio = earth_radius_m / (earth_radius_m + shell_height_m);
-    const double cos_elevation = std::cos(elevation_rad);
-    const double argument = std::clamp(ratio * cos_elevation, -1.0, 1.0);
-    const double psi = M_PI_2 - elevation_rad - std::asin(argument);
-    const double sin_lat = std::sin(latitude_rad);
-    const double cos_lat = std::cos(latitude_rad);
-    const double sin_psi = std::sin(psi);
-    const double cos_psi = std::cos(psi);
-
-    const double ipp_lat_rad = std::asin(
-        std::clamp(sin_lat * cos_psi + cos_lat * sin_psi * std::cos(azimuth_rad),
-                   -1.0,
-                   1.0));
-    const double ipp_lon_rad = longitude_rad + std::atan2(
-        sin_psi * std::sin(azimuth_rad),
-        cos_lat * cos_psi - sin_lat * sin_psi * std::cos(azimuth_rad));
-
-    const double mapping_argument = ratio * cos_elevation;
-    mapping_factor = 1.0 /
-        std::sqrt(std::max(1e-12, 1.0 - mapping_argument * mapping_argument));
-    ipp_lat_deg = ipp_lat_rad / kDegreesToRadians;
-    ipp_lon_deg = ipp_lon_rad / kDegreesToRadians;
-    while (ipp_lon_deg > 180.0) {
-        ipp_lon_deg -= 360.0;
-    }
-    while (ipp_lon_deg < -180.0) {
-        ipp_lon_deg += 360.0;
-    }
-    return std::isfinite(mapping_factor);
 }
 
 double ionosphereDelayMetersFromTecu(SignalType signal,
@@ -574,8 +493,10 @@ PositionSolution SPPProcessor::processEpoch(
 
     try {
         // Use RINEX header position for initialization if available
-        if (estimated_position_.norm() < 1000.0 && obs.receiver_position.norm() > 1e6) {
+        if ((estimated_position_.norm() < 1000.0 || position_is_cold_start_seed_) &&
+            obs.receiver_position.norm() > 1e6) {
             estimated_position_ = obs.receiver_position;
+            position_is_cold_start_seed_ = false;
         }
 
         // Validate and filter observations
@@ -658,12 +579,17 @@ ProcessorStats SPPProcessor::getStats() const {
 
 void SPPProcessor::reset() {
     estimated_position_.setZero();
+    position_is_cold_start_seed_ = false;
     receiver_clock_bias_ = 0.0;
     system_biases_.clear();
     has_last_valid_position_ = false;
     last_valid_position_.setZero();
     last_valid_time_ = GNSSTime();
     last_valid_clock_bias_ = 0.0;
+    baro_filter_.reset();
+    baro_samples_.clear();
+    last_baro_diagnostics_ = BaroEpochDiagnostics{};
+    baro_prior_active_ = false;
     last_applied_precise_orbit_clock_measurements_ = 0;
     last_applied_ssr_orbit_clock_corrections_ = 0;
     last_applied_ssr_code_bias_corrections_ = 0;
@@ -729,8 +655,108 @@ bool SPPProcessor::loadDCBProducts(const std::string& dcb_file) {
 PositionSolution SPPProcessor::solvePosition(const std::vector<SPPObservation>& valid_obs,
                                            const NavigationData& nav,
                                            const GNSSTime& time) {
+    if (spp_config_.baro.enabled) {
+        return solvePositionBaroAided(valid_obs, nav, time);
+    }
     // Direct call to native least-squares solver
     return solvePositionLS(valid_obs, nav, time);
+}
+
+PositionSolution SPPProcessor::solvePositionBaroAided(
+    const std::vector<SPPObservation>& valid_obs,
+    const NavigationData& nav,
+    const GNSSTime& time) {
+    const auto& cfg = spp_config_.baro;
+    last_baro_diagnostics_ = BaroEpochDiagnostics{};
+    auto& diag = last_baro_diagnostics_;
+    baro_filter_.setConfig(cfg);
+
+    // 1. Unconstrained solve: exactly the barometer-OFF measurement path.  Its
+    //    height is the only GNSS information the filter ever sees, so the
+    //    height constraint below can never feed back into its own input.
+    PositionSolution base = solvePositionLS(valid_obs, nav, time);
+
+    double baro_height_m = 0.0;
+    diag.baro_available = baro_samples_.heightAt(
+        time, cfg.sample_window_s, cfg.max_sample_age_s, baro_height_m, &diag.sample_count);
+    diag.filter_initialized = baro_filter_.initialized();
+    diag.baro_height_m = baro_height_m;
+    if (!diag.baro_available) {
+        diag.final_height_m = base.isValid() ? base.position_geodetic.height : 0.0;
+        return base;
+    }
+
+    // 2. Unconstrained height, its inflated sigma and the geometry gate.
+    double base_height_m = 0.0;
+    double base_sigma_m = 0.0;
+    if (base.isValid()) {
+        double lat = 0.0, lon = 0.0, h = 0.0;
+        ecef2geodetic(base.position_ecef, lat, lon, h);
+        const Vector3d up(std::cos(lat) * std::cos(lon), std::cos(lat) * std::sin(lon),
+                          std::sin(lat));
+        const double var_up = up.dot(base.position_covariance * up);
+        base_height_m = h;
+        base_sigma_m = std::max(
+            cfg.gnss_sigma_floor_m,
+            cfg.gnss_sigma_scale * std::sqrt(std::max(0.0, var_up)));
+        diag.unconstrained_height_m = h;
+        diag.unconstrained_sigma_m = base_sigma_m;
+        diag.geometry_good = std::isfinite(base_sigma_m) &&
+                             base.num_satellites >= cfg.init_min_satellites &&
+                             std::isfinite(base.gdop) && base.gdop <= cfg.init_max_gdop;
+        diag.final_height_m = h;
+    }
+
+    // 3. Causal KF: initialise from a good GNSS height, then predict + baro.
+    if (!baro_filter_.initialized()) {
+        if (diag.geometry_good) {
+            baro_filter_.initialize(time, base_height_m, base_sigma_m, baro_height_m);
+            diag.initialized_this_epoch = true;
+            diag.filter_initialized = true;
+            diag.bias_m = baro_filter_.bias();
+            diag.bias_sigma_m = baro_filter_.biasSigma();
+        }
+        return base;
+    }
+    diag.filter_initialized = true;
+    baro_filter_.predict(time);
+    diag.baro_update_accepted = baro_filter_.updateBaro(baro_height_m);
+    diag.rebase_count = baro_filter_.rebaseCount();
+    diag.prior_height_m = baro_filter_.height();
+    diag.prior_sigma_m = std::max(cfg.prior_sigma_floor_m, baro_filter_.heightSigma());
+
+    // 4. GNSS height update (after the prior was captured, so the constraint
+    //    in step 5 does not contain this epoch's own GNSS height).
+    if (diag.geometry_good) {
+        diag.gnss_update_accepted = baro_filter_.updateGnss(base_height_m, base_sigma_m);
+    }
+    diag.bias_m = baro_filter_.bias();
+    diag.bias_sigma_m = baro_filter_.biasSigma();
+
+    if (!base.isValid() || !(diag.prior_sigma_m <= cfg.max_prior_sigma_m)) {
+        return base;
+    }
+
+    // 5. Constrained re-solve with the prior height as an extra LS row.
+    const Vector3d saved_position = estimated_position_;
+    const double saved_clock_bias = receiver_clock_bias_;
+    const auto saved_system_biases = system_biases_;
+    const bool saved_cold_start_seed = position_is_cold_start_seed_;
+    baro_prior_active_ = true;
+    baro_prior_height_m_ = diag.prior_height_m;
+    baro_prior_sigma_m_ = diag.prior_sigma_m;
+    PositionSolution constrained = solvePositionLS(valid_obs, nav, time);
+    baro_prior_active_ = false;
+    if (constrained.isValid()) {
+        diag.constraint_applied = true;
+        diag.final_height_m = constrained.position_geodetic.height;
+        return constrained;
+    }
+    estimated_position_ = saved_position;
+    receiver_clock_bias_ = saved_clock_bias;
+    system_biases_ = saved_system_biases;
+    position_is_cold_start_seed_ = saved_cold_start_seed;
+    return base;
 }
 
 PositionSolution SPPProcessor::solvePositionLS(const std::vector<SPPObservation>& valid_obs,
@@ -741,8 +767,28 @@ PositionSolution SPPProcessor::solvePositionLS(const std::vector<SPPObservation>
     solution.time = time;
     solution.status = SolutionStatus::SPP;
 
-    if (estimated_position_.norm() < 1000.0) {
-        initializePosition(valid_obs, nav, time);
+    // Cold start: no receiver position is known yet (no RINEX header seed and
+    // no previous solution).  initializePosition() only provides a crude
+    // linearization point (0.9 * first satellite position), from which the
+    // elevation of every satellite is meaningless: only 2-3 satellites used to
+    // pass the mask there, the epoch failed, and the same bogus seed was kept
+    // for every later epoch (permanent lockout).  RTKLIB rescode() treats an
+    // unset receiver position as el = pi/2 for every satellite, i.e. the
+    // elevation mask is bypassed until the estimate has moved to a plausible
+    // location.  Mirror that: while a cold start is still unsettled (Newton
+    // step larger than kColdStartSettledStepM) the mask is not applied; it is
+    // applied from the following iteration on and always to the final
+    // measurement set.
+    constexpr double kColdStartSettledStepM = 1000.0;
+    //
+    // The seed is remembered in position_is_cold_start_seed_ until a solve
+    // stores a position, so a failed cold-start epoch does not make the next
+    // epoch re-use the same bogus linearization point.
+    const bool cold_start =
+        estimated_position_.norm() < 1000.0 || position_is_cold_start_seed_;
+    if (cold_start) {
+        position_is_cold_start_seed_ =
+            initializePosition(valid_obs, nav, time);
     }
 
     struct MeasurementModel {
@@ -795,7 +841,8 @@ PositionSolution SPPProcessor::solvePositionLS(const std::vector<SPPObservation>
         !(spp_config_.use_ssr_corrections && ssr_products_loaded_);
     std::vector<BroadcastMeasurementCache> broadcast_cache(valid_obs.size());
 
-    auto buildMeasurements = [&](const Vector3d& current_position) {
+    auto buildMeasurements = [&](const Vector3d& current_position,
+                                 bool apply_elevation_mask = true) {
         std::vector<MeasurementModel> measurements;
         measurements.reserve(valid_obs.size());
         const double configured_elevation_mask =
@@ -863,24 +910,31 @@ PositionSolution SPPProcessor::solvePositionLS(const std::vector<SPPObservation>
             double travel_time = transmit_pseudorange / constants::SPEED_OF_LIGHT;
             GNSSTime tx_time = time - travel_time;
             if (spp_config_.use_precise_products && precise_products_loaded_) {
+                bool precise_clock_available = false;
                 precise_orbit_clock = precise_products_.interpolateOrbitClock(
                     obs.satellite,
                     time,
                     sat_pos,
                     sat_vel,
                     sat_clk,
-                    sat_clk_drift);
-                if (precise_orbit_clock) {
-                    const double initial_distance = (sat_pos - current_position).norm();
-                    if (std::isfinite(initial_distance) && initial_distance > 0.0) {
-                        travel_time = initial_distance / constants::SPEED_OF_LIGHT;
-                        sat_pos -= sat_vel * travel_time;
-                        sat_clk -= sat_clk_drift * travel_time;
-                        tx_time = time - travel_time;
-                    } else {
-                        precise_orbit_clock = false;
-                    }
+                    sat_clk_drift,
+                    &precise_clock_available);
+                // Satellites without a precise orbit and clock are dropped
+                // rather than mixed in on broadcast clocks (RTKLIB
+                // EPHOPT_PREC behaviour; see ppp_corrections.cpp).
+                if (!precise_orbit_clock || !precise_clock_available) {
+                    continue;
                 }
+                const double initial_distance = (sat_pos - current_position).norm();
+                if (!std::isfinite(initial_distance) || initial_distance <= 0.0) {
+                    continue;
+                }
+                travel_time = initial_distance / constants::SPEED_OF_LIGHT;
+                sat_pos -= sat_vel * travel_time;
+                sat_clk -= sat_clk_drift * travel_time;
+                tx_time = time - travel_time;
+                // Product clocks exclude the periodic relativistic term.
+                sat_clk += preciseClockRelativisticCorrection(sat_pos, sat_vel);
             }
 
             if (!precise_orbit_clock && spp_config_.mrtklib_iflc_code_bias) {
@@ -1057,7 +1111,7 @@ PositionSolution SPPProcessor::solvePositionLS(const std::vector<SPPObservation>
                     : earth_rotation * sat_vel;
 
             auto geom = nav.calculateGeometry(current_position, corrected_sat_pos);
-            if (geom.elevation < min_elevation_rad) {
+            if (apply_elevation_mask && geom.elevation < min_elevation_rad) {
                 continue;
             }
             // The CLAS benchmark enables MRTKLIB's rover SNR mask on both
@@ -1309,8 +1363,15 @@ PositionSolution SPPProcessor::solvePositionLS(const std::vector<SPPObservation>
     int adaptive_robust_activations = 0;
     int adaptive_robust_tail_measurements = 0;
 
-    for (int iter = 0; iter < spp_config_.max_iterations; ++iter) {
-        auto measurements = buildMeasurements(position);
+    bool cold_start_settled = !cold_start;
+    // The unmasked cold-start iterations (Newton from a ~24000 km seed) are not
+    // counted against the regular iteration budget.
+    constexpr int kColdStartExtraIterations = 5;
+    const int max_iterations =
+        spp_config_.max_iterations + (cold_start ? kColdStartExtraIterations : 0);
+    for (int iter = 0; iter < max_iterations; ++iter) {
+        const bool iteration_masked = cold_start_settled;
+        auto measurements = buildMeasurements(position, iteration_masked);
         if (measurements.size() < 4) {
             solution.status = SolutionStatus::NONE;
             return solution;
@@ -1344,10 +1405,13 @@ PositionSolution SPPProcessor::solvePositionLS(const std::vector<SPPObservation>
             bias_columns[bias_groups[i]] = 4 + i;
         }
 
+        // Barometer height row (transient; absent unless solvePositionBaroAided
+        // armed it), appended after the n measurement rows.
+        const int baro_rows = baro_prior_active_ ? 1 : 0;
         MatrixXd H = MatrixXd::Zero(n, num_unknowns);
         VectorXd residuals = VectorXd::Zero(n);
-        MatrixXd weighted_H = MatrixXd::Zero(n, num_unknowns);
-        VectorXd weighted_residuals = VectorXd::Zero(n);
+        MatrixXd weighted_H = MatrixXd::Zero(n + baro_rows, num_unknowns);
+        VectorXd weighted_residuals = VectorXd::Zero(n + baro_rows);
         int iteration_robust_weighted_measurements = 0;
         double iteration_min_robust_weight_factor = 1.0;
         int iteration_tail_measurements = 0;
@@ -1438,6 +1502,15 @@ PositionSolution SPPProcessor::solvePositionLS(const std::vector<SPPObservation>
             weighted_H.row(i) = H.row(i) * sqrt_weight;
             weighted_residuals(i) = residuals(i) * sqrt_weight;
         }
+        if (baro_rows == 1) {
+            double lat = 0.0, lon = 0.0, h = 0.0;
+            ecef2geodetic(position, lat, lon, h);
+            const double inv_sigma = 1.0 / baro_prior_sigma_m_;
+            weighted_H(n, 0) = std::cos(lat) * std::cos(lon) * inv_sigma;
+            weighted_H(n, 1) = std::cos(lat) * std::sin(lon) * inv_sigma;
+            weighted_H(n, 2) = std::sin(lat) * inv_sigma;
+            weighted_residuals(n) = (baro_prior_height_m_ - h) * inv_sigma;
+        }
 
         VectorXd dx;
         if (spp_config_.mrtklib_iflc_code_bias) {
@@ -1484,12 +1557,16 @@ PositionSolution SPPProcessor::solvePositionLS(const std::vector<SPPObservation>
             spp_config_.mrtklib_iflc_code_bias
                 ? dx.norm()
                 : dx.head<3>().norm();
-        if (convergence_norm < spp_config_.position_convergence_threshold) {
+        if (!cold_start_settled && dx.head<3>().norm() < kColdStartSettledStepM) {
+            cold_start_settled = true;
+        }
+        if (iteration_masked &&
+            convergence_norm < spp_config_.position_convergence_threshold) {
             solution.iterations = iter + 1;
             break;
         }
-        if (iter == spp_config_.max_iterations - 1) {
-            solution.iterations = spp_config_.max_iterations;
+        if (iter == max_iterations - 1) {
+            solution.iterations = max_iterations;
         }
     }
 
@@ -1585,6 +1662,14 @@ PositionSolution SPPProcessor::solvePositionLS(const std::vector<SPPObservation>
             }
             normal.noalias() += weight * geometry.row(i).transpose() * geometry.row(i);
         }
+        if (baro_prior_active_) {
+            double lat = 0.0, lon = 0.0, h = 0.0;
+            ecef2geodetic(position, lat, lon, h);
+            const Vector3d up(std::cos(lat) * std::cos(lon), std::cos(lat) * std::sin(lon),
+                              std::sin(lat));
+            normal.topLeftCorner<3, 3>().noalias() +=
+                (1.0 / (baro_prior_sigma_m_ * baro_prior_sigma_m_)) * up * up.transpose();
+        }
         normal = 0.5 * (normal + normal.transpose());
         if (!normal.allFinite()) {
             return fallback_covariance;
@@ -1654,6 +1739,12 @@ PositionSolution SPPProcessor::solvePositionLS(const std::vector<SPPObservation>
             detectOutliers(final_observations, final_residuals, spp_config_.outlier_threshold_sigma);
         if (inlier_observations.size() < final_observations.size() &&
             inlier_observations.size() >= 4U) {
+            if (cold_start) {
+                // Warm-start the re-solve from the converged position rather
+                // than from the crude cold-start seed.
+                estimated_position_ = position;
+                position_is_cold_start_seed_ = false;
+            }
             auto filtered_solution = solvePositionLS(
                 inlier_observations, nav, time, false);
             if (filtered_solution.isValid()) {
@@ -1698,6 +1789,9 @@ PositionSolution SPPProcessor::solvePositionLS(const std::vector<SPPObservation>
         const Vector3d saved_position = estimated_position_;
         const double saved_clock_bias = receiver_clock_bias_;
         const auto saved_system_biases = system_biases_;
+        const bool saved_cold_start_seed = position_is_cold_start_seed_;
+        // The candidate re-solves start from the converged position.
+        position_is_cold_start_seed_ = false;
 
         for (size_t excluded = 0; excluded < final_observations.size(); ++excluded) {
             std::vector<SPPObservation> candidate_observations;
@@ -1732,6 +1826,7 @@ PositionSolution SPPProcessor::solvePositionLS(const std::vector<SPPObservation>
         estimated_position_ = saved_position;
         receiver_clock_bias_ = saved_clock_bias;
         system_biases_ = saved_system_biases;
+        position_is_cold_start_seed_ = saved_cold_start_seed;
 
         const int selected = spp_utils::selectRaimFdeCandidate(
             final_residual_rms,
@@ -1749,6 +1844,7 @@ PositionSolution SPPProcessor::solvePositionLS(const std::vector<SPPObservation>
             fde_solution.spp_rejected_satellites.push_back(
                 final_observations[static_cast<size_t>(selected)].observation.satellite);
             estimated_position_ = fde_solution.position_ecef;
+            position_is_cold_start_seed_ = false;
             receiver_clock_bias_ = fde_solution.receiver_clock_bias;
             system_biases_ = candidate_system_biases[static_cast<size_t>(selected)];
             return fde_solution;
@@ -1856,6 +1952,14 @@ PositionSolution SPPProcessor::solvePositionLS(const std::vector<SPPObservation>
         solution.status = SolutionStatus::NONE;
         return solution;
     }
+    if (spp_config_.max_position_sigma_m > 0.0) {
+        const double position_sigma_m = std::sqrt(solution.position_covariance.trace());
+        if (!std::isfinite(position_sigma_m) ||
+            position_sigma_m > spp_config_.max_position_sigma_m) {
+            solution.status = SolutionStatus::NONE;
+            return solution;
+        }
+    }
     if (spp_config_.max_residual_rms > 0.0 &&
         std::isfinite(solution.residual_rms) &&
         solution.residual_rms > spp_config_.max_residual_rms) {
@@ -1908,6 +2012,7 @@ PositionSolution SPPProcessor::solvePositionLS(const std::vector<SPPObservation>
     }
 
     estimated_position_ = position;
+    position_is_cold_start_seed_ = false;
     receiver_clock_bias_ = clock_bias;
     system_biases_ = bias_estimates;
     return solution;
@@ -2045,11 +2150,7 @@ std::vector<SPPProcessor::SPPObservation> SPPProcessor::validateObservations(
         // nonzero health on the remaining systems, excludes the satellite. The
         // MIZU BRDC nav carries unhealthy R11/R26/R27, E14/E18 and several BDS
         // GEO/IGSO; including them drove the SPP solution kilometers off.
-        int sv_health = static_cast<int>(eph->health);
-        if (observation.satellite.system == GNSSSystem::QZSS) {
-            sv_health &= 0xFE;
-        }
-        if (sv_health != 0) {
+        if (!ephemerisHealthy(*eph, observation.satellite.system)) {
             markPreprocessRow(diagnostics, input_row_index, false,
                               "unhealthy-satellite");
             continue;
@@ -2210,17 +2311,23 @@ std::map<SatelliteId, SPPProcessor::SatelliteState> SPPProcessor::calculateSatel
                 0,
                 &ssr_orbit_iode);
 
-        if (spp_config_.use_precise_products &&
-            precise_products_loaded_ &&
-            precise_products_.interpolateOrbitClock(obs.satellite,
-                                                     time,
-                                                     state.position,
-                                                     state.velocity,
-                                                     state.clock_bias,
-                                                     state.clock_drift)) {
-            state.valid = true;
-            state.precise_orbit_clock = true;
-            states[obs.satellite] = state;
+        if (spp_config_.use_precise_products && precise_products_loaded_) {
+            // Precise products loaded: use them or drop the satellite (no
+            // broadcast fallback; see buildMeasurements()).
+            bool precise_clock_available = false;
+            state.valid = precise_products_.interpolateOrbitClock(
+                              obs.satellite,
+                              time,
+                              state.position,
+                              state.velocity,
+                              state.clock_bias,
+                              state.clock_drift,
+                              &precise_clock_available) &&
+                precise_clock_available;
+            state.precise_orbit_clock = state.valid;
+            if (state.valid) {
+                states[obs.satellite] = state;
+            }
             continue;
         }
 
@@ -2563,6 +2670,7 @@ SPPProcessor::preprocessEpoch(const ObservationData& obs,
         if (st.precise_orbit_clock) {
             sat_position -= st.velocity * travel_time;
             sat_clk -= st.clock_drift * travel_time;
+            sat_clk += preciseClockRelativisticCorrection(sat_position, st.velocity);
             range_approx = (sat_position - position).norm();
             travel_time = range_approx / constants::SPEED_OF_LIGHT;
         }
@@ -2781,6 +2889,30 @@ SPPProcessor::preprocessEpoch(const ObservationData& obs,
         cm.identity.clock_group = cm.clock_group;
         cm.identity.weight = cm.weight;
         cm.ionosphere_free = spp_obs.ionosphere_free;
+        cm.snr = o.snr;
+        cm.carrier_frequency_hz =
+            o.has_source_carrier_frequency_hz &&
+                    std::isfinite(o.source_carrier_frequency_hz) &&
+                    o.source_carrier_frequency_hz > 0.0
+                ? o.source_carrier_frequency_hz
+                : (o.has_glonass_frequency_channel
+                       ? signalFrequencyHz(o)
+                       : signalFrequencyHz(o.signal, eph));
+        cm.loss_of_lock_indicator = o.lli;
+        cm.source_loss_of_lock = o.loss_of_lock;
+        cm.carrier_observation_type = o.carrier_phase_observation_type;
+        if (o.has_carrier_phase) {
+            cm.carrier_phase = o.carrier_phase;
+        }
+        if (o.has_doppler) {
+            cm.doppler = o.doppler;
+        }
+        // Rotate the velocity with the same Sagnac rotation as the position.
+        cm.satellite_velocity = {
+            st.velocity.x() * cos_a + st.velocity.y() * sin_a,
+            -st.velocity.x() * sin_a + st.velocity.y() * cos_a,
+            st.velocity.z()};
+        cm.satellite_clock_drift = st.clock_drift;
         result.push_back(cm);
         markAccepted(spp_obs);
     }

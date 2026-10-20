@@ -3,6 +3,7 @@
 #include <libgnss++/algorithms/ppp.hpp>
 #include <libgnss++/algorithms/ppp_utils.hpp>
 #include <libgnss++/core/constants.hpp>
+#include <libgnss++/core/coordinates.hpp>
 
 #include <algorithm>
 #include <cctype>
@@ -15,13 +16,205 @@ namespace libgnss::ppp_internal {
 
 inline constexpr double kDefaultZenithDelayMeters = 2.3;
 
-inline int filterIterationCount(bool madoca_per_frequency_update,
-                                bool precise_products_loaded,
-                                int configured_iterations) {
-    if (madoca_per_frequency_update) {
-        return 1;
+// Number of Kalman measurement updates PPPProcessor::updateFilter() commits
+// per epoch. applyPreciseCorrections() materializes the observation geometry
+// once, at the prior position, so every pass after the first re-reads the
+// position innovation the state has already absorbed and pushes the position
+// again on an already-shrunk covariance, while the clock, troposphere and
+// ambiguity rows are re-evaluated and take up whatever the overshoot leaves.
+// RTKLIB/MADOCALIB commit one update per epoch (ppp.c pppos() restarts every
+// residual-screening pass from rtk->x/rtk->P). A single update linearized at
+// the prior is also all the geometry needs: a position error of 100 m changes
+// the line of sight by ~5e-6 rad, a sub-millimetre range term.
+//
+// One update per epoch everywhere: static, --low-dynamics and kinematic;
+// broadcast, SP3/CLK, HAS / legacy RTCM SSR and MADOCA (uncombined and
+// ionosphere-free). At start-up the repeated push moved a static solution
+// tens to hundreds of metres (TSK2 IGS-final first hour 930 m 3D, 30 s
+// GPS-only Kamakura 250 m; MADOCA static IF MIZU/ALIC 1 h 250/340 m 3D RMS
+// once its SPP anchor blend was off) before the phase rows pulled it back.
+inline constexpr int kMeasurementUpdatesPerEpoch = 1;
+
+// Geometry-free and Melbourne-Wubbena cycle-slip detection (RTKLIB
+// detslp_gf() / detslp_mw(), used by every RTKLIB PPP mode). Static
+// ionosphere-free PPP on broadcast or SP3/CLK products used to rely on the
+// receiver LLI flag alone, so a slip without LLI -- typically on a second
+// frequency that drops out for a few epochs and comes back with a new
+// ambiguity -- was absorbed by the float ambiguity and the position (TSK2
+// 2024-01-01: 0.96 m east at the end of the day). SSR ionosphere-free and
+// kinematic PPP already used these detectors; CLAS kinematic OSR has its own.
+inline bool useCombinationSlipDetection(bool kinematic_mode,
+                                        bool clas_kinematic_osr,
+                                        bool use_ionosphere_free) {
+    return (kinematic_mode && !clas_kinematic_osr) || use_ionosphere_free;
+}
+
+// Post-fit residual screening for kinematic PPP. RTKLIB/MADOCALIB ppp.c
+// (ppp_res(), THRES_REJECT = 4) excludes the satellite with the largest
+// post-fit residual beyond four sigmas and redoes the epoch's update from the
+// predicted state. The native kinematic filter had no equivalent (its code
+// gate only rejects kilometre-level blunders), so urban NLOS code rows tens of
+// metres long were committed and carried into the persistent troposphere and
+// float-ambiguity states. The residuals are standardized by their own
+// covariance (Baarda w-test) rather than by the measurement sigma alone: the
+// native phase sigma (~1 cm, no broadcast signal-in-space term) would otherwise
+// make the phase rows of healthy satellites the "worst" rows whenever one code
+// outlier bends the solution. Used for kinematic motion (not --low-dynamics),
+// which commits one update per epoch; coherent MADOCA keeps the MADOCALIB
+// bridge semantics it is pinned against, and the CLAS OSR lane never reaches
+// this filter.
+inline constexpr double kPostfitRejectSigma = 4.0;
+
+// Position / velocity / acceleration dynamics (RTKLIB ppp-kine with
+// pos1-dynamics=on) for the non-CLAS kinematic filter. --low-dynamics and the
+// CLAS OSR filter (MRTKLIB dynamics of its own) never use it.
+inline bool usePvaDynamics(bool use_pva_dynamics,
+                           bool use_dynamics_model,
+                           bool kinematic_mode,
+                           bool low_dynamics_mode,
+                           bool clas_osr_filter) {
+    return use_pva_dynamics && use_dynamics_model && kinematic_mode &&
+           !low_dynamics_mode && !clas_osr_filter;
+}
+
+// RTKLIB udpos_ppp() acceleration process noise: a random walk with
+// standard deviation sigma_h (east, north) and sigma_v (up) per sqrt(s),
+// defined in the local frame at `receiver_position_ecef` and rotated to ECEF
+// (covecef()).
+inline Eigen::Matrix3d pvaAccelerationProcessNoiseEcef(
+    const Eigen::Vector3d& receiver_position_ecef,
+    double sigma_horizontal,
+    double sigma_vertical,
+    double dt) {
+    double lat = 0.0;
+    double lon = 0.0;
+    double height = 0.0;
+    ecef2geodetic(receiver_position_ecef, lat, lon, height);
+    Eigen::Matrix3d enu_to_ecef;
+    enu_to_ecef.col(0) = enu2ecef(Eigen::Vector3d::UnitX(), lat, lon);
+    enu_to_ecef.col(1) = enu2ecef(Eigen::Vector3d::UnitY(), lat, lon);
+    enu_to_ecef.col(2) = enu2ecef(Eigen::Vector3d::UnitZ(), lat, lon);
+    Eigen::Matrix3d q_enu = Eigen::Matrix3d::Zero();
+    q_enu(0, 0) = q_enu(1, 1) = sigma_horizontal * sigma_horizontal * std::abs(dt);
+    q_enu(2, 2) = sigma_vertical * sigma_vertical * std::abs(dt);
+    return enu_to_ecef * q_enu * enu_to_ecef.transpose();
+}
+
+// SPP position variance assumed when the seed carries no covariance (m^2).
+inline constexpr double kPvaFallbackSeedVariance = 100.0;
+
+// Normalized squared distance d' (P + C)^-1 d between the predicted filter
+// position (covariance P) and the SPP seed (covariance C); infinity when the
+// sum is not positive definite or an input is not finite.
+inline double seedPositionDisagreement(const Eigen::Vector3d& predicted_position,
+                                       const Eigen::Matrix3d& predicted_covariance,
+                                       const Eigen::Vector3d& seed_position,
+                                       const Eigen::Matrix3d& seed_covariance) {
+    const Eigen::Vector3d d = predicted_position - seed_position;
+    const Eigen::Matrix3d C = predicted_covariance + seed_covariance;
+    if (!d.allFinite() || !C.allFinite()) {
+        return std::numeric_limits<double>::infinity();
     }
-    return precise_products_loaded ? 3 : configured_iterations;
+    const Eigen::LLT<Eigen::Matrix3d> llt(C);
+    if (llt.info() != Eigen::Success) {
+        return std::numeric_limits<double>::infinity();
+    }
+    return d.dot(llt.solve(d));
+}
+
+// Kalman update of the velocity states with a direct velocity measurement
+// (the SPP Doppler velocity) of covariance R. Returns false, leaving the
+// state untouched, when the normalized innovation squared exceeds
+// chi_square_gate (<= 0 disables the gate) or the inputs are not finite.
+inline bool applyVelocityMeasurement(ppp_shared::PPPState& filter_state,
+                                     const Eigen::Vector3d& velocity,
+                                     const Eigen::Matrix3d& covariance,
+                                     double chi_square_gate) {
+    const int v = filter_state.vel_index;
+    if (v < 0 || v + 3 > filter_state.state.size() || !velocity.allFinite() ||
+        !covariance.allFinite()) {
+        return false;
+    }
+    auto& x = filter_state.state;
+    auto& P = filter_state.covariance;
+    const Eigen::Vector3d innovation = velocity - x.segment(v, 3);
+    const Eigen::Matrix3d S = P.block(v, v, 3, 3) + covariance;
+    const Eigen::LDLT<Eigen::Matrix3d> ldlt(S);
+    if (ldlt.info() != Eigen::Success) {
+        return false;
+    }
+    const double nis = innovation.dot(ldlt.solve(innovation));
+    if (!std::isfinite(nis) || (chi_square_gate > 0.0 && nis > chi_square_gate)) {
+        return false;
+    }
+    const Eigen::MatrixXd PHt = P.middleCols(v, 3);  // P H'
+    const Eigen::MatrixXd gain = ldlt.solve(PHt.transpose()).transpose();
+    x += gain * innovation;
+    P -= gain * PHt.transpose();
+    P = 0.5 * (P + P.transpose()).eval();
+    return true;
+}
+
+// True on the MADOCA L6E per-frequency (uncombined, estimated-ionosphere) path.
+inline bool madocaPerFrequencyPath(
+    bool require_coherent_ssr,
+    bool ssr_products_loaded,
+    bool use_ionosphere_free,
+    bool estimate_ionosphere,
+    bool use_clas_osr_filter) {
+    return require_coherent_ssr && ssr_products_loaded &&
+           !use_ionosphere_free && estimate_ionosphere &&
+           !use_clas_osr_filter;
+}
+
+// Post-fit residual screening (drop the worst standardized-residual satellite
+// and re-solve). Off for coherent MADOCA SSR and CLAS OSR, except on the
+// MADOCA per-frequency path, where it corresponds to the 4-sigma satellite
+// exclusion with re-iteration in MADOCALIB ppp_res() (ppp.c).
+inline bool usePostfitResidualScreening(bool kinematic_motion,
+                                        bool coherent_madoca_ssr,
+                                        bool clas_osr_filter,
+                                        bool madoca_per_frequency = false) {
+    return kinematic_motion && !clas_osr_filter &&
+           (!coherent_madoca_ssr || madoca_per_frequency);
+}
+
+// Phase prefit-residual floor. MADOCALIB gates every row with the single
+// prefit innovation limit maxinno (pos2-rejionno = 50 m). The native 10/20 m
+// floors, combined with an L1 + Klobuchar SPP seed, reject most L2 phase rows
+// when the ionosphere is large, so on the MADOCA per-frequency path the floor
+// is raised to the MADOCALIB value; every other path keeps its native floor.
+inline constexpr double kMadocaMaxInnovationM = 50.0;
+
+inline double phaseInnovationFloorM(double native_floor_m,
+                                    bool madoca_per_frequency) {
+    return madoca_per_frequency
+        ? std::max(native_floor_m, kMadocaMaxInnovationM)
+        : native_floor_m;
+}
+
+// Index of the row with the largest standardized post-fit residual
+// w_i = (S^-1 r)_i / sqrt((S^-1)_ii), S = H P H' + R the innovation covariance
+// and r the innovations (for a Kalman update the post-fit residual is
+// R S^-1 r with covariance R S^-1 R); -1 when every |w_i| <= threshold_sigma.
+inline int worstStandardizedResidualRow(const Eigen::VectorXd& innovations,
+                                        const Eigen::MatrixXd& innovation_inverse,
+                                        double threshold_sigma) {
+    const Eigen::VectorXd weighted = innovation_inverse * innovations;
+    int worst = -1;
+    double worst_ratio = threshold_sigma;
+    for (int i = 0; i < weighted.size(); ++i) {
+        const double variance = innovation_inverse(i, i);
+        if (!(variance > 0.0) || !std::isfinite(weighted(i))) {
+            continue;
+        }
+        const double ratio = std::abs(weighted(i)) / std::sqrt(variance);
+        if (ratio > worst_ratio) {
+            worst_ratio = ratio;
+            worst = i;
+        }
+    }
+    return worst;
 }
 
 inline double geometryFreeSlipThresholdMeters(
@@ -435,6 +628,137 @@ inline std::vector<SignalType> secondarySignals(GNSSSystem system) {
         default: return {};
     }
 }
+
+// Ionosphere-free PPP whose satellite clocks come from the broadcast
+// ephemeris, with no precise, SSR or DCB/OSB products supplying code biases.
+// Ionosphere-free PPP on SP3/CLK products (no SSR) needs both frequencies of a
+// satellite. With only the primary signal the code row would carry the full
+// first-order ionospheric delay (no broadcast Klobuchar term is applied on this
+// path) and the raw L1 carrier phase would be tied to the satellite's
+// ionosphere-free ambiguity state, so a satellite that drops its second
+// frequency for a few epochs corrupts that ambiguity (metres) when the second
+// frequency returns. RTKLIB/MADOCALIB (IONOOPT_IFLC) skip such a satellite;
+// do the same. Broadcast and SSR paths keep their own single-frequency rows.
+inline bool dropSingleFrequencyPreciseProductSatellite(bool precise_products_loaded,
+                                                       bool ssr_products_loaded) {
+    return precise_products_loaded && !ssr_products_loaded;
+}
+
+inline bool broadcastClockIonosphereFree(bool use_ionosphere_free,
+                                         bool precise_products_loaded,
+                                         bool ssr_products_loaded,
+                                         bool dcb_products_loaded) {
+    return use_ionosphere_free && !precise_products_loaded &&
+           !ssr_products_loaded && !dcb_products_loaded;
+}
+
+// Broadcast (D1/D2) BeiDou satellite clocks are referenced to B3I; the B1I and
+// B2I codes carry the broadcast group delays TGD1 / TGD2 (BDS-SIS-ICD-2.1
+// 5.2.4.10, RTKLIB pntpos.c prange()), which reach -45 ns (-13.5 m) on BDS-3
+// satellites and are amplified by the ionosphere-free combination. The BDS-3
+// B1C / B2a signals have no group delay in D1/D2 (only in B-CNAV1/2), so they
+// cannot be used against a D1/D2 clock.
+inline const std::vector<SignalType>& broadcastBeiDouPrimarySignals() {
+    static const std::vector<SignalType> signals{SignalType::BDS_B1I};
+    return signals;
+}
+
+// BDS-3 satellites (C19 and above) do not transmit B2I: their D1 message is
+// on B1I and B3I only (BDS-SIS-ICD-B1I-3.0, BDS-SIS-ICD-B3I-1.0), and the
+// RINEX band-7 code a receiver logs for them (C7D / C7P / C7Z) is B2b, which
+// shares the B2I carrier (and so the BDS_B2I slot here) but whose group delay
+// is only broadcast in B-CNAV3 (TGD_B2bI). Their D1 TGD2 field repeats TGD1
+// (all BDS-3 satellites in the IGS merged BRDC files of 2025-046 / 2025-233),
+// so pairing B1I with B2b and removing TGD1 / TGD2 left a
+// 1.49 * (TGD1 - TGD_B2b) error of up to tens of metres per satellite. BDS-3
+// uses B1I / B3I, whose only group delay is TGD1; BDS-2 keeps B2I / TGD2.
+inline bool isBeiDou3Satellite(const SatelliteId& sat) {
+    return sat.system == GNSSSystem::BeiDou && sat.prn >= 19;
+}
+
+inline const std::vector<SignalType>& broadcastBeiDouSecondarySignals(
+    const SatelliteId& sat) {
+    static const std::vector<SignalType> bds2_signals{
+        SignalType::BDS_B2I, SignalType::BDS_B3I};
+    static const std::vector<SignalType> bds3_signals{SignalType::BDS_B3I};
+    return isBeiDou3Satellite(sat) ? bds3_signals : bds2_signals;
+}
+
+// The RINEX reader keeps one policy-selected secondary observation per
+// satellite, with band 7 ahead of band 6, so a BDS-3 satellite logging B2b
+// keeps B2b there and its B3I code is only in the per-tracking-code
+// observations. Return the B3I (C6I / C6Q / C6X) observation of a BDS-3
+// satellite, or the first broadcast secondary signal of a BDS-2 satellite.
+// require_carrier selects an observation with a carrier phase (slip
+// detection) instead of a pseudorange.
+inline const Observation* findBroadcastBeiDouSecondaryObservation(
+    const ObservationData& obs, const SatelliteId& sat, bool require_carrier) {
+    const auto usable = [require_carrier](const Observation* candidate) {
+        if (candidate == nullptr || !candidate->valid) {
+            return false;
+        }
+        if (require_carrier) {
+            return candidate->has_carrier_phase &&
+                   std::isfinite(candidate->carrier_phase);
+        }
+        return candidate->has_pseudorange && candidate->pseudorange > 0.0 &&
+               std::isfinite(candidate->pseudorange);
+    };
+    for (const auto signal : broadcastBeiDouSecondarySignals(sat)) {
+        const Observation* candidate = obs.getObservation(sat, signal);
+        if (usable(candidate)) {
+            return candidate;
+        }
+    }
+    if (!isBeiDou3Satellite(sat)) {
+        return nullptr;
+    }
+    for (const char* tracking_code : {"6I", "6Q", "6X"}) {
+        const Observation* candidate =
+            obs.getRinexTrackingObservation(sat, tracking_code);
+        if (usable(candidate)) {
+            return candidate;
+        }
+    }
+    return nullptr;
+}
+
+inline double broadcastBeiDouGroupDelayMeters(SignalType signal, const Ephemeris& eph) {
+    switch (signal) {
+        case SignalType::BDS_B1I:
+            return constants::SPEED_OF_LIGHT * eph.tgd;
+        case SignalType::BDS_B2I:
+            return constants::SPEED_OF_LIGHT * eph.tgd_secondary;
+        default:
+            return 0.0;  // B3I is the clock reference.
+    }
+}
+
+// Broadcast group delay (metres) to subtract from a single-frequency primary
+// code (the satellite's secondary frequency is missing this epoch). GPS/QZSS
+// LNAV and Galileo clocks are ionosphere-free references, so their L1 / E1
+// code carries TGD / BGD; this is the SPP single-frequency model
+// (spp.cpp groupDelayCorrectionMeters, legacy Galileo field). GLONASS
+// broadcasts no L1 group delay.
+inline double broadcastSingleFrequencyGroupDelayMeters(const SatelliteId& satellite,
+                                                       SignalType signal,
+                                                       const Ephemeris& eph) {
+    switch (satellite.system) {
+        case GNSSSystem::GPS:
+        case GNSSSystem::QZSS:
+        case GNSSSystem::Galileo:
+            return constants::SPEED_OF_LIGHT * eph.tgd;
+        case GNSSSystem::BeiDou:
+            return broadcastBeiDouGroupDelayMeters(signal, eph);
+        default:
+            return 0.0;
+    }
+}
+
+// Error factor of the broadcast (Klobuchar) ionosphere model applied to the
+// single-frequency rows of a broadcast ionosphere-free solution: sigma = 0.5 *
+// delay, as RTKLIB ERR_BRDCI.
+inline constexpr double kBroadcastIonosphereErrorFactor = 0.5;
 
 inline const Observation* findObservationForSignals(const ObservationData& obs,
                                                     const SatelliteId& sat,

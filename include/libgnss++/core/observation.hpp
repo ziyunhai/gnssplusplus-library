@@ -90,7 +90,7 @@ struct Observation {
 class ObservationData {
 public:
     GNSSTime time;
-    Vector3d receiver_position;     ///< Approximate receiver position (ECEF)
+    Vector3d receiver_position = Vector3d::Zero();  ///< Approximate receiver position (ECEF); zero = unknown
     double receiver_clock_bias = 0.0;
     // Optional raw Android receiver clock rate in range metres/second.  This
     // is populated only when the input explicitly carries
@@ -167,12 +167,6 @@ public:
      * @brief Get observations for specific signal type
      */
     std::vector<Observation> getObservations(SignalType signal) const;
-    
-    /**
-     * @brief Filter observations by elevation angle
-     */
-    std::vector<Observation> filterByElevation(double min_elevation, 
-                                             const Vector3d& receiver_pos) const;
     
     /**
      * @brief Filter observations by SNR

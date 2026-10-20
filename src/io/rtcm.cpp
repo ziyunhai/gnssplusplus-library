@@ -10,6 +10,7 @@
 #include <iterator>
 #include <limits>
 #include <string>
+#include <stdexcept>
 
 #ifndef _WIN32
 #include <netdb.h>
@@ -28,9 +29,16 @@ namespace io {
 using namespace rtcm_internal;
 
 void RTCMProcessor::clear() {
+    reference_time_.reset();
     reference_position_.setZero();
     has_reference_position_ = false;
     glonass_frequency_channels_.clear();
+}
+
+void RTCMProcessor::setReferenceTime(const GNSSTime& time) {
+    if (time.week < 0 || !std::isfinite(time.tow) || time.tow < 0.0 || time.tow >= 604800.0)
+        throw std::invalid_argument("expected normalized finite RTCM GPST context");
+    reference_time_ = time;
 }
 
 std::vector<RTCMMessage> RTCMProcessor::decode(const uint8_t* buffer, size_t size) {
@@ -117,23 +125,6 @@ bool RTCMProcessor::decodeNavigationData(const RTCMMessage& message, NavigationD
     return decodeEphemerisMessage(message, nav_data);
 }
 
-
-void RTCMProcessor::setBits(uint8_t* data, int pos, int len, uint32_t value) {
-    if (!data || len <= 0 || len > 32 || pos < 0) {
-        return;
-    }
-    for (int i = 0; i < len; ++i) {
-        const int bit_pos = pos + len - 1 - i;
-        const int byte_index = bit_pos / 8;
-        const int bit_in_byte = 7 - (bit_pos % 8);
-        const uint8_t mask = static_cast<uint8_t>(1U << bit_in_byte);
-        if ((value >> i) & 0x01U) {
-            data[byte_index] |= mask;
-        } else {
-            data[byte_index] &= static_cast<uint8_t>(~mask);
-        }
-    }
-}
 
 bool RTCMProcessor::parseHeader(const uint8_t* data, RTCMMessageType& type, uint16_t& length) {
     if (!data || data[0] != kRTCMPreamble) {

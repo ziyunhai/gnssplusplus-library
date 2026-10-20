@@ -14,9 +14,6 @@ struct PPPEnvOverrides {
     // GNSS_PPP_REQUIRE_SSR_ORBIT: drop satellites missing SSR orbit
     // corrections when set to a value whose first char is not '0'. Default false.
     bool require_ssr_orbit = false;
-    // GNSS_PPP_DISABLE_MADOCA_STATIC_ANCHOR: disable the MADOCA static anchor
-    // blend when set exactly to "1". Default false.
-    bool disable_madoca_static_anchor = false;
     // GNSS_PPP_STATIC_ANCHOR_BLEND: override static anchor blend fraction;
     // values outside [0,1] are ignored at use sites. Default -1.0 (inactive).
     double static_anchor_blend = -1.0;
@@ -103,9 +100,6 @@ struct PPPEnvOverrides {
     // GNSS_PPP_NO_SOLID_TIDE: skip solid-earth tides when present.
     // Default false.
     bool no_solid_tide = false;
-    // GNSS_PPP_TIDE_ITRS_SUN_MOON: rotate sun/moon vectors to ITRS before IERS
-    // solid tide when present. Default false.
-    bool tide_itrs_sun_moon = false;
     // GNSS_PPP_PF_CODE_VAR_SCALE: diagnostic per-frequency code variance
     // scale applied after the RTKLIB error-ratio model. Default 1.0.
     double pf_code_var_scale = 1.0;
@@ -206,6 +200,32 @@ struct PPPEnvOverrides {
     // (fix ON); exact "0" restores the unconditional-increment-only legacy
     // behavior byte-for-byte.
     bool clas_outage_reset_parity = true;
+    // GNSS_PPP_CLAS_TIDE_NO_PERMANENT: omit the legacy permanent-deformation
+    // elimination term (0.1196*(1.5*sin^2(phi)-0.5) up, 0.0247*sin(2*phi)
+    // north) from the CLAS receiver solid-earth tide when set exactly to "1".
+    // MRTKLIB v0.4.2 and v0.5.1 call tidedisp(opt=5) from clas_osr_zdres()
+    // (mrtk_clas_osr.c: solid(1)+pole(4)); the permanent term needs opt bit 8
+    // (mrtk_tides.c:128) and is therefore NOT applied by the pinned reference.
+    // Default false keeps the historical term for bit-exact legacy output.
+    bool clas_tide_no_permanent = false;
+    // GNSS_PPP_CLAS_RECEIVER_TIDE: feed the CLAS receiver tide displacement
+    // (solid + pole [+ grid ocean loading for the hard-coded network 7]) into
+    // the OSR measurement geometry, exactly as MRTKLIB clas_osr_zdres() does
+    // with "rr[i] += disp[i]" before the geometric distance
+    // (mrtk_clas_osr.c:1055-1100), while the filter position state stays
+    // tide-free. The displacement was already computed per epoch
+    // (CLASEpochContext::receiver_tide_displacement) but only the CLAS DD
+    // scaffold consumed it, so the default OSR filter modelled a site with no
+    // tide at all. Exact "1" enables; default false is bit-identical legacy.
+    // For networks other than 7 (no ocean-loading table available) only the
+    // solid and pole terms are applied.
+    bool clas_receiver_tide = false;
+    // GNSS_PPP_CLAS_GRID_BLQ: path to the official CLAS ocean-loading table
+    // (clas_grid.blq, records "<network>-<grid>"). When set together with
+    // GNSS_PPP_CLAS_RECEIVER_TIDE=1 the grid ocean loading is interpolated for
+    // every network exactly as MRTKLIB ocean_tide_clasgrid() does; unset keeps
+    // the embedded network-7 table (other networks: solid + pole only).
+    std::string clas_grid_blq_path;
     // GNSS_PPP_CLAS_SIS_BOUNDARY: apply the CLAS SIS continuity delta with
     // CLASLIB-style SSR-update-boundary semantics (hold the delta captured at
     // a 30s orbit/clock boundary for the following 15s, matching the
@@ -331,6 +351,15 @@ struct PPPEnvOverrides {
     // definition in ppp_clas_epoch.cpp). Default -1 (unset) preserves the
     // built-in default of 60, bit-identical; any value >= 0 overrides it.
     int clas_hold_cont_min_track = -1;
+    // GNSS_PPP_CLAS_PAR_FREQ_GATE: when exactly "1", the CLAS kinematic
+    // direct state-DD partial-AR exclusion loop only tries satellites that
+    // pass MRTKLIB's resamb gate (mrtk_ppp_rtk.c elsort loop: a satellite is
+    // skipped when more than one of the nf configured frequencies is not both
+    // observed (vsat) and locked (lock > 0)).  clas.toml uses l1+2+3 (nf = 3)
+    // and this implementation tracks L1/L2 states only, so the gate means
+    // "at least two active locked frequency states".  Default false keeps the
+    // historical one-state minimum (bit-identical).
+    bool clas_par_freq_gate = false;
     // GNSS_PPP_DEBUG: general PPP debug logging. Default false.
     bool debug = false;
 
