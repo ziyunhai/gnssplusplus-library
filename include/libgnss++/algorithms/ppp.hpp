@@ -160,10 +160,14 @@ public:
 
     // Load receiver-specific L6D ionosphere snapshots. They remain
     // measurement-neutral unless PPPConfig::apply_madoca_l6d_ionosphere is
-    // explicitly enabled.
-    bool loadMadocaL6dProducts(const std::vector<std::string>& l6d_files,
-                               const double reference_epoch[6],
-                               const double receiver_ecef[3]);
+    // explicitly enabled. kFailed leaves the products empty. A receiver
+    // outside the L6D service area (kOutsideCoverage) is not an error: the
+    // products stay empty and apply_madoca_l6d_ionosphere is cleared so the
+    // run is identical to one without L6D input.
+    io::MadocaL6dLoadStatus loadMadocaL6dProducts(
+        const std::vector<std::string>& l6d_files,
+        const double reference_epoch[6],
+        const double receiver_ecef[3]);
     void setMadocaIonoProductsForShadow(const io::MadocaIonoProducts& products) {
         madoca_iono_products_ = products;
     }
@@ -399,6 +403,9 @@ private:
     bool satellite_antex_loaded_ = false;
     Vector3d static_anchor_position_ = Vector3d::Zero();
     bool has_static_anchor_position_ = false;
+    // predictState() re-initialised the position from the per-epoch kinematic
+    // SPP seed in this epoch (the MADOCA post-fit score reference).
+    bool position_reset_to_seed_this_epoch_ = false;
     double last_ar_ratio_ = 0.0;
     int last_fixed_ambiguities_ = 0;
     bool last_ar_wide_lane_only_ = false;
@@ -904,6 +911,9 @@ private:
     void reinitializeVectorState(int start_index, const Vector3d& value, double variance);
     void reinitializeScalarState(int index, double value, double variance);
     bool useLowDynamicsBroadcastSeedAssist() const;
+    bool madocaPostfitScoreRejectsEpoch(bool converged,
+                                        int normalized_row_count,
+                                        double score) const;
     void recoverLowDynamicsBroadcastState(const ObservationData& obs,
                                           const PositionSolution* seed_solution);
     int receiverClockStateIndex(const SatelliteId& satellite) const;
