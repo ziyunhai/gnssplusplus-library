@@ -3,6 +3,7 @@
 #include <libgnss++/algorithms/stationary_gyro_initializer.hpp>
 #include <libgnss++/algorithms/adjacent_residual_moments.hpp>
 #include <libgnss++/algorithms/code_edge_candidates.hpp>
+#include <libgnss++/algorithms/hardware_clock_reset.hpp>
 #include <libgnss++/algorithms/pseudorange_position_information.hpp>
 // Opt-in, no-base GNSS+IMU entry point for the smartphone research lane.
 //
@@ -387,6 +388,12 @@ struct Options {
     bool native_source_tdcp_resl_observable = false;
     bool native_tdcp_only_affine_geometry = false;
     bool native_epoch_heading_attitude_seeds = false;
+    // Treat raw Android HardwareClockDiscontinuityCount changes as clock jumps.
+    bool android_hardware_clock_reset_clock_jumps = false;
+    std::size_t android_hardware_clock_reset_epochs = 0;
+    // Seed IMU attitude yaw from the GNSS-first course plus this mount yaw.
+    bool native_course_attitude_seeds = false;
+    double native_course_attitude_seed_mount_deg = 0.0;
     bool native_omit_first_imu_bias_prior = false;
     bool native_omit_first_imu_velocity_prior = false;
     bool native_relative_height_pairs = false;
@@ -598,6 +605,8 @@ void usage(const char* program) {
                  " [--native-source-tdcp-resl-observable]"
                  " [--native-tdcp-only-affine-geometry]"
                  " [--native-epoch-heading-attitude-seeds]"
+                 " [--android-hardware-clock-reset-clock-jumps]"
+                 " [--native-course-attitude-seeds-mount-deg DEG]"
                  " [--native-omit-first-imu-bias-prior]"
                  " [--native-omit-first-imu-velocity-prior]"
                  " [--native-relative-height-pairs] [--native-pseudorange-remasking]\n";
@@ -1163,6 +1172,21 @@ bool parseArguments(int argc, char** argv, Options& options) {
             options.native_tdcp_only_affine_geometry = true;
         } else if (arg == "--native-epoch-heading-attitude-seeds") {
             options.native_epoch_heading_attitude_seeds = true;
+        } else if (arg == "--android-hardware-clock-reset-clock-jumps") {
+            options.android_hardware_clock_reset_clock_jumps = true;
+        } else if (arg == "--native-course-attitude-seeds-mount-deg") {
+            std::string value;
+            if (!requireValue(argc, argv, i, value)) return false;
+            if (options.native_course_attitude_seeds) return false;
+            try {
+                std::size_t consumed = 0;
+                options.native_course_attitude_seed_mount_deg = std::stod(value, &consumed);
+                if (consumed != value.size() ||
+                    !std::isfinite(options.native_course_attitude_seed_mount_deg)) return false;
+            } catch (...) {
+                return false;
+            }
+            options.native_course_attitude_seeds = true;
         } else if (arg == "--native-omit-first-imu-bias-prior") {
             options.native_omit_first_imu_bias_prior = true;
         } else if (arg == "--native-pseudorange-remasking") {
@@ -1729,6 +1753,19 @@ bool parseArguments(int argc, char** argv, Options& options) {
     }
     if (options.android_raw_clock_only && !android_raw) {
         std::cerr << "--android-raw-clock-only requires Android raw GNSS/IMU input\n";
+        return false;
+    }
+    if (options.android_hardware_clock_reset_clock_jumps &&
+        (!android_raw || !options.android_raw_clock_only)) {
+        std::cerr << "--android-hardware-clock-reset-clock-jumps requires Android raw input "
+                     "and --android-raw-clock-only\n";
+        return false;
+    }
+    if (options.native_course_attitude_seeds &&
+        (!android_raw || !phase171_imu_main || !phase171_ecef_doppler ||
+         options.native_epoch_heading_attitude_seeds)) {
+        std::cerr << "--native-course-attitude-seeds-mount-deg requires Android raw Phase171 ECEF-D "
+                     "without epoch heading seeds\n";
         return false;
     }
     if (options.native_imu_time_offset_override &&
@@ -10551,6 +10588,16 @@ std::string makeSummary(const Options& options,
         << (options.native_epoch_heading_attitude_seeds ? "true" : "false") << ",\n"
         << "    \"epoch_heading_attitude_seeds_inserted\": "
         << result.diagnostics.epoch_heading_attitude_seeds_inserted << ",\n"
+        << "    \"hardware_clock_reset_clock_jumps_requested\": "
+        << (options.android_hardware_clock_reset_clock_jumps ? "true" : "false") << ",\n"
+        << "    \"hardware_clock_reset_epochs\": "
+        << options.android_hardware_clock_reset_epochs << ",\n"
+        << "    \"course_attitude_seeds_requested\": "
+        << (options.native_course_attitude_seeds ? "true" : "false") << ",\n"
+        << "    \"course_attitude_seed_mount_deg\": "
+        << options.native_course_attitude_seed_mount_deg << ",\n"
+        << "    \"course_attitude_seeds_inserted\": "
+        << result.diagnostics.course_attitude_seeds_inserted << ",\n"
         << "    \"omit_first_imu_bias_prior_requested\": "
         << (options.native_omit_first_imu_bias_prior ? "true" : "false") << ",\n"
         << "    \"first_imu_bias_priors_inserted\": "
@@ -13198,7 +13245,18 @@ int main(int argc, char** argv) {
         config.use_source_tdcp_resl_observable = options.native_source_tdcp_resl_observable;
         config.use_native_tdcp_only_affine_geometry = options.native_tdcp_only_affine_geometry;
         config.use_native_epoch_heading_attitude_seeds =
-            options.native_epoch_heading_attitude_seeds || options.native_source_imu_initialization;
+            options.native_epoch_heading_attitude_seeds ||
+            (options.native_source_imu_initialization && !options.native_course_attitude_seeds);
+        config.use_native_course_attitude_seeds = options.native_course_attitude_seeds;
+        config.native_course_attitude_seed_mount_rad =
+            options.native_course_attitude_seed_mount_deg * M_PI / 180.0;
+        if (options.android_hardware_clock_reset_clock_jumps) {
+            config.hardware_clock_reset_raw_utc_millis = libgnss::hardware_clock_reset::utcKeys(
+                android_gnss.epoch_hardware_clock_discontinuity_count,
+                android_gnss.epoch_utc_time_millis);
+            options.android_hardware_clock_reset_epochs =
+                config.hardware_clock_reset_raw_utc_millis.size();
+        }
         config.omit_native_first_imu_bias_prior = options.native_omit_first_imu_bias_prior;
         config.omit_native_first_imu_velocity_prior = options.native_omit_first_imu_velocity_prior;
         config.use_native_relative_height_pairs = options.native_relative_height_pairs;
@@ -13826,6 +13884,7 @@ int main(int argc, char** argv) {
         gnss_first_config.native_tdcp_frequency_residual_prior_sigma_m = 0.0;
         gnss_first_config.use_main_pseudorange_cauchy_loss=false;
         gnss_first_config.use_native_epoch_heading_attitude_seeds = false;
+        gnss_first_config.use_native_course_attitude_seeds = false;
         gnss_first_config.omit_native_first_imu_bias_prior = false;
         gnss_first_config.omit_native_first_imu_velocity_prior = false;
         gnss_first_config.use_native_relative_height_pairs = false;
@@ -14815,6 +14874,12 @@ int main(int argc, char** argv) {
                     imu_report.refinement_gnss_drift_handoff = true;
                 }
                 auto final_config = config;
+                if (options.native_course_attitude_seeds) {
+                    // Course seeds start the initial IMU pass only; the
+                    // refinement pass takes that pass's optimized attitude.
+                    final_config.use_native_course_attitude_seeds = false;
+                    final_config.use_native_epoch_heading_attitude_seeds = true;
+                }
                 if (options.native_source_imu_stop_phases)
                     final_config.native_imu_stop_phase = libgnss::NativeImuStopPhase::Final;
                 if (options.native_source_imu_observation_stages)

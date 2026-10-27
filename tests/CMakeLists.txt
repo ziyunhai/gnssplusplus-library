@@ -5,6 +5,14 @@ cmake_minimum_required(VERSION 3.10)
 find_package(GTest REQUIRED)
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
+add_test(NAME python_readme_hero_satellite_tests
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_readme_hero_satellites.py)
+set_tests_properties(python_readme_hero_satellite_tests PROPERTIES LABELS core)
+
+add_test(NAME python_phase_audit_tests
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_phase_audit.py)
+set_tests_properties(python_phase_audit_tests PROPERTIES LABELS core)
+
 add_test(NAME python_cli_argument_sequencing_tests
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_cli_argument_sequencing.py)
 add_test(NAME python_gsdc_native_output_audit_tests
@@ -819,7 +827,9 @@ if(GTest_FOUND)
         list(APPEND GNSSPP_NO_BASE_CLI_TESTS python_smartphone_paired_epoch_states_cli_tests)
         if(GNSSPP_PYTEST_IMPORT_RESULT EQUAL 0)
             foreach(module IN ITEMS
+                    smartphone_course_attitude_seeds_cli
                     smartphone_epoch_heading_seeds
+                    smartphone_hardware_clock_reset_cli
                     smartphone_include_first_native_epoch
                     smartphone_omit_first_bias_prior
                     smartphone_omit_first_velocity_prior

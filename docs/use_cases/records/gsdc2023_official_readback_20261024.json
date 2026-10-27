@@ -1,0 +1,858 @@
+{
+  "status": "official-score-readback",
+  "date": "2026-10-24",
+  "official_score": true,
+  "truth_used_in_inference": false,
+  "build": {
+    "source": "develop a40998e (submission 57585127, 57586667 runs) plus, for the sjc-he2 rerun, an experimental copy whose behaviour is reproduced byte-for-byte by --android-hardware-clock-reset-clock-jumps; submission 57590194 ran develop 5c0481e with --native-source-imu-initialization on sjc-ce1",
+    "compiler": "GCC 15 (conda-forge), Release",
+    "gtsam": "4.3.0 (conda-forge)",
+    "control_parity": "official recipe replays of the 7 replaced drives differ from submission 56625084 by at most 0.02 m; height maps rebuilt from the GCC stage-0 trajectories (all 156 Kaggle train truth files match their pinned SHA-256; the maps differ from the pinned SHA-256 only by boundary points)",
+    "one_build_rebuild": "submission 57619467: every final replay, stage-0 run and height map rerun on one Linux GCC 15 Release build (gnss_fgo_imu_no_base sha256 a29694ad193c133f920b29b959033cd65f48b53437bfdadb9e192726556abd32, develop ed5f8d0; develop 86d1e81 links the same binary), four replays at a time on 4 cores (~1.5 h)"
+  },
+  "submissions": [
+    {
+      "ref": 57585127,
+      "sha256": "b2ef4a88eec4461f82c302dd435011c00fe8fc684e3764d01e6ba58c31f510f7",
+      "base_ref": 56625084,
+      "base_sha256": "cbd1fde10f0f317f7803871b7d00b64a73398498f967b86f2130d8ba8acc26f8",
+      "private_m": 0.982,
+      "public_m": 0.902,
+      "base_private_m": 0.984,
+      "base_public_m": 0.915,
+      "rows": 71936,
+      "retained_rows_byte_identical": "61681/61681",
+      "replaced": {
+        "2022-07-12-18-37-us-ca-mtv-b/sm-a325f": {
+          "rows": 1782,
+          "solution_sha256": "be05310b0cf9ac1469b7805ac01eb06eb0741ff7e5dc377148bcb540f271ad82",
+          "added_flags": [
+            "--native-phase213-main-doppler",
+            "--android-continuous-clock-reference",
+            "--native-imu-time-offset-ms",
+            "150"
+          ]
+        },
+        "2022-06-28-20-56-us-ca-sjc-r/samsunga32": {
+          "rows": 1829,
+          "solution_sha256": "408f07e448f0cc8b33281fa0cc95a69e0419cfb735fff5e2d15371497944e419",
+          "added_flags": [
+            "--native-phase213-main-doppler",
+            "--android-continuous-clock-reference",
+            "--native-imu-time-offset-ms",
+            "150"
+          ]
+        },
+        "2023-05-09-23-10-us-ca-sjc-r/sm-a505u": {
+          "rows": 2384,
+          "solution_sha256": "72bc4d2ee09d6cc4fff39885174a8fa1e1a98dc12449ade85ec054ea6fb97295",
+          "added_flags": [
+            "--native-phase213-main-doppler",
+            "--android-continuous-clock-reference"
+          ]
+        },
+        "2021-09-14-20-32-us-ca-mtv-k/pixel4": {
+          "rows": 1274,
+          "solution_sha256": "b2c7889e7598c6606624e68f671d3cbb29359086e9a9b3096949d5f3c8b2473b",
+          "added_flags": [
+            "--native-phase213-main-doppler",
+            "--android-continuous-clock-reference"
+          ]
+        },
+        "2021-09-20-19-03-us-ca-mtv-l/pixel4": {
+          "rows": 1796,
+          "solution_sha256": "35326e06ad67a5336bd2f29f9b112eaa1d13a11b8da911ed6dea78652dbe2153",
+          "added_flags": [
+            "--native-phase213-main-doppler",
+            "--android-continuous-clock-reference"
+          ]
+        },
+        "2020-12-11-19-30-us-ca-mtv-e/pixel4xl": {
+          "rows": 1190,
+          "solution_sha256": "19f3d4f6b3d49a737192babaa2dea621eefbe3695d5361a86b81a61478e27c70",
+          "added_flags": [
+            "--native-phase213-main-doppler",
+            "--android-continuous-clock-reference"
+          ]
+        }
+      },
+      "rule": "per-phone recipe on top of the submitted retained-height recipe: sm-a325f/samsunga32 add main Doppler, continuous raw clock reference and +150 ms IMU time offset; sm-a505u/pixel4/pixel4xl add main Doppler and continuous raw clock reference",
+      "train_evidence_m": {
+        "2022-08-04-20-07-us-ca-sjc-q/sm-a325f": [
+          1.965,
+          1.556
+        ],
+        "2022-10-06-21-51-us-ca-mtv-n/sm-a325f": [
+          1.799,
+          1.661
+        ],
+        "2023-05-23-19-56-us-ca-mtv-ie2/sm-a505g": [
+          1.688,
+          1.602
+        ],
+        "2021-07-14-20-50-us-ca-mtv-e/pixel4": [
+          0.377,
+          0.358
+        ],
+        "2021-07-27-19-49-us-ca-mtv-b/pixel4": [
+          0.828,
+          0.787
+        ],
+        "2021-03-16-20-40-us-ca-mtv-b/pixel4xl": [
+          0.422,
+          0.415
+        ]
+      },
+      "train_evidence_note": "(P50+P95)/2 before/after on exposed train drives with the submitted phone recipe minus height constraints; not held out"
+    },
+    {
+      "ref": 57586667,
+      "sha256": "745440aa2fb8af54a906ca73359822dffd0ebdadcc4d0f14692bba87d07231ff",
+      "base_ref": 57585127,
+      "base_sha256": "b2ef4a88eec4461f82c302dd435011c00fe8fc684e3764d01e6ba58c31f510f7",
+      "private_m": 0.926,
+      "public_m": 0.902,
+      "base_private_m": 0.982,
+      "base_public_m": 0.902,
+      "rows": 71936,
+      "retained_rows_byte_identical": "70328/70328",
+      "replaced": {
+        "2023-06-06-22-43-us-ca-sjc-he2/pixel5": {
+          "rows": 1608,
+          "solution_sha256": "4abd464452c7c25ad12bdd8851e95c04a53e6ad5b148cae25e4a92c7f3c2dad5",
+          "added_flags": [
+            "--android-hardware-clock-reset-clock-jumps"
+          ]
+        }
+      },
+      "cause": "HardwareClockDiscontinuityCount 5->6 at epoch 149 (TimeNanos and FullBiasNanos both step by 2^32 ms). The loader rebases the receiver-clock reference there, a ~194 m clock step that the positive 100 km clock-jump detector misses; the clock continuity factor then dragged GNSS-first epochs 0-210 by 27-89 m (pseudorange residual median 11-53 m vs 1.2-2.1 m at the archived taroz GNSS-stage positions) and left 2-3.8 m in the final output. Solving epochs 0-147 alone gives 0.6 m.",
+      "inventory": "only this drive among the 40 test and 40 train drives changes HardwareClockDiscontinuityCount",
+      "truth_free_diagnostic": "horizontal distance to the archived taroz result_gnss_imu test output: median 0.16 -> 0.05 m, P95 3.26 -> 0.10 m"
+    },
+    {
+      "ref": 57590194,
+      "sha256": "f9526888e615f14affc8d411861ca5d75e4d3d77db694365e6ca5b795169ff09",
+      "base_ref": 57586667,
+      "base_sha256": "745440aa2fb8af54a906ca73359822dffd0ebdadcc4d0f14692bba87d07231ff",
+      "private_m": 0.862,
+      "public_m": 0.902,
+      "base_private_m": 0.926,
+      "base_public_m": 0.902,
+      "rows": 71936,
+      "retained_rows_byte_identical": "70441/70441",
+      "replaced": {
+        "2023-06-15-18-49-us-ca-sjc-ce1/pixel7pro": {
+          "rows": 1495,
+          "solution_sha256": "f3c2ba3d9e86ee1ea454e60bb4ad90dcc30b4fafc8f49a8cad009c0468a4c9d4",
+          "added_flags": [
+            "--native-source-imu-initialization"
+          ]
+        }
+      },
+      "cause": "The static leveling window (first 250 gyro samples, 2.25 s) starts while the car moves at 5 m/s and turns. Its gyro mean (0.0097 rad/s; stop-block mean 0.0004 rad/s) became the initial gyro bias, which the 0.01 rad/s prior and the 5e-7 bias random walk kept (optimized -0.0093 rad/s about the vertical body axis). Body yaw minus GNSS course then rotated at 0.5 deg/s, and the IMU stage left the GNSS-first stage by 2-3 m in curves.",
+      "rule": "apply the existing zero-bias initialization only where the leveling-window gyro mean differs from the stop-block gyro mean by more than 0.005 rad/s; among the 40 test drives that is sjc-ce1 alone (0.0100 rad/s; next 0.0031 rad/s)",
+      "train_evidence_m": {
+        "2021-07-27-19-49-us-ca-mtv-b/pixel4": [
+          0.828,
+          0.588
+        ],
+        "2021-03-16-20-40-us-ca-mtv-b/pixel4xl": [
+          0.422,
+          1.422
+        ]
+      },
+      "train_evidence_note": "(P50+P95)/2 without/with --native-source-imu-initialization on the 14 scored static-leveling train drives; the other 12 change by at most 0.001 m. mtv-b Pixel4 (0.0053 rad/s) is the only train drive above the rule; Pixel4XL (0.0007 rad/s) shows why the option is not applied everywhere",
+      "truth_free_diagnostic": "horizontal distance to the archived taroz result_gnss_imu test output: median 0.76 -> 0.13 m, P95 2.76 -> 0.33 m"
+    },
+    {
+      "ref": 57594243,
+      "sha256": "2344a34f9750485e79290a363b103c14596d90c5ea182e38548a52adf918a65e",
+      "base_ref": 57590194,
+      "base_sha256": "f9526888e615f14affc8d411861ca5d75e4d3d77db694365e6ca5b795169ff09",
+      "private_m": 0.862,
+      "public_m": 0.884,
+      "base_private_m": 0.862,
+      "base_public_m": 0.902,
+      "rows": 71936,
+      "retained_rows_byte_identical": "70350/70350",
+      "replaced": {
+        "2022-04-25-22-36-us-ca-ebf-z/pixel5": {
+          "rows": 1586,
+          "solution_sha256": "416f58a63cd87cfbf245a64b8fa2a8bd0e6d8d7983307b7e588fe356af64f7f0",
+          "removed_flags": [
+            "--native-epoch-heading-attitude-seeds"
+          ]
+        }
+      },
+      "cause": "With the epoch heading attitude seeds (initial values only, not priors) the optimized body yaw slips one full turn against the GNSS-first course between minutes 3 and 13; without them the mount yaw stays at -176 deg.",
+      "rule": "drop the seeds only where the optimized yaw slips a full turn (p95 deviation of body yaw minus course from its median above 90 deg); among the 40 test drives under the current recipe that is ebf-z alone (A505U slips without seeds and is open)",
+      "train_evidence_note": "14 checked train Pixel5 drives with seeds show no slip (p95 deviation at most 1.8 deg), so the rule changes no train drive; the evidence is truth-free",
+      "truth_free_diagnostic": "horizontal distance to the archived taroz result_gnss_imu test output: median 0.19 -> 0.16 m, P95 1.01 -> 0.42 m; the seeded GCC control reproduces the submitted rows (P95 1.01 m)"
+    },
+    {
+      "ref": 57600830,
+      "sha256": "a7242b5646da84026f992035eac7d65217a95d5cc214b8fe96622b3c9b781716",
+      "base_ref": 57594243,
+      "base_sha256": "2344a34f9750485e79290a363b103c14596d90c5ea182e38548a52adf918a65e",
+      "private_m": 0.845,
+      "public_m": 0.884,
+      "base_private_m": 0.862,
+      "base_public_m": 0.884,
+      "rows": 71936,
+      "retained_rows_byte_identical": "69552/69552",
+      "replaced": {
+        "2023-05-09-23-10-us-ca-sjc-r/sm-a505u": {
+          "rows": 2384,
+          "solution_sha256": "d68137e10ebb1d10acdbccd6796f6f3232f68a4acb659b9eda800eab3e7eb768",
+          "added_flags": [
+            "--native-course-attitude-seeds-mount-deg",
+            "178.9"
+          ]
+        }
+      },
+      "cause": "The IMU-stage yaw slipped one full turn between epochs 800 and 1400, a local minimum: with yaw = GNSS course + a constant 178.9 deg mount, the 1-s accelerometer matches the GNSS acceleration (along-track residual ~0, constant -0.5 m/s^2 cross-track), while dead-reckoned, velocity-heading and blended seeds all converge to the slipped basin.",
+      "rule": "reseed only a drive whose yaw slips a full turn, with the mount estimated from the slip-free part of its first solution; keep the reseeded run only if the slip disappears and final-vs-GNSS-first P95 drops (A505U: 2.91 -> 1.38 m)",
+      "train_evidence_note": "no train drive slips, so the rule changes no train score; course seeds on all five Samsung train drives leave four within 0.001 m and make mtv-n A205U worse (1.772 -> 5.675 m), which the final-vs-GNSS-first check flags (P95 2.32 -> 8.86 m)",
+      "truth_free_diagnostic": "horizontal distance to the archived taroz result_gnss_imu test output: median 0.42 -> 0.34 m, P95 2.15 -> 0.88 m"
+    },
+    {
+      "ref": 57619467,
+      "sha256": "c46ca65f1100a1e549ac50d18c2518d65863432e19711031ce408d11d29e826c",
+      "base_ref": 57600830,
+      "base_sha256": "a7242b5646da84026f992035eac7d65217a95d5cc214b8fe96622b3c9b781716",
+      "private_m": 0.844,
+      "public_m": 0.885,
+      "base_private_m": 0.845,
+      "base_public_m": 0.884,
+      "rows": 71936,
+      "retained_rows_byte_identical": "14944/14944",
+      "replaced_drives": 31,
+      "cause": "platform only: the 31 drives retained from 56625084 were pinned to MSVC research outputs, so no single build reproduced 57600830; they, their 17 stage-0 runs and height maps were rerun with the same argv on the GCC build",
+      "drift_vs_base": "31 rerun drives: median 0.001 m, P95 0.008 m, max 0.079 m (mtv-m Mi8; every other drive at most 0.025 m)",
+      "reproduction": "the 9 GCC final drives of 57600830 and the 8 GCC stage-0 runs (develop a40998e) rerun byte-identical; with the updated recipe height-maps matches 25/25 and assemble writes c46ca65f... with 40/40 drives identical"
+    },
+    {
+      "ref": 57626255,
+      "sha256": "6c0eca7d4b5ea871ef1508817e3255ed2a582af019a0a9d016e232dc747ee8d1",
+      "base_ref": 57619467,
+      "base_sha256": "c46ca65f1100a1e549ac50d18c2518d65863432e19711031ce408d11d29e826c",
+      "private_m": 0.844,
+      "public_m": 0.85,
+      "base_private_m": 0.844,
+      "base_public_m": 0.885,
+      "rows": 71936,
+      "retained_rows_byte_identical": "70039/70039",
+      "replaced": [
+        "2022-04-25-21-04-us-ca-ebf-x/mi8"
+      ],
+      "cause": "the first 11 static minutes (38% of the 1,897 scored rows) sat about 2 m from the taroz test output; raw-ADR epoch-to-epoch carrier displacements disagree with the native GNSS-first and final trajectories by 1.2 m over the 40 s parking-lot exit (epochs 680-720), while taroz agrees within 0.2 m; the first 599 static epochs also show 0.9 m of carrier motion",
+      "change": "solve from epoch 599 (taroz settings_test.csv IdxStart=600; recipe input_window, leading keys filled with the first solved row as taroz submission.m does) with --native-source-tdcp-meter-sigma --native-phase184-source-tdcp-huber-k --native-source-route-type Highway --native-source-l5 1",
+      "rule": "a low-speed 30-epoch window where the native trajectory disagrees with raw-ADR TDCP by more than 0.5 m while taroz agrees within 0.3 m; among the 40 test drives only ebf-x qualifies",
+      "alternative": {
+        "ref": 57626257,
+        "sha256": "29608a3623cf5e1710cee213746a1a339b179732cd5cf5fee2fb6346732530d0",
+        "private_m": 0.844,
+        "public_m": 0.864,
+        "change": "same window with --native-source-tdcp-meter-sigma only"
+      },
+      "train_evidence_note": "the same TDCP flags on every train drive are worse (4 of the first 6 drives regress, mtv-b Pixel4 +0.106 m); the two train drives the TDCP scan flags (mtv-u Pixel6Pro, routebb1 Pixel7Pro, one window each) are not fixed by them, so they stay on ebf-x only",
+      "truth_free_diagnostic": "distance to the taroz test output over all scored rows: P50 0.44 -> 0.31 m, P95 2.81 -> 0.64 m"
+    },
+    {
+      "ref": 57629197,
+      "sha256": "f19acb58ae3017789714ab5564c97b69f96e2b320578d6464154de394e38621f",
+      "base_ref": 57626255,
+      "base_sha256": "6c0eca7d4b5ea871ef1508817e3255ed2a582af019a0a9d016e232dc747ee8d1",
+      "private_m": 0.844,
+      "public_m": 0.85,
+      "base_private_m": 0.844,
+      "base_public_m": 0.85,
+      "rows": 71936,
+      "numerically_identical_rows": "71936/71936",
+      "cause": "the recipe lane rebuild of 57626255: the lane copies native text verbatim, while the research fill step (pandas) dropped trailing zeros in 284 ebf-x rows; the official recipe is pinned to this file"
+    },
+    {
+      "ref": 57663786,
+      "sha256": "771e979d1c91228ad8339364b745bbfd47475b9f929614ea163f231f87cbfc8e",
+      "base_ref": 57629197,
+      "base_sha256": "f19acb58ae3017789714ab5564c97b69f96e2b320578d6464154de394e38621f",
+      "private_m": 0.811,
+      "public_m": 0.836,
+      "base_private_m": 0.844,
+      "base_public_m": 0.85,
+      "rows": 71936,
+      "replaced_drives": 30,
+      "change": "--native-imu-refinement-pass: the upstream third pass (taroz run_fgo.m runs fgo_gnss, then fgo_gnss_imu twice; the last one re-screens P/D around the first GNSS/IMU trajectory with the tighter final thresholds, 20/15 m and 3 m/s, and solves again); it needs --native-export-gnss-stage, --native-export-imu-stage, --native-source-imu-initialization and --native-phase213-main-doppler, added where the drive recipe lacked them",
+      "not_refined": {
+        "mi8, xiaomimi8 (5 drives)": "train +0.061 m mean, 4 of 4 drives worse (+0.039 to +0.085 m)",
+        "pixel4xl (mtv-e)": "train mtv-b Pixel4 XL +0.868 m; the prerequisites alone give +0.999 m",
+        "samsunga325g (mtv-pe1, lax-hh)": "train sjc-s +0.004 m (refinement -0.067 m, prerequisites +0.071 m)",
+        "sjc-r sm-a505u": "incompatible with its --native-course-attitude-seeds-mount-deg 178.9; without the course seeds the third pass moves minutes 22-26 about 2 m off taroz ((P50+P95)/2 to taroz 0.61 -> 1.42 m)",
+        "lax-p pixel5": "its refinement solve crashed (a GTSAM TBB worker overflowed its stack); added in 57664241"
+      },
+      "train_evidence": {
+        "drives": 36,
+        "mean_m": "0.7646 -> 0.7443 (35 drives with taroz: 0.7358 -> 0.7187, taroz 0.7123)",
+        "per_phone_total_delta_m": {
+          "sm-a325f (2)": -0.437,
+          "sm-a505g (1)": -0.202,
+          "pixel4 (2)": -0.138,
+          "sm-a205u (1)": -0.131,
+          "sm-s908b (1)": -0.026,
+          "pixel7pro (4)": -0.02,
+          "pixel5 (14)": -0.015,
+          "sm-g988b (2)": -0.013,
+          "pixel6pro (3)": -0.006,
+          "samsunga325g (1)": 0.004,
+          "mi8 (4)": 0.061,
+          "pixel4xl (1)": 0.868
+        },
+        "refinement_only_delta_m": "against the same recipe with only the missing prerequisites added: sm-a325f -0.216, sm-a205u -0.131, pixel4xl -0.131, sm-a505g -0.117, samsunga325g -0.067, sm-s908b -0.026, pixel7pro -0.020, pixel4 -0.018, pixel5 -0.015 (11 of 14 better), sm-g988b -0.013, pixel6pro -0.006, mi8 +0.049",
+        "stop_and_observation_stages": "--native-source-imu-stop-phases --native-source-imu-observation-stages on top: within 0.011 m of the refinement pass alone on 11 drives; not used"
+      },
+      "truth_free_diagnostic": "distance to the taroz test output ((P50+P95)/2): mtv-b A325F 1.40 -> 0.77 m, lax-x Pixel5 0.74 -> 0.21 m (its first 4-5 minutes now agree), sjc-r A32 0.82 -> 0.59 m, ebf-zz 0.32 -> 0.21 m, ebf-z 0.29 -> 0.52 m; mean over 37 drives 0.348 -> 0.300 m (sjc-r A505U without course seeds, not taken, 0.61 -> 1.42 m)"
+    },
+    {
+      "ref": 57663818,
+      "sha256": "d7cb11ddb819cfef8ae204a70199f757c5ffd6a0859aef195d14ccc40a282cb8",
+      "base_ref": 57663786,
+      "private_m": 0.811,
+      "public_m": 0.821,
+      "base_private_m": 0.811,
+      "base_public_m": 0.836,
+      "rows": 71936,
+      "replaced": [
+        "2022-04-25-22-36-us-ca-ebf-z/pixel5"
+      ],
+      "change": "ebf-z Pixel5 back to its 57629197 rows (probe of the third pass on a Public drive)",
+      "cause": "the third pass moved ebf-z 0.5-0.9 m off taroz in minutes 5-10; raw-ADR 30-s windows agree with both trajectories (median 0.06 / 0.09 m), so the move is an offset the carrier phase cannot arbitrate; Kaggle Public says it was worse"
+    },
+    {
+      "ref": 57664241,
+      "sha256": "ea13dc3665207804bf146a3e3e90fd3568ab56d9c43ac9ac40f3db80051d81c5",
+      "base_ref": 57663818,
+      "private_m": 0.811,
+      "public_m": 0.817,
+      "base_private_m": 0.811,
+      "base_public_m": 0.821,
+      "rows": 71936,
+      "replaced": [
+        "2022-02-24-15-10-us-ca-lax-p/pixel5"
+      ],
+      "change": "lax-p Pixel5 with the third pass; it crashes in 2 of 3 runs (a GTSAM TBB worker overflows its stack, with an 8 MB or unlimited stack) and finishes with the same solution when pinned to one CPU (recipe single_cpu); (P50+P95)/2 to taroz 0.325 -> 0.300 m; mean over 37 drives to taroz 0.293 m",
+      "recipe": "the official recipe is pinned to this file: 30 drives carry --native-imu-refinement-pass (research_source.added_flags, previous_research_source)"
+    },
+    {
+      "ref": 57675079,
+      "sha256": "7e755a4bb0a2c17c41ed121d586b32de1138938c93337b44c737b1acbd4744bb",
+      "base_ref": 57664241,
+      "private_m": 0.811,
+      "public_m": 0.82,
+      "base_private_m": 0.811,
+      "base_public_m": 0.817,
+      "rows": 71936,
+      "replaced": [
+        "2020-12-11-19-30-us-ca-mtv-e/pixel4xl",
+        "2022-05-12-20-19-us-ca-mtv-pe1/samsunga325g",
+        "2022-06-22-20-12-us-ca-lax-hh/samsunga325g"
+      ],
+      "change": "third pass (with --native-source-imu-initialization where missing) on the three drives left out of 57663786 as train-neutral or prerequisite-limited; the mtv-e Pixel4 XL test recipe already carries main Doppler",
+      "truth_free_diagnostic": "(P50+P95)/2 to taroz: mtv-e Pixel4 XL 0.315 -> 0.295 m, mtv-pe1 A325G 0.785 -> 0.625 m, lax-hh A325G 0.630 -> 0.510 m",
+      "outcome": "all three are Public drives; Public worse in sum (split by the probes below)"
+    },
+    {
+      "ref": 57675081,
+      "sha256": "ee500146db5049eaf346dfa9259deeadad04b883c7321e17c703db8de7d2b7fb",
+      "base_ref": 57675079,
+      "private_m": 0.806,
+      "public_m": 0.82,
+      "base_private_m": 0.811,
+      "base_public_m": 0.82,
+      "rows": 71936,
+      "replaced": [
+        "2023-05-09-23-10-us-ca-sjc-r/sm-a505u"
+      ],
+      "change": "sjc-r A505U third pass keeping --native-course-attitude-seeds-mount-deg 178.9, on the build that admits course seeds with source IMU initialization (the initial IMU pass takes the course seeds, the refinement pass that pass attitude)",
+      "truth_free_diagnostic": "(P50+P95)/2 to taroz 0.61 -> 0.56 m, without the 2 m excursion of the run that dropped the course seeds; the recipe argv without the new flags reproduces the pinned output byte for byte on that build"
+    },
+    {
+      "ref": 57677499,
+      "sha256": "aa68a620c1b51aad28cd6563229ce5dc8b332f52ad8188f678429432809f6593",
+      "base_ref": 57664241,
+      "private_m": 0.806,
+      "public_m": 0.817,
+      "base_private_m": 0.811,
+      "base_public_m": 0.817,
+      "rows": 71936,
+      "replaced": [
+        "2023-05-09-23-10-us-ca-sjc-r/sm-a505u"
+      ],
+      "change": "sjc-r A505U alone, as in 57675081"
+    },
+    {
+      "ref": 57677502,
+      "base_ref": 57677499,
+      "private_m": 0.806,
+      "public_m": 0.817,
+      "replaced": [
+        "2020-12-11-19-30-us-ca-mtv-e/pixel4xl"
+      ],
+      "probe": true,
+      "change": "plus mtv-e Pixel4 XL third pass: no change at three decimals; not taken"
+    },
+    {
+      "ref": 57677505,
+      "base_ref": 57677499,
+      "private_m": 0.806,
+      "public_m": 0.821,
+      "replaced": [
+        "2022-05-12-20-19-us-ca-mtv-pe1/samsunga325g"
+      ],
+      "probe": true,
+      "change": "plus mtv-pe1 A325G third pass: Public worse although it moved 0.16 m toward taroz; not taken"
+    },
+    {
+      "ref": 57677507,
+      "sha256": "2e0deb2ceace3ae9fb98f34ec38798506deaf31d6325dd045e5e45aed4990dcf",
+      "base_ref": 57677499,
+      "private_m": 0.806,
+      "public_m": 0.816,
+      "replaced": [
+        "2022-06-22-20-12-us-ca-lax-hh/samsunga325g"
+      ],
+      "probe": true,
+      "change": "plus lax-hh A325G third pass: Public better; taken"
+    },
+    {
+      "ref": 57678818,
+      "sha256": "2e0deb2ceace3ae9fb98f34ec38798506deaf31d6325dd045e5e45aed4990dcf",
+      "base_ref": 57664241,
+      "base_sha256": "ea13dc3665207804bf146a3e3e90fd3568ab56d9c43ac9ac40f3db80051d81c5",
+      "private_m": 0.806,
+      "public_m": 0.816,
+      "base_private_m": 0.811,
+      "base_public_m": 0.817,
+      "rows": 71936,
+      "replaced": [
+        "2023-05-09-23-10-us-ca-sjc-r/sm-a505u",
+        "2022-06-22-20-12-us-ca-lax-hh/samsunga325g"
+      ],
+      "change": "the file of probe 57677507 submitted as the recipe target",
+      "recipe": "the official recipe is pinned to this file: 32 drives carry --native-imu-refinement-pass"
+    }
+  ],
+  "rejected_on_train": {
+    "keep_base_missing_beidou_qzss_uncorrected": "+0.079 m mean over 14 drives",
+    "upstream_route_type_l5_parameters": "+0.018 m mean over 36 drives",
+    "per_drive_imu_time_offset_from_truth_lag": "+0.001 m mean over 15 drives",
+    "epoch_heading_seeds_all_phones": "pixel4 mtv-b -0.24, pixel4xl +1.00, five drives unchanged",
+    "zero_bias_initialization_all_static_drives": "pixel4 mtv-b -0.240, pixel4xl mtv-b +1.000, 12 drives within 0.001 m",
+    "source_phone_imu_noise_samsung": "7 of 8 Samsung train drives worse, 1 unchanged, mean 1.305 -> 1.420 m (it shortened A505U test P95 to taroz 2.15 -> 1.45 m without removing the yaw slip)",
+    "course_attitude_seeds_all_samsung": "four of five Samsung train drives within 0.001 m, mtv-n A205U 1.772 -> 5.675 m (23.8 m with dead-reckoned roll/pitch)",
+    "gyro_bias_random_walk_x100": "36 train drives 0.7646 -> 0.7598 m, all of it from mtv-b Pixel4 (-0.169 m, fixed by the source IMU initialization); the other 35 net about 0",
+    "gyro_bias_random_walk_x1000": "36 train drives 0.7646 -> 0.7725 m",
+    "gyro_bias_random_walk_x10": "12-drive screen +0.006 m",
+    "accel_bias_random_walk_x4_or_x0.25": "12-drive screen +0.002 / -0.001 m",
+    "native_samsung_clock_drift_flag": "bit-identical solutions on five Samsung train drives (the estimate only seeds the optimizer)",
+    "source_tdcp_metre_sigma_phase184_huber_all_drives": "4 of the first 6 train drives worse (mean +0.031 m; mtv-b Pixel4 +0.106 m); kept on ebf-x only",
+    "along_track_shift_per_phone_family": "truth-free shift of -b along the solution's own heading (b = leave-one-out family median along-track bias): mean over 36 drives 0.7475 -> 0.7628 m",
+    "refinement_pass_mi8": "third pass on 4 Mi8 train drives +0.039 to +0.085 m (mean +0.061 m); also worse in the 2026-09 records; Mi8 test drives keep the two-stage recipe",
+    "refinement_prerequisites_pixel4xl": "--native-source-imu-initialization with --native-phase213-main-doppler on mtv-b Pixel4 XL 0.422 -> 1.421 m (the third pass then 1.290 m); mtv-e Pixel4 XL keeps its recipe"
+  },
+  "open_issues": {
+    "2022-04-25-21-04-us-ca-ebf-x/mi8": "resolved by 57626255/57629197 (input_window + source TDCP sigma/Huber)",
+    "samsung_test_drives": "with the third pass mtv-b A325F 1.40 -> 0.77 m and sjc-r A32 0.82 -> 0.59 m from the taroz test output; lax-hh A325G takes the third pass in 57678818 (0.63 -> 0.51 m, Public better); mtv-pe1 A325G moved 0.785 -> 0.625 m toward taroz with it but Public got worse, so it keeps its recipe; no truth-free arbiter for A325F/A32 (ADR unusable)",
+    "pixel5_drive_starts": "lax-x resolved by the third pass ((P50+P95)/2 to taroz 0.74 -> 0.21 m; its first 4-5 minutes now agree) and taken in 57663786; ebf-xx 0.60 -> 0.55 m; its exit (epochs 120-240) disagreement with TDCP is at 7-9-satellite epochs, where on train TDCP is the wrong one (native closer to truth in 7 of 7 low-satellite steps); Kaggle per-drive swaps say taroz is right at the ebf-xx start (Public -0.017, about 0.34 m on the drive)",
+    "2023-05-09-23-10-us-ca-sjc-r/sm-a505u": "resolved by 57677499/57678818: the third pass now keeps the course seeds (Private 0.811 -> 0.806 m)",
+    "2022-04-25-22-36-us-ca-ebf-z/pixel5": "the third pass made it worse (Public 0.821 vs 0.836 with it); kept on 57629197"
+  },
+  "reference_targets": {
+    "final_leaderboard_first_private_m": 0.883,
+    "taroz_gsdc2023_post_deadline": {
+      "private_m": 0.782,
+      "public_m": 0.796,
+      "source": "score image in the taroz/gsdc2023 README (submission_20240919_0824.csv, after deadline)"
+    }
+  },
+  "course_seed_rule_scan": {
+    "rule": "rerun with --native-course-attitude-seeds-mount-deg 180 (dropping heading seeds / source IMU initialization) and keep it only if final-vs-GNSS-first P95 drops below 0.9x",
+    "train_36": "34 within 0.001 m; mtv-b Pixel4 0.828 -> 0.588 m kept (ratio 0.79); mtv-n A205U 1.772 -> 5.673 m rejected (ratio 3.82)",
+    "test_40": "keeps exactly sjc-ce1 (0.40), sjc-r A505U (0.48) and ebf-z (0.76), all already fixed; the rest 0.998-1.013; mtv-m Mi8 needs the source IMU initialization and cannot take course seeds"
+  },
+  "taroz_comparison_notes": {
+    "train_recipe_equivalent": "35 train drives with the per-phone test recipes: native mean (P50+P95)/2 0.718 m, taroz result_gnss_imu 0.712 m",
+    "offset_convention": "taroz result_gnss.mat and result_gnss_imu.mat already include add_position_offset (fgo_gnss.m / fgo_gnss_imu.m apply it before saving); compare them with the native final, not the native GNSS-first stage",
+    "along_track": "moving epochs: native along-track |error| median 0.314 m vs taroz 0.267 m, cross-track 0.295 vs 0.294 m; the excess is drive-specific (sm-a505g +0.79 vs +0.36 m), not a phone-family bias",
+    "final_departs_from_gnss_first": "train epochs where the native final is more than 0.8 m from the native GNSS-first (offset-aligned): the final is closer to truth in 82.7% of 7,985 epochs",
+    "static_disagreement": "train static epochs where native and taroz differ by more than 1 m: 102 epochs, taroz closer in 73%",
+    "tdcp_arbiter": "raw-ADR epoch-to-epoch displacement (robust LS, free clock) matches ground-truth steps to about 0.3 mm (10 ppm) at 29 m/s and stays within 0.00-0.12 m horizontally over 60-133 static epochs on train; compare it with trajectories converted exactly via ECEF/ENU (a spherical lat/lon conversion adds 0.19-0.24% scale error, which an earlier note mistook for TDCP drift); it cannot be used on phones whose ADR is unreliable (A325F, A32, S908B: 0.9-1.3 m per 30 s window)",
+    "height_maps": "test map drives vs relative-height drives: mean (P50+P95)/2 to taroz 0.375 vs 0.354 m; map points within 15 m spanning more than 2 m in height occur on at most 6% of epochs; removing the map moves mtv-b A325F 1.40 -> 1.38 m, sjc-r A32 0.81 -> 0.70 m and mtv-pe1 A325G 0.78 -> 0.84 m from taroz (not adopted)",
+    "tdcp_scan_all_speeds": "all 40 test drives, 30-s windows at all speeds: median disagreement 0.05-0.15 m for both pipelines where ADR is usable; native-only (> 0.5 m while taroz < 0.3 m) windows only on mtv-m Mi8 (1.06 m at a 7-satellite epoch, ambiguous) and mtv-a Mi8 (0.52 m); no second ebf-x-type failure",
+    "third_pass": "taroz runs fgo_gnss_imu twice (initflag true, then false with the previous result as input and tighter P/D screens); the native recipe ran one IMU solve until 57663786; with --native-imu-refinement-pass the 35 train drives with taroz move 0.7358 -> 0.7187 m (taroz 0.7123), and without Mi8 and Pixel4 XL the estimate is 0.687 m",
+    "taroz_distance_as_proxy": "moving toward taroz is not a reliable proxy for a better score on its own drive: ebf-z (away, worse) and lax-hh A325G (toward, better) follow it, mtv-pe1 A325G (0.16 m toward, Public worse) does not"
+  },
+  "taroz_kaggle_probes": {
+    "purpose": "diagnostic only (not our pipeline): locate the remaining gap to the taroz post-deadline score by Kaggle readback",
+    "taroz_archive": {
+      "ref": 57683971,
+      "public_m": 0.796,
+      "private_m": 0.782,
+      "note": "the archived taroz/gsdc2023 test result_gnss_imu.mat files, assembled as taroz submission.m does, reproduce the README score exactly; sjc-r A205U must be matched on the UTC keys of phone_data.mat (its 1,697 solved epochs drop the first 2 of 1,699 device_gnss keys)"
+    },
+    "split_size": "an earlier assembly that misaligned A205U by 2 epochs (about 470 m) scored Private 24.117 m (57683941), so the Private split holds about 20 drives; per-drive deltas below times about 20 give the per-drive (P50+P95)/2 difference",
+    "group_swaps": {
+      "base": "ref 57678818 (Public 0.816 / Private 0.806 m) with one phone group replaced by the taroz rows",
+      "pixel5 (17)": {
+        "ref": 57684010,
+        "public_m": 0.806,
+        "private_m": 0.795
+      },
+      "pixel4, pixel4xl, pixel6pro, pixel7pro (9)": {
+        "ref": 57684013,
+        "public_m": 0.814,
+        "private_m": 0.796
+      },
+      "samsung (9)": {
+        "ref": 57684014,
+        "public_m": 0.823,
+        "private_m": 0.802
+      },
+      "mi8, xiaomimi8 (5)": {
+        "ref": 57684015,
+        "public_m": 0.802,
+        "private_m": 0.805
+      }
+    },
+    "per_drive_swaps": {
+      "base": "ref 57678818 with one trip replaced by the taroz rows; delta_m = score change in that trip's split (negative: taroz better); unresolved = no change at three decimals in either split",
+      "drives": [
+        {
+          "trip": "2022-02-23-17-46-us-ca-lax-n/pixel5",
+          "ref": 57684352,
+          "public_m": 0.816,
+          "private_m": 0.796,
+          "split": "private",
+          "delta_m": -0.01
+        },
+        {
+          "trip": "2023-05-02-19-24-us-ca-sjc-we1/pixel7pro",
+          "ref": 57684448,
+          "public_m": 0.816,
+          "private_m": 0.799,
+          "split": "private",
+          "delta_m": -0.007
+        },
+        {
+          "trip": "2023-05-09-23-10-us-ca-sjc-r/sm-a505u",
+          "ref": 57684455,
+          "public_m": 0.816,
+          "private_m": 0.8,
+          "split": "private",
+          "delta_m": -0.006
+        },
+        {
+          "trip": "2021-09-14-20-32-us-ca-mtv-k/pixel4",
+          "ref": 57684330,
+          "public_m": 0.816,
+          "private_m": 0.803,
+          "split": "private",
+          "delta_m": -0.003
+        },
+        {
+          "trip": "2023-05-23-21-06-us-ca-mtv-de1/pixel5",
+          "ref": 57684457,
+          "public_m": 0.816,
+          "private_m": 0.803,
+          "split": "private",
+          "delta_m": -0.003
+        },
+        {
+          "trip": "2022-02-08-22-04-us-ca-sjc-r/pixel5",
+          "ref": 57684350,
+          "public_m": 0.816,
+          "private_m": 0.804,
+          "split": "private",
+          "delta_m": -0.002
+        },
+        {
+          "trip": "2022-04-04-16-31-us-ca-lax-x/pixel5",
+          "ref": 57684374,
+          "public_m": 0.816,
+          "private_m": 0.804,
+          "split": "private",
+          "delta_m": -0.002
+        },
+        {
+          "trip": "2022-10-06-20-46-us-ca-sjc-r/sm-a205u",
+          "ref": 57684438,
+          "public_m": 0.816,
+          "private_m": 0.804,
+          "split": "private",
+          "delta_m": -0.002
+        },
+        {
+          "trip": "2023-05-25-21-50-us-ca-sjc-ke2/sm-s908b",
+          "ref": 57684467,
+          "public_m": 0.816,
+          "private_m": 0.804,
+          "split": "private",
+          "delta_m": -0.002
+        },
+        {
+          "trip": "2023-06-15-18-49-us-ca-sjc-ce1/pixel7pro",
+          "ref": 57684479,
+          "public_m": 0.816,
+          "private_m": 0.804,
+          "split": "private",
+          "delta_m": -0.002
+        },
+        {
+          "trip": "2021-09-20-19-03-us-ca-mtv-l/pixel4",
+          "ref": 57684340,
+          "public_m": 0.816,
+          "private_m": 0.805,
+          "split": "private",
+          "delta_m": -0.001
+        },
+        {
+          "trip": "2021-09-28-21-56-us-ca-mtv-a/mi8",
+          "ref": 57684341,
+          "public_m": 0.816,
+          "private_m": 0.805,
+          "split": "private",
+          "delta_m": -0.001
+        },
+        {
+          "trip": "2022-02-23-22-35-us-ca-lax-m/pixel5",
+          "ref": 57684354,
+          "public_m": 0.816,
+          "private_m": 0.807,
+          "split": "private",
+          "delta_m": 0.001
+        },
+        {
+          "trip": "2022-03-22-18-44-us-ca-mtv-pe1/pixel5",
+          "ref": 57684371,
+          "public_m": 0.816,
+          "private_m": 0.807,
+          "split": "private",
+          "delta_m": 0.001
+        },
+        {
+          "trip": "2023-05-25-17-32-us-ca-pao-j/pixel6pro",
+          "ref": 57684466,
+          "public_m": 0.816,
+          "private_m": 0.807,
+          "split": "private",
+          "delta_m": 0.001
+        },
+        {
+          "trip": "2023-05-26-21-23-us-ca-sjc-be2/pixel5",
+          "ref": 57684469,
+          "public_m": 0.816,
+          "private_m": 0.807,
+          "split": "private",
+          "delta_m": 0.001
+        },
+        {
+          "trip": "2022-03-17-20-16-us-ca-sjc-q/sm-g988b",
+          "ref": 57684367,
+          "public_m": 0.816,
+          "private_m": 0.81,
+          "split": "private",
+          "delta_m": 0.004
+        },
+        {
+          "trip": "2021-11-30-20-59-us-ca-mtv-m/mi8",
+          "ref": 57684347,
+          "public_m": 0.798,
+          "private_m": 0.806,
+          "split": "public",
+          "delta_m": -0.018
+        },
+        {
+          "trip": "2022-04-27-19-23-us-ca-ebf-xx/pixel5",
+          "ref": 57684394,
+          "public_m": 0.799,
+          "private_m": 0.806,
+          "split": "public",
+          "delta_m": -0.017
+        },
+        {
+          "trip": "2022-06-22-20-12-us-ca-lax-hh/samsunga325g",
+          "ref": 57684412,
+          "public_m": 0.81,
+          "private_m": 0.806,
+          "split": "public",
+          "delta_m": -0.006
+        },
+        {
+          "trip": "2022-04-27-21-55-us-ca-ebf-ww/mi8",
+          "ref": 57684398,
+          "public_m": 0.811,
+          "private_m": 0.806,
+          "split": "public",
+          "delta_m": -0.005
+        },
+        {
+          "trip": "2022-03-14-19-57-us-ca-mtv-pe1/xiaomimi8",
+          "ref": 57684363,
+          "public_m": 0.813,
+          "private_m": 0.806,
+          "split": "public",
+          "delta_m": -0.003
+        },
+        {
+          "trip": "2023-05-02-20-33-us-ca-mtv-xe1/pixel7pro",
+          "ref": 57684452,
+          "public_m": 0.814,
+          "private_m": 0.806,
+          "split": "public",
+          "delta_m": -0.002
+        },
+        {
+          "trip": "2020-12-11-19-30-us-ca-mtv-e/pixel4xl",
+          "ref": 57684322,
+          "public_m": 0.817,
+          "private_m": 0.806,
+          "split": "public",
+          "delta_m": 0.001
+        },
+        {
+          "trip": "2022-04-27-18-16-us-ca-ebf-zz/pixel5",
+          "ref": 57684389,
+          "public_m": 0.817,
+          "private_m": 0.806,
+          "split": "public",
+          "delta_m": 0.001
+        },
+        {
+          "trip": "2022-06-28-20-56-us-ca-sjc-r/samsunga32",
+          "ref": 57684420,
+          "public_m": 0.817,
+          "private_m": 0.806,
+          "split": "public",
+          "delta_m": 0.001
+        },
+        {
+          "trip": "2021-08-17-20-37-us-ca-mtv-g/pixel5",
+          "ref": 57684323,
+          "public_m": 0.818,
+          "private_m": 0.806,
+          "split": "public",
+          "delta_m": 0.002
+        },
+        {
+          "trip": "2022-02-24-15-10-us-ca-lax-p/pixel5",
+          "ref": 57684360,
+          "public_m": 0.818,
+          "private_m": 0.806,
+          "split": "public",
+          "delta_m": 0.002
+        },
+        {
+          "trip": "2022-04-25-22-36-us-ca-ebf-z/pixel5",
+          "ref": 57684386,
+          "public_m": 0.818,
+          "private_m": 0.806,
+          "split": "public",
+          "delta_m": 0.002
+        },
+        {
+          "trip": "2022-05-12-20-19-us-ca-mtv-pe1/samsunga325g",
+          "ref": 57684405,
+          "public_m": 0.818,
+          "private_m": 0.806,
+          "split": "public",
+          "delta_m": 0.002
+        },
+        {
+          "trip": "2023-04-27-20-55-us-ca-sjc-q/pixel5",
+          "ref": 57684445,
+          "public_m": 0.819,
+          "private_m": 0.806,
+          "split": "public",
+          "delta_m": 0.003
+        },
+        {
+          "trip": "2022-07-12-18-37-us-ca-mtv-b/sm-a325f",
+          "ref": 57684433,
+          "public_m": 0.822,
+          "private_m": 0.806,
+          "split": "public",
+          "delta_m": 0.006
+        },
+        {
+          "trip": "2021-08-31-20-37-us-ca-mtv-e/sm-g988b",
+          "ref": 57684327,
+          "public_m": 0.823,
+          "private_m": 0.806,
+          "split": "public",
+          "delta_m": 0.007
+        },
+        {
+          "trip": "2022-04-25-21-04-us-ca-ebf-x/mi8",
+          "ref": 57684381,
+          "public_m": 0.83,
+          "private_m": 0.806,
+          "split": "public",
+          "delta_m": 0.014
+        },
+        {
+          "trip": "2021-11-05-18-28-us-ca-mtv-m/pixel6pro",
+          "ref": 57684343,
+          "public_m": 0.816,
+          "private_m": 0.806,
+          "split": "unresolved",
+          "delta_m": 0.0
+        },
+        {
+          "trip": "2022-02-24-22-14-us-ca-lax-i/pixel5",
+          "ref": 57684361,
+          "public_m": 0.816,
+          "private_m": 0.806,
+          "split": "unresolved",
+          "delta_m": 0.0
+        },
+        {
+          "trip": "2022-04-22-20-11-us-ca-ebf-y/pixel5",
+          "ref": 57684380,
+          "public_m": 0.816,
+          "private_m": 0.806,
+          "split": "unresolved",
+          "delta_m": 0.0
+        },
+        {
+          "trip": "2023-04-27-19-25-us-ca-mtv-pe1/pixel5",
+          "ref": 57684443,
+          "public_m": 0.816,
+          "private_m": 0.806,
+          "split": "unresolved",
+          "delta_m": 0.0
+        },
+        {
+          "trip": "2023-05-23-22-16-us-ca-mtv-ie2/pixel6pro",
+          "ref": 57684460,
+          "public_m": 0.816,
+          "private_m": 0.806,
+          "split": "unresolved",
+          "delta_m": 0.0
+        },
+        {
+          "trip": "2023-06-06-22-43-us-ca-sjc-he2/pixel5",
+          "ref": 57684475,
+          "public_m": 0.816,
+          "private_m": 0.806,
+          "split": "unresolved",
+          "delta_m": 0.0
+        }
+      ]
+    },
+    "findings": [
+      "Private: lax-n Pixel5 (-0.010), sjc-we1 Pixel7Pro (-0.007) and sjc-r A505U (-0.006) carry most of the gap; the rest is spread thin and native is better on 5 Private drives",
+      "Public: mtv-m Mi8 (-0.018) and ebf-xx Pixel5 (-0.017) dominate; native is better on ebf-x Mi8 (+0.014), mtv-e G988B (+0.007) and mtv-b A325F (+0.006)",
+      "the drives taroz wins differ from native by slowly varying 0.1-0.4 m over minutes, often at the drive start (ebf-xx static 0-150 s about 0.9 m, lax-n first 270 s 0.2-0.45 m, mtv-m Mi8 static runs 0.6-0.8 m); taroz is the better one there",
+      "train shows no such start deficit with the current recipes: first 5 minutes median error 0.506 m native vs 0.516 m taroz over 35 drives (rest 0.471 vs 0.479 m)"
+    ]
+  }
+}

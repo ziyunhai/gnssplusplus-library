@@ -5,7 +5,16 @@ Modern C++20 GNSS toolkit for non-GUI positioning.
 Native `SPP`, `RTK`, `PPP`, `CLAS/MADOCA`, `RTCM`, `UBX`, and direct `QZSS L6`
 handling without an external RTKLIB runtime.
 
-![UrbanNav Odaiba social card](docs/driving_odaiba_social_card.png)
+![Ground Truth, libgnss++, and RTKLIB trajectories in one 3D scene, with a Ground Truth-anchored zenith inset showing satellite IDs and model-predicted LOS/NLOS](docs/odaiba_hero.gif)
+
+Selected UrbanNav Odaiba showcase: Ground Truth, libgnss++, and RTKLIB demo5
+in one scene. Median horizontal error on 172 common epochs: **0.38 m vs 7.41 m**
+(libgnss++ default settings vs RTKLIB demo5, both with GPS, GLONASS, Galileo, QZSS
+and BeiDou; a favorable selected segment, not a full-run benchmark: over the whole
+drive demo5 fixes more epochs than the default settings, while `--preset urban`
+fixes more than demo5 with fewer wrong fixes, see the Urban RTK row below).
+Zenith inset: satellite IDs and LOS/NLOS predictions from PLATEAU buildings and bridges, not measured labels.
+[Data, attribution, and rendering details](docs/odaiba_hero.md).
 
 ## What You Get
 
@@ -95,26 +104,30 @@ See the [v0.3.0 release highlights](docs/releases/v0.3.0.md) and
 | RTK | PPC Tokyo/Nagoya vs RTKLIB `demo5` b34k | +56.9 pp fix rate, +44.9 pp official score, -11.33 m P95 H delta (six-run average; demo5 publishes mostly FLOAT/SINGLE on more epochs, so Positioning is -9.7 pp) |
 | GNSS/IMU FGO | PPC Tokyo vs `tightly-coupled-gnss-imu-fgo` | Higher fix rate on all 3 runs (avg +10.7 pp); <50 cm fraction higher on 2 of 3 runs (avg +7.9 pp, run1 -1.8 pp); fixed-only RMS wins 2 of 3 runs |
 | CLAS PPP | Six PPC Tokyo/Nagoya runs vs MRTKLIB CLAS | 25.117% aggregate FIX, 0.359 m FIX RMS2D, and zero FIX epochs above 3 m across 58,259 scored epochs; every run passes the MRTKLIB v0.4.2 FIX-rate and FIX-RMS2D hard gates |
-| Urban RTK | UrbanNav Tokyo Odaiba vs RTKLIB `demo5` b34k | 1298 vs 205 fixes, Hp95 4.77 vs 25.62 m, Vp95 11.54 vs 43.37 m; lower Hmed on common epochs (0.298 vs 0.553 m); both solvers use the surveyed base position |
+| Urban RTK | UrbanNav Tokyo Odaiba vs RTKLIB `demo5` b34k, both multi-GNSS | `--preset urban` 7467 vs 5839 fixes with fewer wrong fixes (9/0/0 vs 19/4/4 beyond 0.5/2/3 m) and lower Hmed/Hp95/Vp95 (0.046/4.86/10.77 vs 0.190/7.86/15.72 m); default profile 1298 fixes with lower Hp95/Vp95 (4.78/11.54 m); both solvers use the surveyed base position |
 | SPP | PPC SPP adaptive robust + policy gate (Tokyo run1, Nagoya run1-3) | No P95 H regression with <=1 pp positioning drop on the 4 checked runs |
-| Smartphone GNSS/IMU | GSDC 2023-2024 official submission | **Private 0.984 m / Public 0.915 m**; 40 drives, 71,936 native output rows |
+| Smartphone GNSS/IMU | GSDC 2023-2024 official submission | **Private 0.806 m / Public 0.816 m**; 40 drives, 71,936 native output rows |
 
 Reproduce: `python3 apps/gnss.py reproduce list` shows one command per row; see [docs/reproduce.md](docs/reproduce.md) for datasets, tool pins, and the latest local results.
 
 ### Smartphone GNSS/IMU
 
 Official Google Smartphone Decimeter Challenge 2023-2024 submission
-**56625084** (2026-09-28) scored **Private 0.984 m / Public 0.915 m**.
+**57678818** (2026-10-26, after the deadline) scored **Private 0.806 m / Public 0.816 m**.
 The submitted recipe combines Pixel5 heading initialization with Android clock handling
-and observation-model updates for supported phones. All 40 drives and
-71,936 output rows were checked against native solver results.
+and observation-model updates for supported phones. On 32 drives, a second GNSS/IMU pass
+re-screens the observations around the first one, as the taroz pipeline does. All 40 drives and
+71,936 output rows were rebuilt with one Linux GCC build and checked against
+native solver results.
 
 The recipe uses raw GNSS/IMU, broadcast navigation, base observations, and
 training-derived height constraints where configured; evaluation ground
 truth is not used during inference. These official scores are separate from
-the development-route measurements below. The 0.928 m Private target remains
-unmet; work is paused at the sub-meter milestone. See the
-[official score record](docs/use_cases/records/gsdc2023_heading_modern_official_readback_20260928.json)
+the development-route measurements below. The Private score is below the
+0.928 m taroz competition score and the 0.883 m final-leaderboard first
+place; the released taroz/gsdc2023 code scores Private 0.782 m after the
+deadline, which remains the target. See the
+[official score record](docs/use_cases/records/gsdc2023_official_readback_20261024.json)
 and [experiment and validation log](docs/gsdc2023_native_taroz_goal.md).
 
 Base-surveyed correction on the GSDC dev routes (Pixel5, `(P50+P95)/2` m):

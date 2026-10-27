@@ -152,6 +152,27 @@ public:
         double process_noise_ambiguity = 1e-8;    // cycles^2/s (very small - ambiguities are constant)
         double process_noise_iono = 1e-4;         // m^2/s for DD ionosphere states
         int kf_iterations = 4;                       // more iterations for position convergence
+        // Opt-in: apply the relinearized passes above to the epoch prior
+        // (iterated EKF). Off keeps the legacy passes, which re-apply the
+        // epoch's rows to the previous pass's posterior and so count them
+        // again (docs/rtk_iterated_update_covariance.md).
+        bool kf_relinearize_from_epoch_prior = false;
+        // Opt-in: apply held DD integers as a Kalman pseudo-observation
+        // (RTKLIB holdamb, 0.001 cycle^2) that also conditions the correlated
+        // position. Off keeps the legacy overwrite, which writes the integer
+        // into the satellite ambiguity and zeroes its correlations.
+        bool hold_ambiguity_kalman_update = false;
+        // Opt-in: compare a kinematic AR candidate against the last FIX
+        // propagated by the latest Doppler velocity (both at most 2 s old)
+        // in the consecutive-FIX history check. Off keeps the stationary
+        // last FIX, which rejects consistent fixes above about 2 m/s at 10 Hz.
+        bool fix_history_motion_compensation = false;
+        // Opt-in: propagate the last FIX the same way (Doppler velocity, both
+        // at most 2 s old) before the absolute max_position_jump check. Off
+        // keeps the stationary anchor, which rejects every consistent
+        // candidate once the vehicle has moved max_position_jump_m since the
+        // last FIX (0.4 s at 13 m/s with the 5 m default).
+        bool max_position_jump_motion_compensation = false;
 
         // Measurement noise
         double pseudorange_sigma = 0.3;           // m (eratio = pseudorange_sigma / carrier_phase_sigma = 150)
@@ -368,6 +389,22 @@ public:
         /// unchanged bit-for-bit; a smaller value has no effect.
         int hold_fix_min_matched_pairs = 4;
 
+        /// Reject a hold-fix candidate ("hold_fix_update_nis") when the float
+        /// update of the same epoch has a normalized innovation squared per
+        /// observation above this limit. max_fixed_update_nis_per_observation
+        /// guards only AR candidates, so a hold fix can follow an update that
+        /// contradicts the held integers. 0 (default) disables the check, so the
+        /// behavior is unchanged bit-for-bit.
+        double hold_fix_max_update_nis_per_observation = 0.0;
+
+        /// When the hold fix is rejected only by hold_fix_max_update_nis_per_observation,
+        /// skip that epoch without closing the hold path: the run of fixes it had
+        /// still counts for the hold-fix fallback and the hold of later epochs
+        /// until a fix extends the run or any other hold rejection or reset ends
+        /// it. Other uses of the consecutive-fix count are unchanged. false
+        /// (default): the rejected epoch is FLOAT and resets the run as before.
+        bool hold_fix_update_nis_keeps_hold_run = false;
+
         /// Minimum number of non-reference satellites in the fixed DD set of an
         /// ambiguity-resolution FIX (full set, subset or WL/NL fallback). Each such
         /// satellite adds one double-difference direction; fewer than 3 cannot
@@ -389,9 +426,20 @@ public:
         /// validation. 0 preserves the legacy non-expiring anchor.
         double max_fixed_anchor_age_s = 0.0;
 
-        /// Reject FIX candidates that disagree with an independent position
-        /// track propagated by rover Doppler velocity. 0 disables the gate.
+        /// Reject AR and hold-FIX candidates that disagree with the position
+        /// track propagated by rover Doppler velocity, even with a fresh FIX
+        /// anchor. An existing track must be current to the candidate epoch.
+        /// The first FIX bootstraps the track; this is a continuity check, not
+        /// an independent absolute-position or integer-integrity guarantee.
+        /// 0 disables the gate. Moving-base mode bypasses it.
         double max_fixed_doppler_consensus_m = 0.0;
+
+        /// Age limit of the Doppler consensus track since an accepted FIX last
+        /// re-anchored it. Its integration error grows with that age, and only
+        /// an accepted FIX can re-anchor it, so a drifted track would otherwise
+        /// veto every later candidate. Past this age the gate does not veto.
+        /// 0 keeps the track without a limit (legacy behavior).
+        double max_fixed_doppler_consensus_age_s = 0.0;
 
         /// Adaptive max AR fix jump from last fixed position.
         /// When max_position_jump_rate_mps > 0, accepted jump is
@@ -1117,6 +1165,12 @@ public:
         double lambda_shadow_effective_candidates =
             std::numeric_limits<double>::quiet_NaN();
         int lambda_shadow_best_second_disagreements = 0;
+        // Best full-set candidate, per DD pair: z = (float - integer) /
+        // sqrt(Qb_ii). Locates the pairs that make the best cost large.
+        double lambda_shadow_max_abs_z = std::numeric_limits<double>::quiet_NaN();
+        std::string lambda_shadow_max_z_pair;
+        int lambda_shadow_max_z_lock_count = 0;
+        int lambda_shadow_pairs_abs_z_gt3 = 0;
         bool lambda_shadow_ffrt_table_supported = false;
         bool lambda_shadow_ffrt_accepts_any = false;
         bool lambda_shadow_ffrt_passed = false;
@@ -1436,6 +1490,10 @@ public:
         bool validation_attempted = false;
         bool validation_passed = false;
         double postfix_residual_rms = std::numeric_limits<double>::quiet_NaN();
+        // Largest |post-fix DD phase residual| [m] over the fixed pairs and its
+        // pair REF-SAT/Lf, from the same pass as postfix_residual_rms.
+        double postfix_residual_max_abs_m = std::numeric_limits<double>::quiet_NaN();
+        std::string postfix_residual_max_pair;
         double fixed_float_jump_m = std::numeric_limits<double>::quiet_NaN();
         Vector3d fixed_candidate_position_ecef = Vector3d::Zero();
         bool fixed_candidate_position_valid = false;
@@ -1446,6 +1504,8 @@ public:
         double fixed_candidate_history_dt_s =
             std::numeric_limits<double>::quiet_NaN();
         double fixed_candidate_doppler_consensus_distance_m =
+            std::numeric_limits<double>::quiet_NaN();
+        double fixed_candidate_doppler_consensus_age_s =
             std::numeric_limits<double>::quiet_NaN();
         bool low_count_rescue_evaluated = false;
         bool low_count_rescue_passed = false;
@@ -1810,6 +1870,7 @@ private:
     bool has_last_doppler_velocity_ = false;
     Vector3d doppler_continuity_position_ecef_ = Vector3d::Zero();
     GNSSTime doppler_continuity_time_;
+    GNSSTime doppler_continuity_anchor_time_;
     bool has_doppler_continuity_position_ = false;
 
     /**
@@ -1966,7 +2027,7 @@ private:
     bool has_ref_satellite_ = false;
 
     // Fixed solution baseline (from LAMBDA)
-    Vector3d fixed_baseline_;
+    Vector3d fixed_baseline_ = Vector3d::Zero();
     bool has_fixed_solution_ = false;
 
     // Last validated fixed position (for position reset in next epoch)
@@ -1991,6 +2052,12 @@ private:
     Matrix3d first_pass_position_covariance_ = Matrix3d::Zero();
     double first_pass_nis_per_observation_ = 0.0;
     bool has_first_pass_covariance_ = false;
+    // Epoch prior for the relinearized measurement passes. While set,
+    // updateFilter() gates rows at the current iterate and applies them once
+    // to this prior (iterated EKF) instead of again to the posterior.
+    VectorXd iterated_update_prior_state_;
+    MatrixXd iterated_update_prior_covariance_;
+    bool has_iterated_update_prior_ = false;
     Vector3d last_trusted_position_ = Vector3d::Zero();
     bool has_last_trusted_position_ = false;
     Vector3d fixed_update_gate_previous_position_ = Vector3d::Zero();
@@ -1999,6 +2066,12 @@ private:
 
     // Consecutive fix tracking for holdamb
     int consecutive_fix_count_ = 0;
+    // Fix run kept for the hold-fix fallback after a hold fix rejected only by
+    // hold_fix_max_update_nis_per_observation (hold_fix_update_nis_keeps_hold_run).
+    int nis_suspended_hold_run_ = 0;
+    int holdEligibleFixCount() const {
+        return std::max(consecutive_fix_count_, nis_suspended_hold_run_);
+    }
 
     // Consecutive float tracking for ambiguity auto-reset gate
     int consecutive_float_count_ = 0;
@@ -2503,6 +2576,8 @@ private:
      */
     bool validateFixedSolution(const std::map<SatelliteId, SatelliteData>& sat_data,
                                const GNSSTime& current_time);
+    bool validateFixedDopplerConsensus(const Vector3d& position,
+                                       const GNSSTime& current_time);
     bool validateCpPrFixedCandidate(const std::map<SatelliteId, SatelliteData>& sat_data,
                                     const GNSSTime& current_time);
 

@@ -183,6 +183,7 @@ void RTKProcessor::reset() {
     current_epoch_slips_l5_.clear();
     ambiguity_arc_bank_.reset();
     consecutive_fix_count_ = 0;
+    nis_suspended_hold_run_ = 0;
     consecutive_float_count_ = 0;
     consecutive_nonfix_count_ = 0;
     consecutive_high_float_residual_count_ = 0;
@@ -376,7 +377,11 @@ void RTKProcessor::rememberSolution(const PositionSolution& solution) {
         // WP9: remember the trust sample being replaced so CV_PREDICT can
         // derive a two-point constant-velocity estimate from the last two
         // trusted deltas. No effect on any exported solution.
-        if (has_last_trusted_position_ && has_last_trusted_time_) {
+        // FLOAT and FIX candidates, or a kept FLOAT, can be recorded more
+        // than once at the same epoch. Replace that epoch's current sample
+        // without turning it into its own predecessor (zero-span velocity).
+        if (has_last_trusted_position_ && has_last_trusted_time_ &&
+            solution.time - last_trusted_time_ > 0.0) {
             prev_trusted_position_ = last_trusted_position_;
             prev_trusted_time_ = last_trusted_time_;
             has_prev_trusted_position_ = true;

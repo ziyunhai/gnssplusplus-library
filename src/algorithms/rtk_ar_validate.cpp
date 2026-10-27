@@ -3,6 +3,7 @@
 #include <libgnss++/algorithms/rtk_ar_selection.hpp>
 #include <libgnss++/algorithms/disjoint_satellite_fix_evidence.hpp>
 #include <libgnss++/algorithms/fix_failure_budget.hpp>
+#include <libgnss++/algorithms/kalman.hpp>
 #include <libgnss++/algorithms/lambda.hpp>
 #include <libgnss++/algorithms/rtk_cp_pr_gate.hpp>
 #include <libgnss++/algorithms/rtk_ddpr_anchor.hpp>
@@ -189,6 +190,38 @@ void RTKProcessor::restoreHoldState(const HoldStateSnapshot& snapshot) {
     last_dd_fixed_ = snapshot.dd_fixed;
     last_ar_ratio_ = snapshot.ar_ratio;
     last_num_fixed_ambiguities_ = snapshot.num_fixed_ambiguities;
+}
+
+bool RTKProcessor::validateFixedDopplerConsensus(const Vector3d& position,
+                                                const GNSSTime& current_time) {
+    if (isMovingBasePositionMode(rtk_config_) ||
+        !(rtk_config_.max_fixed_doppler_consensus_m > 0.0) ||
+        !has_doppler_continuity_position_) {
+        return true;
+    }
+    // An expired track is no reference: its integration error has outgrown the
+    // gate and only an accepted FIX could re-anchor it.
+    const double anchor_age = current_time - doppler_continuity_anchor_time_;
+    debug_telemetry_.fixed_candidate_doppler_consensus_age_s = anchor_age;
+    if (rtk_config_.max_fixed_doppler_consensus_age_s > 0.0 && std::isfinite(anchor_age) &&
+        anchor_age > rtk_config_.max_fixed_doppler_consensus_age_s) {
+        return true;
+    }
+    // A recent FIX anchor does not establish consistency of this candidate.
+    // Validate before it can seed trusted positions or held integers. A track
+    // that could not be propagated to this epoch is not a current reference.
+    const double age = current_time - doppler_continuity_time_;
+    if (!std::isfinite(age) || std::abs(age) > 1e-6) {
+        debug_telemetry_.reject_reason = "fixed_doppler_stale";
+        return false;
+    }
+    const double distance = (position - doppler_continuity_position_ecef_).norm();
+    debug_telemetry_.fixed_candidate_doppler_consensus_distance_m = distance;
+    if (!std::isfinite(distance) || distance > rtk_config_.max_fixed_doppler_consensus_m) {
+        debug_telemetry_.reject_reason = "fixed_doppler_consensus";
+        return false;
+    }
+    return true;
 }
 
 bool RTKProcessor::validateFixedSolution(const std::map<SatelliteId, SatelliteData>& sat_data,
@@ -380,41 +413,35 @@ bool RTKProcessor::validateFixedSolution(const std::map<SatelliteId, SatelliteDa
         has_last_fixed_time_,
         fixed_jump_dt,
         rtk_config_.max_fixed_anchor_age_s);
-    const bool fixed_residual_overconfidence_suspect =
-        rtk_config_.max_fixed_prefit_residual_rms_m > 0.0 &&
-        rtk_config_.min_fixed_prefit_outliers > 0 &&
-        current_update_diagnostics_.prefit_residual_rms_m >
-            rtk_config_.max_fixed_prefit_residual_rms_m &&
-        current_update_diagnostics_.suppressed_outliers >=
-            rtk_config_.min_fixed_prefit_outliers &&
-        rtk_config_.max_fixed_overconfidence_covariance_trace_m2 > 0.0 &&
-        debug_telemetry_.float_position_covariance_trace_m2 <=
-            rtk_config_.max_fixed_overconfidence_covariance_trace_m2;
-    const bool require_doppler_consensus =
-        !fixed_anchor_usable || fixed_residual_overconfidence_suspect;
-    if (!isMovingBasePositionMode(rtk_config_) &&
-        rtk_config_.max_fixed_doppler_consensus_m > 0.0 &&
-        require_doppler_consensus &&
-        has_doppler_continuity_position_) {
-        const double consensus_distance =
-            (new_pos - doppler_continuity_position_ecef_).norm();
-        debug_telemetry_.fixed_candidate_doppler_consensus_distance_m =
-            consensus_distance;
-        if (!std::isfinite(consensus_distance) ||
-            consensus_distance > rtk_config_.max_fixed_doppler_consensus_m) {
-            debug_telemetry_.reject_reason = "fixed_doppler_consensus";
-            return false;
-        }
+    if (!validateFixedDopplerConsensus(new_pos, current_time)) {
+        return false;
     }
     const bool use_adaptive_position_jump =
         rtk_config_.max_position_jump_rate_mps > 0.0 &&
         fixed_anchor_usable &&
         has_fixed_jump_dt;
+    Vector3d motion_reference = last_fixed_position_;
+    if ((rtk_config_.fix_history_motion_compensation ||
+         rtk_config_.max_position_jump_motion_compensation) &&
+        rtk_config_.position_mode != RTKConfig::PositionMode::STATIC &&
+        has_last_fixed_time_ && has_last_doppler_velocity_ &&
+        last_doppler_velocity_ecef_.allFinite()) {
+        const double dt = current_time - last_fixed_time_;
+        const double velocity_age = current_time - last_doppler_velocity_time_;
+        if (std::isfinite(dt) && dt > 0.0 && dt <= 2.0 &&
+            std::isfinite(velocity_age) && velocity_age >= 0.0 && velocity_age <= 2.0) {
+            motion_reference += last_doppler_velocity_ecef_ * dt;
+        }
+    }
+    const Vector3d& fix_history_reference =
+        rtk_config_.fix_history_motion_compensation ? motion_reference : last_fixed_position_;
+    const Vector3d& position_jump_reference =
+        rtk_config_.max_position_jump_motion_compensation ? motion_reference : last_fixed_position_;
     if (!isMovingBasePositionMode(rtk_config_) &&
         !use_adaptive_position_jump &&
         rtk_validation::exceedsFixHistoryJump(
             new_pos,
-            last_fixed_position_,
+            fix_history_reference,
             fixed_anchor_usable,
             rtk_config_.position_mode == RTKConfig::PositionMode::STATIC,
             consecutive_fix_count_)) {
@@ -432,7 +459,7 @@ bool RTKProcessor::validateFixedSolution(const std::map<SatelliteId, SatelliteDa
         }
         if (position_jump_limit > 0.0 &&
             rtk_validation::exceedsAbsoluteJump(
-                new_pos, last_fixed_position_, true, position_jump_limit)) {
+                new_pos, position_jump_reference, true, position_jump_limit)) {
             debug_telemetry_.reject_reason =
                 use_adaptive_position_jump ? "adaptive_position_jump" : "max_position_jump";
             return false;
@@ -553,6 +580,8 @@ bool RTKProcessor::validateFixedSolution(const std::map<SatelliteId, SatelliteDa
         int l1_count = 0;
         double all_sum_sq = 0.0;
         int all_count = 0;
+        double max_abs_residual = -1.0;
+        std::string max_residual_pair;
 
         for (int i = 0; i < static_cast<int>(last_best_subset_.size()); ++i) {
             const int dd_idx = last_best_subset_[i];
@@ -642,12 +671,21 @@ bool RTKProcessor::validateFixedSolution(const std::map<SatelliteId, SatelliteDa
 
             all_sum_sq += residual * residual;
             all_count++;
+            if (std::abs(residual) > max_abs_residual) {
+                max_abs_residual = std::abs(residual);
+                max_residual_pair = pair.ref_sat.toString() + "-" + pair.sat.toString() + "/L" +
+                                    std::to_string(pair.freq + 1);
+            }
             if (use_l1) {
                 l1_sum_sq += residual * residual;
                 l1_count++;
             }
         }
 
+        if (max_abs_residual >= 0.0) {
+            debug_telemetry_.postfix_residual_max_abs_m = max_abs_residual;
+            debug_telemetry_.postfix_residual_max_pair = max_residual_pair;
+        }
         if (l1_count > 0) {
             return std::sqrt(l1_sum_sq / static_cast<double>(l1_count));
         }
@@ -686,6 +724,43 @@ void RTKProcessor::applyHoldAmbiguity() {
 
     auto& x = filter_state_.state;
     auto& P = filter_state_.covariance;
+    constexpr double VAR_HOLDAMB = 0.001;
+
+    if (rtk_config_.hold_ambiguity_kalman_update) {
+        // One measurement update with z = held DD integer, h(x) = x_ref - x_sat,
+        // over the same pairs the legacy overwrite would touch.
+        std::vector<std::pair<int, int>> rows;
+        std::vector<double> held;
+        for (int i = 0; i < (int)last_best_subset_.size(); ++i) {
+            int dd_idx = last_best_subset_[i];
+            if (dd_idx >= (int)last_dd_pairs_.size()) continue;
+            if (!usesHoldAmbiguitySystem(rtk_config_, last_dd_pairs_[dd_idx].ref_sat.system)) continue;
+            int ri = last_dd_pairs_[dd_idx].ref_idx;
+            int si = last_dd_pairs_[dd_idx].sat_idx;
+            if (ri >= n || si >= n) continue;
+            if (x(ri) == 0.0 || x(si) == 0.0) continue;
+            rows.emplace_back(ri, si);
+            held.push_back(last_dd_fixed_(i));
+        }
+        if (rows.empty()) return;
+        const int m = static_cast<int>(rows.size());
+        MatrixXd H = MatrixXd::Zero(m, n);
+        VectorXd v(m);
+        for (int r = 0; r < m; ++r) {
+            H(r, rows[r].first) = 1.0;
+            H(r, rows[r].second) = -1.0;
+            v(r) = held[r] - (x(rows[r].first) - x(rows[r].second));
+        }
+        std::vector<bool> force_active;
+        if (rtk_config_.enable_velocity_states && n >= VELOCITY_STATE_INDEX + VELOCITY_STATES) {
+            force_active.assign(n, false);
+            for (int i = 0; i < VELOCITY_STATES; ++i) {
+                force_active[VELOCITY_STATE_INDEX + i] = true;
+            }
+        }
+        kalmanFilter(x, P, H, v, VAR_HOLDAMB * MatrixXd::Identity(m, m), force_active);
+        return;
+    }
 
     // Direct state adjustment: move SD ambiguities to satisfy DD integer constraints
     // Only adjust the satellite (non-reference) SD ambiguity for each DD pair
@@ -706,7 +781,6 @@ void RTKProcessor::applyHoldAmbiguity() {
 
         // Tighten the satellite ambiguity covariance (leave ref untouched)
         // Reduce cross-correlations with position to prevent position distortion
-        constexpr double VAR_HOLDAMB = 0.001;
         for (int j = 0; j < n; ++j) {
             if (j == si) continue;
             P(si, j) = 0.0;
@@ -724,12 +798,13 @@ bool RTKProcessor::tryHoldFix(const std::map<SatelliteId, SatelliteData>& sat_da
     debug_telemetry_.hold_fix_attempted = true;
     const auto reject_hold = [&](const char* reason) {
         debug_telemetry_.hold_fix_reject_reason = reason;
+        nis_suspended_hold_run_ = 0;
         return false;
     };
     if (isMovingBasePositionMode(rtk_config_)) {
         return reject_hold("moving_base");
     }
-    if (!rtk_validation::canAttemptHoldFix(consecutive_fix_count_,
+    if (!rtk_validation::canAttemptHoldFix(holdEligibleFixCount(),
                                            rtk_config_.min_hold_count,
                                            has_last_fixed_position_,
                                            last_dd_fixed_.size() > 0)) {
@@ -827,6 +902,22 @@ bool RTKProcessor::tryHoldFix(const std::map<SatelliteId, SatelliteData>& sat_da
                 rtk_config_.max_hold_divergence_m) {
             return reject_hold("float_divergence");
         }
+    }
+
+    if (!validateFixedDopplerConsensus(test_pos, time)) {
+        return reject_hold(debug_telemetry_.reject_reason.c_str());
+    }
+    const double max_update_nis = rtk_config_.hold_fix_max_update_nis_per_observation;
+    const double update_nis =
+        current_update_diagnostics_.normalized_innovation_squared_per_observation;
+    if (std::isfinite(max_update_nis) && max_update_nis > 0.0 &&
+        std::isfinite(update_nis) && update_nis > max_update_nis) {
+        const int run = holdEligibleFixCount();
+        reject_hold("hold_fix_update_nis");
+        if (rtk_config_.hold_fix_update_nis_keeps_hold_run) {
+            nis_suspended_hold_run_ = run;
+        }
+        return false;
     }
 
     // Accept hold fix

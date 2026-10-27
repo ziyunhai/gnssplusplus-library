@@ -17,6 +17,7 @@
 #include <cmath>
 #include <filesystem>
 #include <map>
+#include <limits>
 #include <memory>
 #include <string>
 #include <utility>
@@ -43,6 +44,19 @@ struct RTKProcessorTestAccess {
     GNSSPP_RTK_TEST_MEMBER(has_fixed_solution_)
     GNSSPP_RTK_TEST_MEMBER(last_fixed_position_)
     GNSSPP_RTK_TEST_MEMBER(has_last_fixed_position_)
+    GNSSPP_RTK_TEST_MEMBER(last_fixed_time_)
+    GNSSPP_RTK_TEST_MEMBER(has_last_fixed_time_)
+    GNSSPP_RTK_TEST_MEMBER(last_trusted_position_)
+    GNSSPP_RTK_TEST_MEMBER(has_last_trusted_position_)
+    GNSSPP_RTK_TEST_MEMBER(last_trusted_time_)
+    GNSSPP_RTK_TEST_MEMBER(has_last_trusted_time_)
+    GNSSPP_RTK_TEST_MEMBER(prev_trusted_position_)
+    GNSSPP_RTK_TEST_MEMBER(prev_trusted_time_)
+    GNSSPP_RTK_TEST_MEMBER(has_prev_trusted_position_)
+    GNSSPP_RTK_TEST_MEMBER(doppler_continuity_position_ecef_)
+    GNSSPP_RTK_TEST_MEMBER(doppler_continuity_time_)
+    GNSSPP_RTK_TEST_MEMBER(doppler_continuity_anchor_time_)
+    GNSSPP_RTK_TEST_MEMBER(has_doppler_continuity_position_)
     GNSSPP_RTK_TEST_MEMBER(consecutive_fix_count_)
     GNSSPP_RTK_TEST_MEMBER(lock_count_l1_)
     GNSSPP_RTK_TEST_MEMBER(last_dd_pairs_)
@@ -51,9 +65,14 @@ struct RTKProcessorTestAccess {
     GNSSPP_RTK_TEST_MEMBER(last_ar_ratio_)
     GNSSPP_RTK_TEST_MEMBER(last_num_fixed_ambiguities_)
     GNSSPP_RTK_TEST_MEMBER(doppler_history_time_)
+    GNSSPP_RTK_TEST_MEMBER(last_doppler_velocity_ecef_)
+    GNSSPP_RTK_TEST_MEMBER(last_doppler_velocity_time_)
+    GNSSPP_RTK_TEST_MEMBER(has_last_doppler_velocity_)
     GNSSPP_RTK_TEST_MEMBER(has_doppler_history_time_)
     GNSSPP_RTK_TEST_MEMBER(doppler_history_base_time_)
     GNSSPP_RTK_TEST_MEMBER(has_doppler_history_base_time_)
+    GNSSPP_RTK_TEST_MEMBER(current_update_diagnostics_)
+    GNSSPP_RTK_TEST_MEMBER(nis_suspended_hold_run_)
     GNSSPP_RTK_TEST_METHOD(formDoubleDifferences)
     GNSSPP_RTK_TEST_METHOD(calculateBaseline)
     GNSSPP_RTK_TEST_METHOD(calculateResiduals)
@@ -64,6 +83,8 @@ struct RTKProcessorTestAccess {
     GNSSPP_RTK_TEST_METHOD(solvePositionWithAmbiguities)
     GNSSPP_RTK_TEST_METHOD(solveLAMBDA)
     GNSSPP_RTK_TEST_METHOD(validateAmbiguityResolution)
+    GNSSPP_RTK_TEST_METHOD(validateFixedSolution)
+    GNSSPP_RTK_TEST_METHOD(rememberSolution)
     GNSSPP_RTK_TEST_METHOD(varerr)
     GNSSPP_RTK_TEST_METHOD(tryHoldFix)
     GNSSPP_RTK_TEST_METHOD(applyHoldAmbiguity)
@@ -83,6 +104,507 @@ struct RTKProcessorTestAccess {
 
 using namespace libgnss;
 using Peer = RTKProcessorTestAccess;
+
+TEST(RTKTrustedHistoryTest, SameEpochFloatAndFixedReplaceCurrentSampleWithoutAdvancingHistory) {
+    RTKProcessor processor;
+    auto sample = [](double tow, double east, SolutionStatus status) {
+        PositionSolution solution;
+        solution.time = GNSSTime(2300, tow);
+        solution.status = status;
+        solution.num_satellites = 8;
+        solution.position_ecef = Vector3d(6378137, east, 0);
+        return solution;
+    };
+    const auto first = sample(100, 0, SolutionStatus::FIXED);
+    const auto next = sample(101, 1, SolutionStatus::FLOAT);
+    Peer::rememberSolution(processor, first);
+    Peer::rememberSolution(processor, next);
+    for (const auto& same_epoch : {sample(101, 1.1, SolutionStatus::FLOAT),
+                                   sample(101, 1.2, SolutionStatus::FIXED)}) {
+        Peer::rememberSolution(processor, same_epoch);
+        EXPECT_EQ(Peer::last_trusted_position_(processor), same_epoch.position_ecef);
+        EXPECT_EQ(Peer::prev_trusted_position_(processor), first.position_ecef);
+        EXPECT_DOUBLE_EQ(Peer::prev_trusted_time_(processor).tow, 100);
+        EXPECT_DOUBLE_EQ(Peer::last_trusted_time_(processor).tow, 101);
+        const auto velocity = float_trust_policy::estimateVelocityFromTrustedDeltas(
+            Peer::last_trusted_position_(processor), Peer::prev_trusted_position_(processor),
+            Peer::last_trusted_time_(processor) - Peer::prev_trusted_time_(processor), 10.0);
+        EXPECT_NEAR(velocity.y(), same_epoch.position_ecef.y(), 1e-9);
+    }
+}
+
+TEST(RTKTrustedHistoryTest, RejectedFloatRestoresBothTrustSamplesAndPreviousPresenceFlag) {
+    const auto nav = synthetic_rtk_scene::constellation();
+    const Vector3d base_position(6378137, 0, 0);
+    const Vector3d rover_position = base_position + Vector3d(40, 30, 10);
+    const auto prns = synthetic_rtk_scene::visible(
+        nav, synthetic_rtk_scene::epochTime(0), rover_position, 15);
+    ASSERT_GE(prns.size(), 6U);
+    for (bool previous_present : {false, true}) {
+        SCOPED_TRACE(previous_present);
+        RTKProcessor processor;
+        auto config = processor.getRTKConfig();
+        config.ratio_threshold = 1e9;
+        config.ambiguity_ratio_threshold = 1e9;
+        config.elevation_mask = 5 * M_PI / 180;
+        processor.setRTKConfig(config);
+        ProcessorConfig spp_config;
+        spp_config.elevation_mask = 5;
+        ASSERT_TRUE(processor.initialize(spp_config));
+        processor.setBasePosition(base_position);
+        auto process = [&](double offset) {
+            const auto time = synthetic_rtk_scene::epochTime(offset);
+            return processor.processRTKEpoch(
+                synthetic_rtk_scene::observations(nav, time, rover_position, 30, prns, 0),
+                synthetic_rtk_scene::observations(nav, time, base_position, 10, prns, 500), nav);
+        };
+        ASSERT_TRUE(process(0).isValid());
+        ASSERT_TRUE(Peer::has_last_trusted_position_(processor));
+        const Vector3d trusted = Peer::last_trusted_position_(processor);
+        const GNSSTime trusted_time = Peer::last_trusted_time_(processor);
+        const Vector3d previous = trusted - Vector3d(0, 1, 0);
+        Peer::prev_trusted_position_(processor) = previous;
+        Peer::prev_trusted_time_(processor) = trusted_time - 1;
+        Peer::has_prev_trusted_position_(processor) = previous_present;
+        config.max_float_spp_divergence_m = 1e-8;
+        processor.setRTKConfig(config);
+        const auto rejected = process(0.2);
+        ASSERT_EQ(rejected.status, SolutionStatus::SPP);
+        ASSERT_GT(processor.getLastDebugTelemetry().float_update_observation_count, 0);
+        EXPECT_EQ(Peer::last_trusted_position_(processor), trusted);
+        EXPECT_DOUBLE_EQ(Peer::last_trusted_time_(processor) - trusted_time, 0);
+        EXPECT_EQ(Peer::has_prev_trusted_position_(processor), previous_present);
+        EXPECT_EQ(Peer::prev_trusted_position_(processor), previous);
+        EXPECT_DOUBLE_EQ(Peer::prev_trusted_time_(processor) - (trusted_time - 1), 0);
+    }
+}
+
+TEST(RTKIteratedUpdateTest, RelinearizationFromPriorDoesNotRecountEpochMeasurements) {
+    // Noise-free static scene with an unbiased seed: every row passes the
+    // prefit gate on the first pass, so relinearizing at the updated state
+    // adds no information. With --kf-relinearize-from-prior a single update
+    // and the iterated update leave the same position and double-difference
+    // ambiguity covariance. The legacy default re-applies the same rows to
+    // the posterior and halves it (docs/rtk_iterated_update_covariance.md).
+    const auto nav = synthetic_rtk_scene::constellation();
+    const Vector3d base_position(6378137, 0, 0);
+    const Vector3d rover_position = base_position + Vector3d(40, 30, 10);
+    const auto prns = synthetic_rtk_scene::visible(
+        nav, synthetic_rtk_scene::epochTime(0), rover_position, 15);
+    ASSERT_GE(prns.size(), 6U);
+    const int reference = Peer::ambiguityIndex(SatelliteId(GNSSSystem::GPS, prns[0]), 0);
+    auto run = [&](int kf_iterations, bool relinearize_from_prior) {
+        RTKProcessor processor;
+        auto config = processor.getRTKConfig();
+        config.ratio_threshold = 1e9;
+        config.ambiguity_ratio_threshold = 1e9;
+        config.elevation_mask = 5 * M_PI / 180;
+        config.kf_iterations = kf_iterations;
+        config.kf_relinearize_from_epoch_prior = relinearize_from_prior;
+        processor.setRTKConfig(config);
+        ProcessorConfig spp_config;
+        spp_config.elevation_mask = 5;
+        // The scene has no atmosphere: an unbiased SPP seed keeps every row
+        // inside the prefit gate on the first pass.
+        spp_config.use_ionosphere_model = false;
+        spp_config.use_troposphere_model = false;
+        EXPECT_TRUE(processor.initialize(spp_config));
+        processor.setBasePosition(base_position);
+        for (int epoch = 0; epoch < 3; ++epoch) {
+            const auto time = synthetic_rtk_scene::epochTime(epoch);
+            const auto solution = processor.processRTKEpoch(
+                synthetic_rtk_scene::observations(nav, time, rover_position, 30, prns, 0),
+                synthetic_rtk_scene::observations(nav, time, base_position, 10, prns, 500),
+                nav);
+            EXPECT_EQ(solution.status, SolutionStatus::FLOAT);
+            const auto& telemetry = processor.getLastDebugTelemetry();
+            EXPECT_EQ(telemetry.float_update_suppressed_outliers, 0);
+            EXPECT_EQ(telemetry.retained_phase_rows, static_cast<int>(prns.size()) - 1);
+        }
+        return Peer::filter_state_(processor);
+    };
+    const auto single = run(1, true);
+    const auto iterated = run(4, true);
+    const auto legacy = run(4, false);
+    EXPECT_EQ(run(1, false).covariance, single.covariance);
+    for (int axis = 0; axis < 3; ++axis) {
+        SCOPED_TRACE(axis);
+        EXPECT_NEAR(iterated.covariance(axis, axis) / single.covariance(axis, axis), 1.0, 1e-3);
+        EXPECT_NEAR(legacy.covariance(axis, axis) / single.covariance(axis, axis), 0.5, 0.01);
+    }
+    auto ddVariance = [&](const auto& state, int index) {
+        return state.covariance(reference, reference) + state.covariance(index, index) -
+               2.0 * state.covariance(reference, index);
+    };
+    for (std::size_t i = 1; i < prns.size(); ++i) {
+        const int index = Peer::ambiguityIndex(SatelliteId(GNSSSystem::GPS, prns[i]), 0);
+        SCOPED_TRACE(static_cast<int>(prns[i]));
+        ASSERT_NE(single.state(index), 0.0);
+        EXPECT_NEAR(ddVariance(iterated, index) / ddVariance(single, index), 1.0, 1e-3);
+        EXPECT_NEAR(ddVariance(legacy, index) / ddVariance(single, index), 0.5, 0.01);
+        EXPECT_NEAR(iterated.state(reference) - iterated.state(index),
+                    single.state(reference) - single.state(index), 1e-3);
+    }
+}
+
+TEST(RTKLambdaShadowTest, ReportsPerPairIntegerResidualOfBestCandidate) {
+    // Noise-free scene: the float DD ambiguities sit on integers, so the
+    // largest normalized integer residual is small and named after a pair.
+    const auto nav = synthetic_rtk_scene::constellation();
+    const Vector3d base_position(6378137, 0, 0);
+    const Vector3d rover_position = base_position + Vector3d(40, 30, 10);
+    const auto prns = synthetic_rtk_scene::visible(
+        nav, synthetic_rtk_scene::epochTime(0), rover_position, 15);
+    ASSERT_GE(prns.size(), 6U);
+    RTKProcessor processor;
+    auto config = processor.getRTKConfig();
+    config.ratio_threshold = 1e9;
+    config.ambiguity_ratio_threshold = 1e9;
+    config.elevation_mask = 5 * M_PI / 180;
+    config.lambda_candidate_shadow_count = 2;
+    processor.setRTKConfig(config);
+    ProcessorConfig spp_config;
+    spp_config.elevation_mask = 5;
+    spp_config.use_ionosphere_model = false;
+    spp_config.use_troposphere_model = false;
+    ASSERT_TRUE(processor.initialize(spp_config));
+    processor.setBasePosition(base_position);
+    for (int epoch = 0; epoch < 6; ++epoch) {
+        const auto time = synthetic_rtk_scene::epochTime(epoch);
+        processor.processRTKEpoch(
+            synthetic_rtk_scene::observations(nav, time, rover_position, 30, prns, 0),
+            synthetic_rtk_scene::observations(nav, time, base_position, 10, prns, 500), nav);
+    }
+    const auto& telemetry = processor.getLastDebugTelemetry();
+    ASSERT_TRUE(telemetry.lambda_shadow_solved);
+    ASSERT_TRUE(std::isfinite(telemetry.lambda_shadow_max_abs_z));
+    EXPECT_LT(telemetry.lambda_shadow_max_abs_z, 3.0);
+    EXPECT_EQ(telemetry.lambda_shadow_pairs_abs_z_gt3, 0);
+    EXPECT_GT(telemetry.lambda_shadow_max_z_lock_count, 0);
+    EXPECT_EQ(telemetry.lambda_shadow_max_z_pair.rfind("G", 0), 0U);
+    EXPECT_NE(telemetry.lambda_shadow_max_z_pair.find("/L1"), std::string::npos);
+}
+
+TEST(RTKPostFixResidualTest, ReportsLargestPairResidualAlongsideRms) {
+    // Noise-free scene: once fixed, every DD phase residual is near zero; the
+    // largest one is named after its pair and bounds the RMS from above.
+    const auto nav = synthetic_rtk_scene::constellation();
+    const Vector3d base_position(6378137, 0, 0);
+    const Vector3d rover_position = base_position + Vector3d(40, 30, 10);
+    const auto prns = synthetic_rtk_scene::visible(
+        nav, synthetic_rtk_scene::epochTime(0), rover_position, 15);
+    ASSERT_GE(prns.size(), 6U);
+    RTKProcessor processor;
+    auto config = processor.getRTKConfig();
+    config.elevation_mask = 5 * M_PI / 180;
+    processor.setRTKConfig(config);
+    ProcessorConfig spp_config;
+    spp_config.elevation_mask = 5;
+    spp_config.use_ionosphere_model = false;
+    spp_config.use_troposphere_model = false;
+    ASSERT_TRUE(processor.initialize(spp_config));
+    processor.setBasePosition(base_position);
+    bool fixed_by_ar = false;
+    for (int epoch = 0; epoch < 10 && !fixed_by_ar; ++epoch) {
+        const auto time = synthetic_rtk_scene::epochTime(epoch);
+        const auto solution = processor.processRTKEpoch(
+            synthetic_rtk_scene::observations(nav, time, rover_position, 30, prns, 0),
+            synthetic_rtk_scene::observations(nav, time, base_position, 10, prns, 500), nav);
+        fixed_by_ar = solution.status == SolutionStatus::FIXED &&
+                      !processor.getLastDebugTelemetry().hold_fix_applied &&
+                      std::isfinite(processor.getLastDebugTelemetry().postfix_residual_rms);
+    }
+    ASSERT_TRUE(fixed_by_ar);
+    const auto& telemetry = processor.getLastDebugTelemetry();
+    ASSERT_TRUE(std::isfinite(telemetry.postfix_residual_max_abs_m));
+    EXPECT_LT(telemetry.postfix_residual_max_abs_m, 0.01);
+    EXPECT_GE(telemetry.postfix_residual_max_abs_m + 1e-12, telemetry.postfix_residual_rms);
+    EXPECT_EQ(telemetry.postfix_residual_max_pair.rfind("G", 0), 0U);
+    EXPECT_NE(telemetry.postfix_residual_max_pair.find("/L"), std::string::npos);
+}
+
+TEST(RTKHoldAmbiguityUpdateTest, LegacyHoldOverwritesInsteadOfConditioningTheState) {
+    // A held DD integer is information about the ambiguity differences. As a
+    // Kalman pseudo-observation (RTKLIB holdamb, 0.001 cycle^2) it moves the
+    // correlated position and keeps the posterior covariance consistent. The
+    // legacy hold writes the integer into the satellite state, zeroes that
+    // state's correlations (position included) and leaves the position alone.
+    const int n = Peer::kStateCount;
+    const std::vector<int> prns{1, 2, 3, 4};
+    std::vector<int> index;
+    for (const int prn : prns) {
+        index.push_back(Peer::ambiguityIndex(SatelliteId(GNSSSystem::GPS, prn), 0));
+    }
+    std::vector<int> active{0, 1, 2};
+    active.insert(active.end(), index.begin(), index.end());
+    Eigen::MatrixXd factor(active.size(), active.size());
+    for (int r = 0; r < factor.rows(); ++r) {
+        for (int c = 0; c < factor.cols(); ++c) {
+            factor(r, c) = 0.3 * std::sin(1.7 * r + 0.9 * c + 0.4) + (r == c ? 1.0 : 0.0);
+        }
+    }
+    const Eigen::MatrixXd active_covariance = factor * factor.transpose();
+    const std::vector<double> values{1.0, 2.0, 3.0, 100.3, 88.1, 120.6, 95.2};
+    VectorXd integers(3);
+    integers << 12.0, -20.0, 5.0;
+    auto prepare = [&](RTKProcessor& processor, bool kalman_update) {
+        auto config = processor.getRTKConfig();
+        config.hold_ambiguity_kalman_update = kalman_update;
+        processor.setRTKConfig(config);
+        auto& filter = Peer::filter_state_(processor);
+        filter.state = VectorXd::Zero(n);
+        filter.covariance = MatrixXd::Zero(n, n);
+        for (std::size_t r = 0; r < active.size(); ++r) {
+            filter.state(active[r]) = values[r];
+            for (std::size_t c = 0; c < active.size(); ++c) {
+                filter.covariance(active[r], active[c]) = active_covariance(r, c);
+            }
+        }
+        auto& pairs = Peer::last_dd_pairs_(processor);
+        pairs.clear();
+        for (std::size_t i = 1; i < prns.size(); ++i) {
+            pairs.push_back({SatelliteId(GNSSSystem::GPS, prns[0]), index[0], index[i],
+                             SatelliteId(GNSSSystem::GPS, prns[i]), 0});
+        }
+        Peer::last_best_subset_(processor) = {0, 1, 2};
+        Peer::last_dd_fixed_(processor) = integers;
+    };
+    RTKProcessor processor;
+    RTKProcessor conditioned;
+    prepare(processor, false);
+    prepare(conditioned, true);
+    const auto& filter = Peer::filter_state_(processor);
+
+    // Reference: one Kalman update with z = held DD, H = e_ref - e_sat.
+    MatrixXd H = MatrixXd::Zero(3, n);
+    for (int i = 0; i < 3; ++i) {
+        H(i, index[0]) = 1.0;
+        H(i, index[i + 1]) = -1.0;
+    }
+    const VectorXd x0 = filter.state;
+    const MatrixXd P0 = filter.covariance;
+    const MatrixXd S = H * P0 * H.transpose() + 0.001 * MatrixXd::Identity(3, 3);
+    const MatrixXd K = (S.ldlt().solve(H * P0)).transpose();
+    const VectorXd expected_state = x0 + K * (integers - H * x0);
+    const MatrixXd expected_covariance = P0 - K * (H * P0);
+    ASSERT_GT((expected_state.head<3>() - x0.head<3>()).norm(), 0.01);
+
+    Peer::applyHoldAmbiguity(conditioned);
+    const auto& updated = Peer::filter_state_(conditioned);
+    EXPECT_LT((updated.state - expected_state).cwiseAbs().maxCoeff(), 1e-9);
+    EXPECT_LT((updated.covariance - expected_covariance).cwiseAbs().maxCoeff(), 1e-9);
+
+    Peer::applyHoldAmbiguity(processor);
+    const auto& legacy = Peer::filter_state_(processor);
+    EXPECT_EQ(legacy.state.head<3>(), x0.head<3>());
+    for (int i = 0; i < 3; ++i) {
+        EXPECT_NEAR(legacy.state(index[0]) - legacy.state(index[i + 1]), integers(i), 1e-9);
+        EXPECT_DOUBLE_EQ(legacy.covariance(index[i + 1], 0), 0.0);
+        EXPECT_NE(expected_covariance(index[i + 1], 0), 0.0);
+    }
+}
+
+TEST(RTKFixHistoryJumpTest, MotionCompensationKeepsConsistentMovingFixes) {
+    // At 6 m/s and 10 Hz a correct next FIX is 0.6 m from the previous one.
+    // The stationary 0.2 m history check rejects it after three consecutive
+    // fixes; propagating the previous FIX by the Doppler velocity accepts it
+    // and still rejects a candidate 0.5 m off that motion.
+    const Vector3d base(6378137.0, 0.0, 0.0);
+    const GNSSTime previous(2032, 273700.0);
+    const GNSSTime now(2032, 273700.1);
+    auto check = [&](bool compensate, double along_track_m) {
+        RTKProcessor processor;
+        auto config = processor.getRTKConfig();
+        config.fix_history_motion_compensation = compensate;
+        processor.setRTKConfig(config);
+        processor.setBasePosition(base);
+        Peer::has_fixed_solution_(processor) = true;
+        Peer::fixed_baseline_(processor) = Vector3d(0.0, along_track_m, 0.0);
+        Peer::last_fixed_position_(processor) = base;
+        Peer::has_last_fixed_position_(processor) = true;
+        Peer::last_fixed_time_(processor) = previous;
+        Peer::has_last_fixed_time_(processor) = true;
+        Peer::consecutive_fix_count_(processor) = 3;
+        Peer::last_doppler_velocity_ecef_(processor) = Vector3d(0.0, 6.0, 0.0);
+        Peer::last_doppler_velocity_time_(processor) = previous;
+        Peer::has_last_doppler_velocity_(processor) = true;
+        const bool ok =
+            Peer::validateFixedSolution(processor, Peer::current_sat_data_(processor), now);
+        return std::make_pair(ok, processor.getLastDebugTelemetry().reject_reason);
+    };
+    EXPECT_EQ(check(false, 0.6), std::make_pair(false, std::string("fix_history_jump")));
+    EXPECT_TRUE(check(true, 0.6).first);
+    EXPECT_EQ(check(true, 1.1), std::make_pair(false, std::string("fix_history_jump")));
+    EXPECT_TRUE(check(false, 0.1).first);
+}
+
+TEST(RTKFixHistoryJumpTest, MotionCompensationKeepsConsistentFixesUnderMaxPositionJump) {
+    // At 13 m/s a vehicle is 14.3 m from its last FIX after 1.1 s. The
+    // absolute 5 m jump check against that stationary anchor (usable for
+    // 5 s) rejects every consistent candidate; propagating the anchor by the
+    // Doppler velocity accepts it, still rejects a candidate 6 m off that
+    // motion, and keeps the stationary anchor beyond the 2 s propagation.
+    const Vector3d base(6378137.0, 0.0, 0.0);
+    const GNSSTime previous(2032, 273505.7);
+    auto check = [&](bool compensate, double along_track_m, double dt_s) {
+        RTKProcessor processor;
+        auto config = processor.getRTKConfig();
+        config.max_fixed_anchor_age_s = 5.0;
+        config.max_position_jump_motion_compensation = compensate;
+        processor.setRTKConfig(config);
+        processor.setBasePosition(base);
+        Peer::has_fixed_solution_(processor) = true;
+        Peer::fixed_baseline_(processor) = Vector3d(0.0, along_track_m, 0.0);
+        Peer::last_fixed_position_(processor) = base;
+        Peer::has_last_fixed_position_(processor) = true;
+        Peer::last_fixed_time_(processor) = previous;
+        Peer::has_last_fixed_time_(processor) = true;
+        Peer::consecutive_fix_count_(processor) = 0;
+        Peer::last_doppler_velocity_ecef_(processor) = Vector3d(0.0, 13.0, 0.0);
+        Peer::last_doppler_velocity_time_(processor) = previous + (dt_s - 0.1);
+        Peer::has_last_doppler_velocity_(processor) = true;
+        const bool ok = Peer::validateFixedSolution(
+            processor, Peer::current_sat_data_(processor), previous + dt_s);
+        return std::make_pair(ok, processor.getLastDebugTelemetry().reject_reason);
+    };
+    EXPECT_EQ(check(false, 14.3, 1.1), std::make_pair(false, std::string("max_position_jump")));
+    EXPECT_TRUE(check(true, 14.3, 1.1).first);
+    EXPECT_EQ(check(true, 20.3, 1.1), std::make_pair(false, std::string("max_position_jump")));
+    EXPECT_EQ(check(true, 39.0, 3.0), std::make_pair(false, std::string("max_position_jump")));
+    EXPECT_TRUE(check(false, 4.0, 1.1).first);
+}
+
+TEST(RTKDopplerConsensusTest, FreshFixAnchorCannotBypassCurrentCandidateCheck) {
+    RTKProcessor processor;
+    auto config = processor.getRTKConfig();
+    config.max_fixed_anchor_age_s = 5.0;
+    config.max_fixed_doppler_consensus_m = 3.0;
+    processor.setRTKConfig(config);
+    const Vector3d base(6378137.0, 0.0, 0.0);
+    const GNSSTime time(2032, 273936.1);
+    processor.setBasePosition(base);
+    Peer::has_fixed_solution_(processor) = true;
+    Peer::fixed_baseline_(processor) = Vector3d(4.758, 0.0, 0.0);
+    Peer::last_fixed_position_(processor) = base;
+    Peer::has_last_fixed_position_(processor) = true;
+    Peer::last_fixed_time_(processor) = GNSSTime(2032, 273935.9);
+    Peer::has_last_fixed_time_(processor) = true;
+    Peer::has_doppler_continuity_position_(processor) = true;
+    Peer::doppler_continuity_position_ecef_(processor) = base;
+    Peer::doppler_continuity_time_(processor) = time;
+    // Early reacquisition, within the 5 m history limit, with a fresh anchor:
+    // the former conditional skipped the Doppler gate and accepted this jump.
+    EXPECT_FALSE(Peer::validateFixedSolution(processor, Peer::current_sat_data_(processor), time));
+    EXPECT_EQ(processor.getLastDebugTelemetry().reject_reason, "fixed_doppler_consensus");
+    EXPECT_NEAR(processor.getLastDebugTelemetry().fixed_candidate_doppler_consensus_distance_m,
+                4.758, 1e-8);
+
+    // A candidate that agrees with the current propagated position still passes.
+    Peer::fixed_baseline_(processor) = Vector3d(0.1, 0.0, 0.0);
+    EXPECT_TRUE(Peer::validateFixedSolution(processor, Peer::current_sat_data_(processor), time));
+}
+
+TEST(RTKDopplerConsensusTest, ExpiredAnchorDoesNotBlockMotionConsistentReacquisition) {
+    RTKProcessor processor;
+    auto config = processor.getRTKConfig();
+    config.max_fixed_anchor_age_s = 5.0;
+    config.max_fixed_doppler_consensus_m = 3.0;
+    processor.setRTKConfig(config);
+    const Vector3d base(6378137.0, 0.0, 0.0);
+    const GNSSTime time(2032, 273700.0);
+    processor.setBasePosition(base);
+    Peer::has_fixed_solution_(processor) = true;
+    Peer::fixed_baseline_(processor) = Vector3d(415.16, 0.0, 0.0);
+    Peer::last_fixed_position_(processor) = base;
+    Peer::has_last_fixed_position_(processor) = true;
+    Peer::last_fixed_time_(processor) = GNSSTime(2032, 273520.9);
+    Peer::has_last_fixed_time_(processor) = true;
+    Peer::consecutive_fix_count_(processor) = 10;
+    Peer::has_doppler_continuity_position_(processor) = true;
+    Peer::doppler_continuity_position_ecef_(processor) = base + Vector3d(415.0, 0.0, 0.0);
+    Peer::doppler_continuity_time_(processor) = time;
+    EXPECT_TRUE(Peer::validateFixedSolution(processor, Peer::current_sat_data_(processor), time));
+    // Disabling expiry reproduces the stationary-anchor lockout.
+    config.max_fixed_anchor_age_s = 0.0;
+    processor.setRTKConfig(config);
+    Peer::has_fixed_solution_(processor) = true;
+    Peer::fixed_baseline_(processor) = Vector3d(415.16, 0.0, 0.0);
+    Peer::last_fixed_position_(processor) = base;
+    Peer::has_last_fixed_position_(processor) = true;
+    EXPECT_FALSE(Peer::validateFixedSolution(processor, Peer::current_sat_data_(processor), time));
+}
+
+TEST(RTKDopplerConsensusTest, DriftedTrackLocksOutUntilItsAnchorExpires) {
+    // Odaiba CDM: after a long FIX gap the Doppler-integrated track is 7-11 m
+    // off, so it rejects every later candidate, all of them correct, for up to
+    // 2704 epochs; only an accepted FIX could re-anchor it. A track whose last
+    // anchor is older than max_fixed_doppler_consensus_age_s no longer vetoes.
+    RTKProcessor processor;
+    auto config = processor.getRTKConfig();
+    config.max_fixed_doppler_consensus_m = 3.0;
+    processor.setRTKConfig(config);
+    const Vector3d base(6378137.0, 0.0, 0.0);
+    const GNSSTime time(2032, 274250.0);
+    processor.setBasePosition(base);
+    auto validate = [&](double anchor_age_s) {
+        Peer::has_fixed_solution_(processor) = true;
+        Peer::fixed_baseline_(processor) = Vector3d::Zero();
+        Peer::has_doppler_continuity_position_(processor) = true;
+        Peer::doppler_continuity_position_ecef_(processor) = base + Vector3d(0.0, 9.0, 0.0);
+        Peer::doppler_continuity_time_(processor) = time;
+        Peer::doppler_continuity_anchor_time_(processor) = time - anchor_age_s;
+        const bool ok =
+            Peer::validateFixedSolution(processor, Peer::current_sat_data_(processor), time);
+        return std::make_pair(ok, processor.getLastDebugTelemetry().reject_reason);
+    };
+    // Legacy (no expiry): a 270 s old drifted track still vetoes.
+    EXPECT_EQ(validate(270.0), std::make_pair(false, std::string("fixed_doppler_consensus")));
+
+    config.max_fixed_doppler_consensus_age_s = 5.0;
+    processor.setRTKConfig(config);
+    EXPECT_TRUE(validate(270.0).first);
+    EXPECT_NEAR(processor.getLastDebugTelemetry().fixed_candidate_doppler_consensus_age_s, 270.0,
+                1e-6);
+    // A track re-anchored within the age limit keeps vetoing a disagreeing candidate.
+    EXPECT_EQ(validate(2.0), std::make_pair(false, std::string("fixed_doppler_consensus")));
+}
+
+TEST(RTKDopplerConsensusTest, StaleTrackRejectsButDisabledGateAndBootstrapRemainAvailable) {
+    RTKProcessor processor;
+    auto config = processor.getRTKConfig();
+    config.max_fixed_doppler_consensus_m = 3.0;
+    processor.setRTKConfig(config);
+    const Vector3d base(6378137.0, 0.0, 0.0);
+    const GNSSTime time(2300, 100.0);
+    processor.setBasePosition(base);
+    Peer::has_fixed_solution_(processor) = true;
+    Peer::fixed_baseline_(processor) = Vector3d::Zero();
+    Peer::has_doppler_continuity_position_(processor) = true;
+    Peer::doppler_continuity_position_ecef_(processor) = base;
+    Peer::doppler_continuity_time_(processor) = GNSSTime(2300, 99.9);
+    EXPECT_FALSE(Peer::validateFixedSolution(processor, Peer::current_sat_data_(processor), time));
+    EXPECT_EQ(processor.getLastDebugTelemetry().reject_reason, "fixed_doppler_stale");
+    Peer::doppler_continuity_time_(processor) = GNSSTime(2300, 100.1);
+    EXPECT_FALSE(Peer::validateFixedSolution(processor, Peer::current_sat_data_(processor), time));
+    Peer::doppler_continuity_time_(processor) = time;
+    Peer::doppler_continuity_position_ecef_(processor).x() =
+        std::numeric_limits<double>::quiet_NaN();
+    EXPECT_FALSE(Peer::validateFixedSolution(processor, Peer::current_sat_data_(processor), time));
+    EXPECT_EQ(processor.getLastDebugTelemetry().reject_reason, "fixed_doppler_consensus");
+    Peer::has_doppler_continuity_position_(processor) = false;
+    EXPECT_TRUE(Peer::validateFixedSolution(processor, Peer::current_sat_data_(processor), time));
+    config.max_fixed_doppler_consensus_m = 0.0;
+    processor.setRTKConfig(config);
+    Peer::has_fixed_solution_(processor) = true;
+    Peer::fixed_baseline_(processor) = Vector3d::Zero();
+    Peer::has_doppler_continuity_position_(processor) = true;
+    Peer::doppler_continuity_position_ecef_(processor) = base + Vector3d(100.0, 0.0, 0.0);
+    EXPECT_TRUE(Peer::validateFixedSolution(processor, Peer::current_sat_data_(processor), time));
+    config.max_fixed_doppler_consensus_m = 3.0;
+    config.position_mode = RTKProcessor::RTKConfig::PositionMode::MOVING_BASE;
+    processor.setRTKConfig(config);
+    EXPECT_TRUE(Peer::validateFixedSolution(processor, Peer::current_sat_data_(processor), time));
+}
 
 namespace {
 
@@ -1098,6 +1620,39 @@ TEST_F(RTKHoldFixUnchangedSetTest, AllCandidatesMatchedWithStaleHeldPairIsAccept
     EXPECT_EQ(Peer::last_num_fixed_ambiguities_(processor_), 4);
 }
 
+TEST_F(RTKHoldFixUnchangedSetTest, DopplerRejectionCannotMutateHeldOrTrustedFixState) {
+    dropSatellites(processor_, {6, 7, 8, 9});
+    auto config = processor_.getRTKConfig();
+    config.max_fixed_doppler_consensus_m = 3.0;
+    processor_.setRTKConfig(config);
+    const auto filter = Peer::filter_state_(processor_);
+    const auto pairs = Peer::last_dd_pairs_(processor_);
+    const auto subset = Peer::last_best_subset_(processor_);
+    const VectorXd integers = Peer::last_dd_fixed_(processor_);
+    const Vector3d previous = Peer::last_fixed_position_(processor_);
+    Peer::has_last_trusted_position_(processor_) = true;
+    Peer::last_trusted_position_(processor_) = previous;
+    Peer::has_doppler_continuity_position_(processor_) = true;
+    Peer::doppler_continuity_time_(processor_) = time_;
+    Peer::doppler_continuity_position_ecef_(processor_) = previous + Vector3d(5.0, 0.0, 0.0);
+    PositionSolution solution;
+    EXPECT_FALSE(Peer::tryHoldFix(processor_, Peer::current_sat_data_(processor_), time_, 5, solution));
+    EXPECT_EQ(processor_.getLastDebugTelemetry().hold_fix_reject_reason, "fixed_doppler_consensus");
+    EXPECT_FALSE(processor_.getLastDebugTelemetry().hold_fix_applied);
+    ASSERT_EQ(Peer::last_dd_fixed_(processor_).size(), integers.size());
+    EXPECT_EQ(Peer::last_dd_fixed_(processor_), integers);
+    EXPECT_EQ(Peer::last_best_subset_(processor_), subset);
+    EXPECT_EQ(Peer::last_fixed_position_(processor_), previous);
+    EXPECT_EQ(Peer::last_dd_pairs_(processor_).size(), pairs.size());
+    EXPECT_EQ(Peer::last_trusted_position_(processor_), previous);
+    EXPECT_TRUE(Peer::has_last_trusted_position_(processor_));
+    EXPECT_FALSE(Peer::has_fixed_solution_(processor_));
+    EXPECT_EQ(solution.status, SolutionStatus::NONE);
+    EXPECT_EQ(Peer::filter_state_(processor_).state, filter.state);
+    Peer::doppler_continuity_position_ecef_(processor_) = previous;
+    EXPECT_TRUE(Peer::tryHoldFix(processor_, Peer::current_sat_data_(processor_), time_, 5, solution));
+}
+
 TEST_F(RTKHoldFixUnchangedSetTest, FewerThanFourMatchedPairsStillRejectsWithItsOwnReason) {
     // Drop two held satellites from tracking: 2 held pairs remain, 6 new ones.
     dropSatellites(processor_, {4, 5});
@@ -1167,6 +1722,99 @@ TEST_F(RTKHoldFixDefaultTest, FewerThanFourMatchedPairsRejectsAsToday) {
     EXPECT_EQ(processor_.getLastDebugTelemetry().hold_fix_reject_reason, "matched_pairs_lt4");
     EXPECT_EQ(processor_.getLastDebugTelemetry().hold_fix_matched_pairs, 2);
     EXPECT_EQ(Peer::last_dd_pairs_(processor_).size(), pairs_before);
+}
+
+TEST_F(RTKHoldFixDefaultTest, HoldFixIgnoresAnInconsistentFloatUpdateUnlessItsNisLimitIsSet) {
+    // UrbanNav Shinjuku TOW 281650.1 under --preset urban: the float update NIS per
+    // observation jumps from 1 to 52.5, LAMBDA fails, and the hold fix that follows is
+    // 0.65 m off. The fixed-update NIS gate guards only AR candidates, so the hold path
+    // accepts it. hold_fix_max_update_nis_per_observation applies a limit to it.
+    dropSatellites(processor_, {6, 7, 8, 9});
+    Peer::current_update_diagnostics_(processor_).normalized_innovation_squared_per_observation = 52.5;
+    auto config = processor_.getRTKConfig();
+    config.max_fixed_update_nis_per_observation = 10.0;
+    processor_.setRTKConfig(config);
+    PositionSolution legacy;
+    EXPECT_TRUE(Peer::tryHoldFix(processor_, Peer::current_sat_data_(processor_), time_, 5, legacy));
+    EXPECT_TRUE(processor_.getLastDebugTelemetry().hold_fix_applied);
+
+    RTKProcessor limited;
+    buildScene(limited, false);
+    dropSatellites(limited, {6, 7, 8, 9});
+    config = limited.getRTKConfig();
+    config.hold_fix_max_update_nis_per_observation = 10.0;
+    limited.setRTKConfig(config);
+    Peer::current_update_diagnostics_(limited).normalized_innovation_squared_per_observation = 52.5;
+    const auto pairs = Peer::last_dd_pairs_(limited);
+    const auto subset = Peer::last_best_subset_(limited);
+    const VectorXd integers = Peer::last_dd_fixed_(limited);
+    const Vector3d previous = Peer::last_fixed_position_(limited);
+    PositionSolution rejected;
+    EXPECT_FALSE(Peer::tryHoldFix(limited, Peer::current_sat_data_(limited), time_, 5, rejected));
+    EXPECT_EQ(limited.getLastDebugTelemetry().hold_fix_reject_reason, "hold_fix_update_nis");
+    EXPECT_FALSE(limited.getLastDebugTelemetry().hold_fix_applied);
+    EXPECT_FALSE(Peer::has_fixed_solution_(limited));
+    EXPECT_EQ(rejected.status, SolutionStatus::NONE);
+    EXPECT_EQ(Peer::last_dd_fixed_(limited), integers);
+    EXPECT_EQ(Peer::last_best_subset_(limited), subset);
+    EXPECT_EQ(Peer::last_dd_pairs_(limited).size(), pairs.size());
+    EXPECT_EQ(Peer::last_fixed_position_(limited), previous);
+
+    // A consistent update keeps the hold fix, with the same position as without the limit.
+    Peer::current_update_diagnostics_(limited).normalized_innovation_squared_per_observation = 2.0;
+    PositionSolution accepted;
+    ASSERT_TRUE(Peer::tryHoldFix(limited, Peer::current_sat_data_(limited), time_, 5, accepted));
+    EXPECT_EQ(accepted.position_ecef, legacy.position_ecef);
+}
+
+TEST_F(RTKHoldFixDefaultTest, NisRejectedHoldKeepsTheHoldPathOpenOnlyWhenAsked) {
+    // Under --preset urban + --hold-fix-max-update-nis-per-obs 10 most of the lost correct
+    // fixes are later hold fixes that were never attempted: the NIS rejection made the epoch
+    // FLOAT, the FLOAT epoch reset the consecutive-fix run, and the hold path stayed closed
+    // until min_hold_count new AR fixes. hold_fix_update_nis_keeps_hold_run keeps it open.
+    for (const bool keep : {false, true}) {
+        SCOPED_TRACE(keep ? "keep hold run" : "legacy");
+        RTKProcessor processor;
+        buildScene(processor, false);
+        dropSatellites(processor, {6, 7, 8, 9});
+        auto config = processor.getRTKConfig();
+        config.hold_fix_max_update_nis_per_observation = 10.0;
+        config.hold_fix_update_nis_keeps_hold_run = keep;
+        processor.setRTKConfig(config);
+        Peer::current_update_diagnostics_(processor).normalized_innovation_squared_per_observation = 52.5;
+        PositionSolution rejected;
+        ASSERT_FALSE(Peer::tryHoldFix(processor, Peer::current_sat_data_(processor), time_, 5, rejected));
+        EXPECT_EQ(processor.getLastDebugTelemetry().hold_fix_reject_reason, "hold_fix_update_nis");
+        EXPECT_EQ(Peer::nis_suspended_hold_run_(processor), keep ? 5 : 0);
+
+        // The FLOAT epoch resets the run; the next update is consistent again.
+        Peer::consecutive_fix_count_(processor) = 0;
+        Peer::current_update_diagnostics_(processor).normalized_innovation_squared_per_observation = 2.0;
+        PositionSolution next;
+        EXPECT_EQ(Peer::tryHoldFix(processor, Peer::current_sat_data_(processor), time_, 5, next), keep);
+        if (!keep) {
+            EXPECT_EQ(processor.getLastDebugTelemetry().hold_fix_reject_reason, "preconditions");
+        }
+    }
+}
+
+TEST_F(RTKHoldFixDefaultTest, KeptHoldRunEndsAtAnyOtherHoldRejection) {
+    dropSatellites(processor_, {6, 7, 8, 9});
+    auto config = processor_.getRTKConfig();
+    config.hold_fix_max_update_nis_per_observation = 10.0;
+    config.hold_fix_update_nis_keeps_hold_run = true;
+    processor_.setRTKConfig(config);
+    Peer::consecutive_fix_count_(processor_) = 0;
+    Peer::nis_suspended_hold_run_(processor_) = 5;
+    // The last FIX is 2 m away: the 1 m hold jump limit rejects, and the kept run ends.
+    Peer::last_fixed_position_(processor_) += Vector3d(2.0, 0.0, 0.0);
+    PositionSolution solution;
+    EXPECT_FALSE(Peer::tryHoldFix(processor_, Peer::current_sat_data_(processor_), time_, 5, solution));
+    EXPECT_EQ(processor_.getLastDebugTelemetry().hold_fix_reject_reason, "position_jump");
+    EXPECT_EQ(Peer::nis_suspended_hold_run_(processor_), 0);
+    PositionSolution again;
+    EXPECT_FALSE(Peer::tryHoldFix(processor_, Peer::current_sat_data_(processor_), time_, 5, again));
+    EXPECT_EQ(processor_.getLastDebugTelemetry().hold_fix_reject_reason, "preconditions");
 }
 
 TEST_F(RTKHoldFixDefaultTest, AllCandidatesMatchedGivesTheSameResultWithTheOptionOnOrOff) {
@@ -1479,7 +2127,13 @@ protected:
         Peer::has_fixed_solution_(processor) = true;
 
         Outcome out;
+        const VectorXd float_state_before_ar = fs.state;
+        const MatrixXd float_covariance_before_ar = fs.covariance;
         out.resolved = Peer::resolveAmbiguities(processor, pairs);
+        // Integer search produces a candidate; it must not commit a conditional
+        // update to the FLOAT filter before the acceptance gates run.
+        EXPECT_EQ(fs.state, float_state_before_ar);
+        EXPECT_EQ(fs.covariance, float_covariance_before_ar);
         out.has_fixed_solution = Peer::has_fixed_solution_(processor);
         out.fixed_baseline = Peer::fixed_baseline_(processor);
         for (const auto& pair : Peer::last_dd_pairs_(processor)) {
@@ -1869,6 +2523,11 @@ TEST(RTKLegacyCompatibilityStandaloneTest, HoldFixUnchangedSetOnlyDefaultOffAndC
     off.hold_fix_unchanged_set_only = false;
     processor.setRTKConfig(off);
     EXPECT_FALSE(processor.getRTKConfig().hold_fix_unchanged_set_only);
+}
+
+TEST(RTKLegacyCompatibilityStandaloneTest, HoldFixUpdateNisLimitDefaultsOff) {
+    EXPECT_EQ(RTKProcessor::RTKConfig{}.hold_fix_max_update_nis_per_observation, 0.0);
+    EXPECT_FALSE(RTKProcessor::RTKConfig{}.hold_fix_update_nis_keeps_hold_run);
 }
 
 TEST(RTKLegacyCompatibilityStandaloneTest, HoldFixMinMatchedPairsDefaultsToTheLegacyFloorAndIsConfigurable) {

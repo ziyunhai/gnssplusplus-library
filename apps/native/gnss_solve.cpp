@@ -82,7 +82,8 @@ enum class RTKTuningPreset {
     SURVEY,
     LOW_COST,
     MOVING_BASE,
-    ODAIBA
+    ODAIBA,
+    URBAN
 };
 
 struct SolveConfig {
@@ -94,6 +95,7 @@ struct SolveConfig {
     std::string output_kml_path = "output/rtk_solution.kml";
     bool write_kml = true;
     bool enable_base_interpolation = true;
+    bool base_interpolation_curvature = false;
     bool verbose = false;
     bool base_position_override = false;
     Eigen::Vector3d base_position_ecef = Eigen::Vector3d::Zero();
@@ -136,7 +138,13 @@ struct SolveConfig {
     int min_hold_count = 5;
     double hold_ratio_threshold = 2.0;
     bool hold_fix_unchanged_set = false;
+    bool kf_relinearize_from_epoch_prior = false;
+    bool hold_ambiguity_kalman_update = false;
+    bool fix_history_motion_compensation = false;
+    bool max_position_jump_motion_compensation = false;
     int hold_fix_min_matched_pairs = 4;
+    double hold_fix_max_update_nis_per_observation = 0.0;
+    bool hold_fix_update_nis_keeps_hold_run = false;
     int min_fix_satellites = 0;
     double elevation_mask_deg = 15.0;
     double process_noise_position = 1e-4;
@@ -206,12 +214,18 @@ struct SolveConfig {
     bool max_position_jump_min_m_set = false;
     bool max_position_jump_rate_mps_set = false;
     bool min_full_ratio_for_subset_ar_set = false;
+    bool low_ratio_guard_threshold_set = false;
+    bool low_ratio_min_fixed_ambiguities_set = false;
+    bool max_fixed_anchor_age_s_set = false;
+    bool max_fixed_doppler_consensus_m_set = false;
+    bool max_fixed_doppler_consensus_age_s_set = false;
     libgnss::RTKProcessor::RTKConfig::ARPolicy ar_policy =
         libgnss::RTKProcessor::RTKConfig::ARPolicy::EXTENDED;
     double max_hold_divergence_m = 0.0;
     double max_position_jump_m = 5.0;
     double max_fixed_anchor_age_s = 0.0;
     double max_fixed_doppler_consensus_m = 0.0;
+    double max_fixed_doppler_consensus_age_s = 0.0;
     double max_position_jump_min_m = 0.0;
     double max_position_jump_rate_mps = 0.0;
     double max_float_spp_divergence_m = 0.0;
@@ -1089,7 +1103,11 @@ public:
               << "float_update_student_t_downweighted_rows,"
               << "float_update_student_t_minimum_weight,"
               << "float_update_student_t_mean_weight,"
-              << "float_position_covariance_trace_m2\n";
+              << "float_position_covariance_trace_m2,"
+              << "lambda_shadow_max_abs_z,lambda_shadow_max_z_pair,"
+              << "lambda_shadow_max_z_lock_count,lambda_shadow_pairs_abs_z_gt3,"
+              << "postfix_residual_max_abs_m,postfix_residual_max_pair,"
+              << "fixed_candidate_doppler_consensus_age_s\n";
         return true;
     }
 
@@ -1451,6 +1469,14 @@ public:
         writeNumber(telemetry.float_update_student_t_mean_weight);
         file_ << ",";
         writeNumber(telemetry.float_position_covariance_trace_m2);
+        file_ << ",";
+        writeNumber(telemetry.lambda_shadow_max_abs_z);
+        file_ << "," << telemetry.lambda_shadow_max_z_pair << ","
+              << telemetry.lambda_shadow_max_z_lock_count << ","
+              << telemetry.lambda_shadow_pairs_abs_z_gt3 << ",";
+        writeNumber(telemetry.postfix_residual_max_abs_m);
+        file_ << "," << telemetry.postfix_residual_max_pair << ",";
+        writeNumber(telemetry.fixed_candidate_doppler_consensus_age_s);
         file_ << "\n";
         file_.flush();
     }
@@ -1479,7 +1505,7 @@ void printUsage(const char* program_name) {
         << "  --nav <file>            Navigation RINEX file\n\n"
         << "Common options:\n"
         << "  --config <path>         Load flat TOML defaults; CLI options override them\n"
-        << "  --preset <name>         survey|low-cost|moving-base|odaiba\n"
+        << "  --preset <name>         survey|low-cost|moving-base|odaiba|urban\n"
         << "  --mode <name>           auto|kinematic|static|moving-base\n"
         << "  --iono <name>           auto|off|iflc|est\n"
         << "  --ratio <value>         Ambiguity ratio threshold\n"
@@ -1512,7 +1538,7 @@ void printAdvancedUsage(const char* program_name) {
         << "                             Position mode (default: auto)\n"
         << "  --iono <auto|off|iflc|est> Ionosphere option (default: auto)\n"
         << "  --ratio <value|sat-count>  Fixed or satellite-count-aware Ratio threshold\n"
-        << "  --preset <survey|low-cost|moving-base|odaiba>\n"
+        << "  --preset <survey|low-cost|moving-base|odaiba|urban>\n"
         << "                             Apply a named RTK tuning preset\n"
         << "  --rtk-reported-covariance <legacy|filter|first-pass|spp-consistency>\n"
         << "                             Covariance reported on RTK FLOAT epochs (default: legacy\n"
@@ -1549,8 +1575,25 @@ void printAdvancedUsage(const char* program_name) {
         << "  --min-hold-count <n>       Consecutive fixes before hold ambiguity is allowed (default: 5)\n"
         << "  --hold-ratio-threshold <v> Ratio threshold used while hold ambiguity is active (default: 2.0)\n"
         << "  --hold-fix-unchanged-set   Reject the hold-fix fallback when a DD pair has no held integer (default: off)\n"
+        << "  --kf-relinearize-from-prior\n"
+        << "                             Apply relinearized KF passes to the epoch prior instead\n"
+        << "                             of re-counting rows on the posterior (default: off)\n"
+        << "  --fix-history-motion-compensation\n"
+        << "                             Propagate the last FIX by Doppler velocity in the\n"
+        << "                             consecutive-FIX 0.2 m history check (default: off)\n"
+        << "  --max-position-jump-motion-compensation\n"
+        << "                             Propagate the last FIX the same way in the absolute\n"
+        << "                             max position jump check (default: off)\n"
+        << "  --hold-kalman-update       Apply held DD integers as a Kalman pseudo-observation\n"
+        << "                             instead of overwriting the ambiguities (default: off)\n"
         << "  --hold-fix-min-matched-pairs <n>\n"
         << "                             Min held DD pairs for the hold-fix fallback (default: 4)\n"
+        << "  --hold-fix-max-update-nis-per-obs <v>\n"
+        << "                             Reject a hold fix when the float update NIS per observation\n"
+        << "                             exceeds v (default: 0 = off)\n"
+        << "  --hold-fix-update-nis-keeps-hold-run\n"
+        << "                             After such a rejection keep the hold-fix fallback available\n"
+        << "                             instead of restarting the fix run (default: off)\n"
         << "  --min-fix-satellites <k>\n"
         << "                             Min non-reference satellites in an ambiguity-resolution FIX (default: 0 = off)\n"
         << "  --elevation-mask-deg <v>   Elevation mask in degrees (default: 15)\n"
@@ -1609,8 +1652,11 @@ void printAdvancedUsage(const char* program_name) {
         << "  --max-fixed-anchor-age <s> Expire the last-FIX jump reference after s seconds\n"
         << "                             (default: 0, disabled)\n"
         << "  --max-fixed-doppler-consensus <m>\n"
-        << "                             Max FIX distance from Doppler-integrated track\n"
+        << "                             Max AR/hold FIX distance from current Doppler track\n"
         << "                             (default: 0, disabled)\n"
+        << "  --max-fixed-doppler-consensus-age <s>\n"
+        << "                             Stop the Doppler track vetoing s seconds after an\n"
+        << "                             accepted FIX last re-anchored it (default: 0, no limit)\n"
         << "  --max-pos-jump-min <v>     Min adaptive AR fix jump in meters (default: 0)\n"
         << "  --max-pos-jump-rate <v>    Max adaptive AR fix jump rate in m/s\n"
         << "                             (default: 0, disabled)\n"
@@ -2056,6 +2102,9 @@ void printAdvancedUsage(const char* program_name) {
         << "  --student-t-rtk-front-end  Enable Student-t(nu=4) DD covariance inflation (default: off)\n"
         << "  --no-kinematic-post-filter Disable the kinematic output post-filter\n"
         << "  --no-base-interp           Require exact rover/base epoch alignment\n"
+        << "  --base-interp-curvature    Evaluate the modeled base range at the rover epoch when\n"
+        << "                             interpolating the base (keeps the range curvature;\n"
+        << "                             default: off)\n"
         << "  --verbose                  Print per-epoch progress summary\n"
         << "  -h, --help                 Show concise everyday-use help\n"
         << "  --help-advanced            Show this complete option reference\n";
@@ -2113,6 +2162,7 @@ RTKTuningPreset parseRTKTuningPreset(const std::string& value, const char* progr
     if (value == "low-cost") return RTKTuningPreset::LOW_COST;
     if (value == "moving-base") return RTKTuningPreset::MOVING_BASE;
     if (value == "odaiba") return RTKTuningPreset::ODAIBA;
+    if (value == "urban") return RTKTuningPreset::URBAN;
     argumentError("unsupported --preset value: " + value, program_name);
 }
 
@@ -2181,6 +2231,29 @@ void applyRTKTuningPreset(SolveConfig& config) {
                 config.max_float_prefit_residual_max_m = 10.0;
             if (!config.max_float_prefit_residual_reset_streak_set)
                 config.max_float_prefit_residual_reset_streak = 5;
+            return;
+        case RTKTuningPreset::URBAN:
+            // The CDME recipe on top of the default profile
+            // (docs/rtk_doppler_consensus_age.md): a FIX anchor expires after
+            // 5 s, a fixed candidate must agree within 3 m with a Doppler track
+            // that itself expires 5 s after its last FIX, AR needs at least 10
+            // fixed ambiguities, and the fix-history and position-jump gates
+            // allow for the rover's motion. More FIX than RTKLIB demo5 with no
+            // more wrong FIX on the UrbanNav Tokyo and PPC runs, but more
+            // 0.5-2 m wrong FIX and missing epochs than the default.
+            if (!config.max_fixed_anchor_age_s_set) config.max_fixed_anchor_age_s = 5.0;
+            if (!config.max_fixed_doppler_consensus_m_set) {
+                config.max_fixed_doppler_consensus_m = 3.0;
+            }
+            if (!config.max_fixed_doppler_consensus_age_s_set) {
+                config.max_fixed_doppler_consensus_age_s = 5.0;
+            }
+            if (!config.low_ratio_guard_threshold_set) config.low_ratio_guard_threshold = 1e9;
+            if (!config.low_ratio_min_fixed_ambiguities_set) {
+                config.low_ratio_min_fixed_ambiguities = 10;
+            }
+            config.fix_history_motion_compensation = true;
+            config.max_position_jump_motion_compensation = true;
             return;
         case RTKTuningPreset::MOVING_BASE:
             if (!config.ratio_threshold_set) config.ratio_threshold = 2.8;
@@ -2301,10 +2374,17 @@ SolveConfig parseArguments(int argc, char* argv[]) {
         }
         if (arg == "--max-fixed-anchor-age" && i + 1 < argc) {
             config.max_fixed_anchor_age_s = std::stod(argv[++i]);
+            config.max_fixed_anchor_age_s_set = true;
             continue;
         }
         if (arg == "--max-fixed-doppler-consensus" && i + 1 < argc) {
             config.max_fixed_doppler_consensus_m = std::stod(argv[++i]);
+            config.max_fixed_doppler_consensus_m_set = true;
+            continue;
+        }
+        if (arg == "--max-fixed-doppler-consensus-age" && i + 1 < argc) {
+            config.max_fixed_doppler_consensus_age_s = std::stod(argv[++i]);
+            config.max_fixed_doppler_consensus_age_s_set = true;
             continue;
         }
         if (arg == "--min-fixed-prefit-outliers" && i + 1 < argc) {
@@ -2464,10 +2544,12 @@ SolveConfig parseArguments(int argc, char* argv[]) {
         }
         if (arg == "--low-ratio-guard-threshold" && i + 1 < argc) {
             config.low_ratio_guard_threshold = std::stod(argv[++i]);
+            config.low_ratio_guard_threshold_set = true;
             continue;
         }
         if (arg == "--low-ratio-min-fixed-ambiguities" && i + 1 < argc) {
             config.low_ratio_min_fixed_ambiguities = std::stoi(argv[++i]);
+            config.low_ratio_min_fixed_ambiguities_set = true;
             continue;
         }
         if (arg == "--low-count-rescue-ratio" && i + 1 < argc) {
@@ -2561,12 +2643,36 @@ SolveConfig parseArguments(int argc, char* argv[]) {
             config.pos_fix_diagnostics = true;
             continue;
         }
+        if (arg == "--fix-history-motion-compensation") {
+            config.fix_history_motion_compensation = true;
+            continue;
+        }
+        if (arg == "--max-position-jump-motion-compensation") {
+            config.max_position_jump_motion_compensation = true;
+            continue;
+        }
+        if (arg == "--hold-kalman-update") {
+            config.hold_ambiguity_kalman_update = true;
+            continue;
+        }
+        if (arg == "--kf-relinearize-from-prior") {
+            config.kf_relinearize_from_epoch_prior = true;
+            continue;
+        }
         if (arg == "--hold-fix-unchanged-set") {
             config.hold_fix_unchanged_set = true;
             continue;
         }
         if (arg == "--hold-fix-min-matched-pairs" && i + 1 < argc) {
             config.hold_fix_min_matched_pairs = std::stoi(argv[++i]);
+            continue;
+        }
+        if (arg == "--hold-fix-max-update-nis-per-obs" && i + 1 < argc) {
+            config.hold_fix_max_update_nis_per_observation = std::stod(argv[++i]);
+            continue;
+        }
+        if (arg == "--hold-fix-update-nis-keeps-hold-run") {
+            config.hold_fix_update_nis_keeps_hold_run = true;
             continue;
         }
         if (arg == "--min-fix-satellites" && i + 1 < argc) {
@@ -2972,6 +3078,8 @@ SolveConfig parseArguments(int argc, char* argv[]) {
             config.enable_kinematic_post_filter = false;
         } else if (arg == "--no-base-interp") {
             config.enable_base_interpolation = false;
+        } else if (arg == "--base-interp-curvature") {
+            config.base_interpolation_curvature = true;
         } else if (arg == "--verbose") {
             config.verbose = true;
         } else {
@@ -3120,6 +3228,9 @@ SolveConfig parseArguments(int argc, char* argv[]) {
     if (config.hold_fix_min_matched_pairs < 4) {
         argumentError("--hold-fix-min-matched-pairs must be >= 4", argv[0]);
     }
+    if (config.hold_fix_max_update_nis_per_observation < 0.0) {
+        argumentError("--hold-fix-max-update-nis-per-obs must be >= 0", argv[0]);
+    }
     if (config.min_fix_satellites < 0) {
         argumentError("--min-fix-satellites must be >= 0", argv[0]);
     }
@@ -3161,6 +3272,9 @@ SolveConfig parseArguments(int argc, char* argv[]) {
     }
     if (config.max_fixed_doppler_consensus_m < 0.0) {
         argumentError("--max-fixed-doppler-consensus must be >= 0", argv[0]);
+    }
+    if (config.max_fixed_doppler_consensus_age_s < 0.0) {
+        argumentError("--max-fixed-doppler-consensus-age must be >= 0", argv[0]);
     }
     if (config.max_position_jump_min_m < 0.0) {
         argumentError("--max-pos-jump-min must be >= 0", argv[0]);
@@ -3740,7 +3854,15 @@ int main(int argc, char* argv[]) {
         rtk_config.min_full_ratio_for_subset_ar = config.min_full_ratio_for_subset_ar;
         rtk_config.min_hold_count = config.min_hold_count;
         rtk_config.hold_fix_unchanged_set_only = config.hold_fix_unchanged_set;
+        rtk_config.kf_relinearize_from_epoch_prior = config.kf_relinearize_from_epoch_prior;
+        rtk_config.hold_ambiguity_kalman_update = config.hold_ambiguity_kalman_update;
+        rtk_config.fix_history_motion_compensation = config.fix_history_motion_compensation;
+        rtk_config.max_position_jump_motion_compensation =
+            config.max_position_jump_motion_compensation;
         rtk_config.hold_fix_min_matched_pairs = config.hold_fix_min_matched_pairs;
+        rtk_config.hold_fix_max_update_nis_per_observation =
+            config.hold_fix_max_update_nis_per_observation;
+        rtk_config.hold_fix_update_nis_keeps_hold_run = config.hold_fix_update_nis_keeps_hold_run;
         rtk_config.min_fix_satellites = config.min_fix_satellites;
         rtk_config.elevation_mask = config.elevation_mask_deg * M_PI / 180.0;
         if (config.process_noise_position_set) {
@@ -3793,6 +3915,7 @@ int main(int argc, char* argv[]) {
         rtk_config.max_position_jump_m = config.max_position_jump_m;
         rtk_config.max_fixed_anchor_age_s = config.max_fixed_anchor_age_s;
         rtk_config.max_fixed_doppler_consensus_m = config.max_fixed_doppler_consensus_m;
+        rtk_config.max_fixed_doppler_consensus_age_s = config.max_fixed_doppler_consensus_age_s;
         rtk_config.max_position_jump_min_m = config.max_position_jump_min_m;
         rtk_config.max_position_jump_rate_mps = config.max_position_jump_rate_mps;
         rtk_config.max_float_spp_divergence_m = config.max_float_spp_divergence_m;
@@ -4050,7 +4173,33 @@ int main(int argc, char* argv[]) {
                   << " m/MHz, L2 ICB " << config.glonass_icb_l2_m_per_mhz << " m/MHz)"
                   << std::endl;
         std::cout << "  base interpolation: "
-                  << (config.enable_base_interpolation ? "enabled" : "disabled") << std::endl;
+                  << (config.enable_base_interpolation ? "enabled" : "disabled")
+                  << (config.enable_base_interpolation && config.base_interpolation_curvature
+                          ? " (modeled range at the rover epoch)" : "")
+                  << std::endl;
+        if (config.max_fixed_anchor_age_s > 0.0 || config.max_fixed_doppler_consensus_m > 0.0 ||
+            config.low_ratio_min_fixed_ambiguities > 0 || config.fix_history_motion_compensation ||
+            config.max_position_jump_motion_compensation) {
+            const auto limit = [](double value, const char* unit) {
+                std::ostringstream text;
+                if (value > 0.0) {
+                    text << value << ' ' << unit;
+                } else {
+                    text << "off";
+                }
+                return text.str();
+            };
+            std::cout << "  fix recovery: anchor age " << limit(config.max_fixed_anchor_age_s, "s")
+                      << ", Doppler consensus " << limit(config.max_fixed_doppler_consensus_m, "m")
+                      << ", consensus track age "
+                      << limit(config.max_fixed_doppler_consensus_age_s, "s")
+                      << ", low-ratio floor " << config.low_ratio_min_fixed_ambiguities
+                      << " ambiguities below ratio " << config.low_ratio_guard_threshold
+                      << ", motion compensation history "
+                      << (config.fix_history_motion_compensation ? "on" : "off") << ", jump "
+                      << (config.max_position_jump_motion_compensation ? "on" : "off")
+                      << std::endl;
+        }
         if (integrity_gate) {
             std::cout << "  real-time FIX integrity: enabled (max latency "
                       << integrity_gate->maxOutputLatencyEpochs() << " epochs, consensus "
@@ -4243,7 +4392,8 @@ int main(int argc, char* argv[]) {
                        timeDiffSeconds(rover_obs.time, lower_base_obs.time) >= -kExactTimeToleranceSeconds &&
                        timeDiffSeconds(base_obs.time, rover_obs.time) >= -kExactTimeToleranceSeconds &&
                        interpolateBaseEpoch(lower_base_obs, base_obs, rover_obs.time,
-                                            base_position, nav_data, aligned_base_obs)) {
+                                            base_position, nav_data, aligned_base_obs,
+                                            config.base_interpolation_curvature)) {
                 interpolated_base_epochs++;
                 have_aligned_base = true;
                 used_interpolated_base = true;

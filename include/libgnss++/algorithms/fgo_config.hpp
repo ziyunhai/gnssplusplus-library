@@ -4,6 +4,7 @@
 #include <libgnss++/algorithms/native_imu_stop_phase.hpp>
 #include <libgnss++/algorithms/native_imu_observation_phase.hpp>
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -292,6 +293,15 @@ struct Config {
         bool use_source_tdcp_resl_observable = false;
         bool use_native_tdcp_only_affine_geometry = false;
         bool use_native_epoch_heading_attitude_seeds = false;
+        // Opt-in IMU attitude seeds: yaw = GNSS-first course + this phone
+        // mount yaw (rad, Rot3::yaw convention); roll/pitch keep the aligned
+        // initial attitude.  Needs imu.stop_velocity_seeds_nav per epoch.
+        bool use_native_course_attitude_seeds = false;
+        double native_course_attitude_seed_mount_rad = 0.0;
+        // Raw Android UTC keys whose HardwareClockDiscontinuityCount changed
+        // (hardware_clock_reset::utcKeys, strictly increasing).  The edge into
+        // each listed epoch is a clock jump; empty keeps the default detector.
+        std::vector<std::int64_t> hardware_clock_reset_raw_utc_millis;
         bool omit_native_first_imu_bias_prior = false;
         bool omit_native_first_imu_velocity_prior = false;
         // Same-run GNSS-first relative local-up pairs; never enabled by default.

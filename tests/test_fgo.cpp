@@ -8,6 +8,8 @@
 #include <libgnss++/algorithms/pseudorange_remasking.hpp>
 #include <libgnss++/algorithms/fgo_quality_anchor.hpp>
 #include <libgnss++/algorithms/fgo_ddpr_gnc.hpp>
+#include <libgnss++/algorithms/course_attitude_seeds.hpp>
+#include <libgnss++/algorithms/hardware_clock_reset.hpp>
 #include <libgnss++/algorithms/pdc_state_bridge.hpp>
 #include <libgnss++/algorithms/residual_ionosphere_contract.hpp>
 #include <libgnss++/algorithms/tdcp_contract.hpp>
@@ -1275,6 +1277,57 @@ TEST(FGORefinementBuilderTest, KeepsFirstAndPostGapDopplerWithIndependentClockDr
     ASSERT_EQ(masked.undifferenced_doppler_factors.size(),2U);
     EXPECT_EQ(masked.undifferenced_doppler_factors[0].epoch_index,0U);
     EXPECT_EQ(masked.undifferenced_doppler_factors[1].epoch_index,2U);
+}
+
+TEST(HardwareClockResetTest, ReportsEpochsWhoseDiscontinuityCountChanges) {
+    namespace hcr=libgnss::hardware_clock_reset;
+    EXPECT_TRUE(hcr::utcKeys({5,5,5},{1000,2000,3000}).empty());
+    EXPECT_EQ(hcr::utcKeys({5,5,6,6,7},{1000,2000,3000,4000,5000}),
+              (std::vector<std::int64_t>{3000,5000}));
+    EXPECT_THROW(hcr::utcKeys({5,6},{1000}),std::invalid_argument);
+    EXPECT_THROW(hcr::utcKeys({5,6},{2000,2000}),std::invalid_argument);
+}
+
+TEST(HardwareClockResetTest, MarksOnlyListedRawEpochsAsClockJumps) {
+    // A loader reference rebase leaves the GPS pseudorange delta far below
+    // the 100 km detector; only the configured raw UTC key becomes a jump.
+    const auto nav=makeSyntheticGpsNavigation(1);
+    const Vector3d receiver(1113194.0,-4841695.0,3985350.0);
+    std::vector<ObservationData> raw;
+    for (std::size_t i=0;i<3;++i) {
+        ObservationData epoch(GNSSTime(2300,100100.0+i));
+        epoch.receiver_position=receiver; epoch.receiver_clock_drift_mps=0;
+        epoch.raw_source_index=i; epoch.raw_utc_time_millis=1700000000000LL+1000*static_cast<std::int64_t>(i);
+        Observation obs;
+        ASSERT_TRUE(makeSyntheticGpsL1Observation(nav,SatelliteId(GNSSSystem::GPS,1),epoch.time,receiver,0,obs));
+        if (i==2) obs.pseudorange+=194.0;
+        epoch.observations.push_back(obs); raw.push_back(epoch);
+    }
+    FGOProcessor::FGOConfig config;
+    config.use_spp_seed=false; config.use_tdcp_factors=false;
+    config.retain_sparse_epochs_for_imu=true; config.min_satellites_per_epoch=0;
+    const auto plain=FGOProcessor(config).buildPseudorangeProblem(raw,nav);
+    ASSERT_EQ(plain.clock_jumps.size(),3U);
+    EXPECT_EQ(plain.clock_jumps,(std::vector<bool>{false,false,false}));
+    config.hardware_clock_reset_raw_utc_millis={raw[2].raw_utc_time_millis};
+    const auto reset=FGOProcessor(config).buildPseudorangeProblem(raw,nav);
+    ASSERT_EQ(reset.clock_jumps.size(),3U);
+    EXPECT_EQ(reset.clock_jumps,(std::vector<bool>{false,false,true}));
+}
+
+TEST(CourseAttitudeSeedsTest, FillsSlowEpochsFromTheNearestMovingCourse) {
+    namespace cas=libgnss::course_attitude_seeds;
+    const std::vector<Eigen::Vector3d> v{
+        {0.0,1.0,0.0},{0.0,10.0,0.0},{1.0,0.5,0.0},{-10.0,0.0,0.5},{0.0,0.0,0.0}};
+    const auto course=cas::filledCourse(v);
+    ASSERT_EQ(course.size(),5U);
+    EXPECT_DOUBLE_EQ(course[0],M_PI/2);  // leading slow epoch takes the first moving course
+    EXPECT_DOUBLE_EQ(course[1],M_PI/2);  // north
+    EXPECT_DOUBLE_EQ(course[2],M_PI/2);  // slow: previous moving course
+    EXPECT_DOUBLE_EQ(course[3],M_PI);    // west
+    EXPECT_DOUBLE_EQ(course[4],M_PI);
+    EXPECT_THROW(cas::filledCourse({{0.0,1.0,0.0}}),std::invalid_argument);
+    EXPECT_THROW(cas::filledCourse({{std::nan(""),10.0,0.0}}),std::invalid_argument);
 }
 
 TEST(FGORefinementBuilderTest, EstimatesDriftBeforeRejectingRowsUsingUnobservedSeeds) {

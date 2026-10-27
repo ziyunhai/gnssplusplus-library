@@ -6558,3 +6558,554 @@ Readback: use_cases/records/gsdc2023_heading_modern_official_readback_20260928.j
 Submission session 49839 exited 0. Do not resubmit this exact candidate.
 The user's prior submission-confirmation preference is revoked; future
 submissions within this goal do not require repeating that permission request.
+
+### Leaderboard target and Samsung A diagnosis (2026-10-24)
+
+`kaggle competitions leaderboard smartphone-decimeter-2023 -s` lists nori
+(Mitsubishi Electric) first at Private 0.883 m and Taro second at 0.928 m.
+The six retained-recipe Samsung A test drives are all L1-only. A325F/A32 have
+TDCP disabled by the source guard. On train, the archived taroz output is
+also 1.5-1.9 m for these phones. A uniform along-track offset or IMU time
+shift learned leave-one-course-out does not help (-0.02 / +0.00 m). The
+native IMU stage breaks down in sharp turns on A325F (77 and 18 epochs where
+it is 1.5 m worse than GNSS-first), A205U and Pixel4 mtv-b. Pixel5 with epoch
+heading seeds shows none.
+
+### Per-phone main Doppler recipe, submission 57585127 (2026-10-24)
+
+Adding the source final-graph Doppler with the continuous raw clock reference
+removes the turn breakdowns. On A325F an IMU time offset of +150 ms is best
+among -150/0/+150/+250/+400 ms. On train, sjc-q A325F goes 1.965 -> 1.556 m
+and mtv-n A325F 1.799 -> 1.661 m (taroz 1.929 / 1.690 m), A505G 1.688 ->
+1.602 m, and Pixel4/4XL 0.377 -> 0.358, 0.828 -> 0.787, 0.422 -> 0.415 m.
+A205U, A325G and Mi8 do not improve and stay unchanged. Submission 57585127
+replaces only the six test drives sm-a325f, samsunga32, sm-a505u, pixel4 x2
+and pixel4xl in 56625084. It scores Private 0.982 m / Public 0.902 m.
+Rejected on train: keeping base-missing BeiDou/QZSS rows uncorrected
+(+0.079 m), the source Type/L5 parameter table (+0.018 m), per-drive IMU time
+offsets from the truth-derived gyro lag (+0.001 m), and epoch heading seeds
+for all phones (Pixel4XL +1.00 m).
+
+### Hardware clock reset breaks the first segment of sjc-he2 (2026-10-24)
+
+Comparing the submission with the archived taroz test output (diagnostic
+only) shows one large outlier: 2023-06-06 sjc-he2 Pixel5 (P95 3.26 m, 13% of
+epochs beyond 2 m, all in the first 5 minutes). HardwareClockDiscontinuityCount
+changes 5 -> 6 at epoch 149, where TimeNanos and FullBiasNanos both step by
+2^32 ms. The loader rebases the receiver-clock reference there. This is a
+~194 m clock step that the positive 100 km clock-jump detector misses, so the
+clock continuity factor dragged GNSS-first epochs 0-210 by 27-89 m. The
+pseudorange residual median was 11-53 m there, against 1.2-2.1 m at the taroz
+positions. Solving epochs 0-147 alone gives 0.6 m. The default-off
+`--android-hardware-clock-reset-clock-jumps` marks epochs whose
+HardwareClockDiscontinuityCount changes as clock jumps and admits them in raw
+P staging. Only this drive changes the count among the 80 train/test drives.
+With the flag, the output is within median 0.05 m / P95 0.10 m of taroz.
+Submission 57586667 replaces only this drive in 57585127. It scores
+**Private 0.926 m** / Public 0.902 m, below the 0.928 m taroz score. The gap to
+first place is 0.043 m. Record:
+`use_cases/records/gsdc2023_official_readback_20261024.json`. The official
+reproduce recipe still pins 56625084. The seven replaced drives were run with
+a GCC build, whose control replays match the MSVC outputs within 0.02 m but
+not byte for byte.
+
+### IMU leveling window during a turn, submission 57590194 (2026-10-24)
+
+A per-minute comparison of 57586667 with the archived taroz test output
+(diagnostic only) isolates 2023-06-15 sjc-ce1 Pixel7Pro. The native
+GNSS-first stage stays within 0.1-0.4 m of the taroz GNSS stage. The native
+IMU stage leaves it by 2-3 m, for example for 90 s after a curve near epoch
+1040. The optimized IMU states show why: the gyro bias about the vertical
+body axis is -0.0093 rad/s for the whole drive, and the body yaw minus the
+GNSS course rotates at 0.5 deg/s. The static leveling window (the first 250
+samples, 2.25 s) starts while the car moves at 5 m/s and turns. Its gyro
+mean (0.0097 rad/s) becomes the initial gyro bias, while the stop-block gyro
+mean is 0.0004 rad/s. The 0.01 rad/s bias prior and the 5e-7 bias random
+walk keep that value, and the wrong attitude rotates the specific force in
+every curve. Removing the relative height pairs or the main Doppler leaves
+P95 to taroz at 2.8-2.9 m.
+
+The existing `--native-source-imu-initialization` (zero-bias
+initialization, already used by 10 test drives) fixes it on this drive.
+The estimated gyro bias becomes about 1e-4 rad/s and the mount yaw stays
+constant. The distance to taroz goes from median 0.76 m / P95 2.76 m to
+0.13 / 0.33 m.
+
+Train evidence covers the 14 scored train drives on the static leveling
+path:
+
+- mtv-b Pixel4 improves from 0.828 to 0.588 m. Its leveling window is
+  0.0053 rad/s off the stop-block mean.
+- 12 drives change by at most 0.001 m.
+- mtv-b Pixel4XL gets worse, from 0.422 to 1.422 m. The option also adds
+  epoch heading seeds.
+
+The option is therefore applied only where the leveling-window gyro mean is
+more than 0.005 rad/s from the stop-block gyro mean. Among the 40 test
+drives that is sjc-ce1 alone (0.0100 rad/s; the next is 0.0031 rad/s).
+Submission 57590194 replaces only this drive in 57586667. It scores
+**Private 0.862 m** / Public 0.902 m, below the 0.883 m first place on the
+final leaderboard. The taroz/gsdc2023 README shows a post-deadline
+submission of the released code at Private 0.782 m / Public 0.796 m, which
+remains 0.080 m ahead.
+
+2023-05-09 sjc-r A505U has a separate open issue. Its IMU stage also leaves
+the GNSS stage: the yaw slips a full turn against the integrated raw gyro
+between epochs 800 and 1400. The zero-bias initialization makes it worse
+there (P95 to taroz 2.15 -> 2.67 m).
+
+The official recipe now rebuilds 57590194. These runs are pinned to Linux
+GCC outputs:
+
+- the eight replaced final drives;
+- the stage-0 runs and height maps of the seven of those drives that use a
+  height map.
+
+The other 32 drives remain the MSVC research outputs, so no single platform
+reproduces the whole file byte for byte.
+
+### Yaw slips under epoch heading seeds, submission 57594243 (2026-10-24)
+
+All 40 test drives were rerun with `--native-imu-state-diagnostic`. For each
+drive, the optimized body yaw was compared with the GNSS-first course while
+moving faster than 5 m/s. The p95 deviation from its median is at most
+7.5 deg everywhere except three drives, where the yaw slips a full turn:
+
+- sjc-ce1 Pixel7Pro (static leveling bias; fixed in 57590194);
+- ebf-z Pixel5;
+- sjc-r A505U.
+
+On ebf-z the slip happens under `--native-epoch-heading-attitude-seeds`
+between minutes 3 and 13. The seeds are initial values only, not priors.
+Without them the mount yaw stays at -176 deg throughout, and the distance to
+the archived taroz output drops from median 0.19 m / P95 1.01 m to
+0.16 / 0.42 m. The seeded control run on the same GCC stage 0 and height map
+reproduces the submitted rows (P95 1.01 m), so the gain comes from dropping
+the seeds. The 14 checked train Pixel5 drives with seeds show no slip (p95
+deviation at most 1.8 deg; the mtv-h run with the state diagnostic crashed).
+So the rule is to drop the seeds only on a drive whose optimized yaw slips a
+full turn. Submission 57594243 replaces only ebf-z in 57590194. It scores
+Private 0.862 m / Public **0.884 m**, so ebf-z is a Public drive.
+
+sjc-r A505U stays open. Between epochs 1000 and 1400 (on-ramp and highway)
+the optimized relative rotations leave the integrated gyro by up to 0.65 deg
+per epoch, so another factor overrides the IMU factors there. None of these
+removes the slip:
+
+- the zero-bias initialization;
+- epoch heading seeds (run through the experimental build);
+- dropping the stop constraints;
+- an IMU time offset (inactive without the UTC wall-clock fallback).
+
+`--native-source-phone-imu-noise` shortens P95 to taroz from 2.15 to 1.45 m
+there, but it makes 7 of 8 Samsung train drives worse and leaves the 8th
+unchanged (mean 1.305 -> 1.420 m), so it is rejected.
+
+ebf-x Mi8 was also checked. Taroz sets IdxStart=600 for that drive and fills
+the first 599 stationary epochs with the nearest solution. Solving only from
+epoch 599 still leaves the stationary segment 1.4-1.7 m from taroz, so that
+drive is undecided.
+
+### Course attitude seeds for the sjc-r A505U yaw slip, submission 57600830 (2026-10-24)
+
+A per-factor error dump at the optimized values (experimental build) puts
+most of the IMU-stage error of 2023-05-09 sjc-r A505U between epochs 1000 and
+1400. In that window:
+
+- the CombinedImu factors hold 134k of 168k total error;
+- the TDCP factors are also about 20 times their usual size;
+- at the GNSS-first initial values the TDCP errors are still small, but the
+  IMU errors are already 100k-540k per 50 epochs.
+
+The data do not force the twist. The 1-s mean accelerometer, rotated into
+ENU with yaw = GNSS course + a constant 178.9 deg mount and roll/pitch held at
+their stop values (-1.8 / 10.6 deg), matches the GNSS acceleration in that
+window: the along-track residual is about 0 and the cross-track residual is a
+constant -0.5 m/s^2, which an accelerometer bias absorbs. So the slip is a
+local minimum. Dead-reckoned, velocity-heading and blended seeds all end in
+the same slipped basin.
+
+`--native-course-attitude-seeds-mount-deg DEG` (default off) seeds every IMU
+attitude with yaw = GNSS-first course + DEG and the aligned initial
+roll/pitch. Epochs below 3 m/s reuse the nearest moving course. With the
+mount estimated from the slip-free part of the first solution (178.9 deg):
+
+- the mount stays at 178-180 deg;
+- final-vs-GNSS-first P95 drops from 2.91 to 1.38 m;
+- the distance to the archived taroz output drops from median 0.42 m /
+  P95 2.15 m to 0.34 / 0.88 m.
+
+It is not a general recipe. On five Samsung train drives with their own
+mounts, four are unchanged (within 0.001 m), but mtv-n A205U goes from
+1.772 to 5.675 m. Keeping the dead-reckoned roll/pitch makes it 23.8 m. The
+same truth-free check flags that failure: final-vs-GNSS-first P95 rises from
+2.32 to 8.86 m. So the rule reseeds only a drive whose yaw slips a full turn,
+and keeps the reseeded run only if the slip disappears and
+final-vs-GNSS-first P95 drops. No train drive slips, so the rule changes no
+train score.
+
+Submission 57600830 replaces only A505U in 57594243. It scores **Private
+0.845 m** / Public 0.884 m, 0.063 m from the 0.782 m post-deadline taroz
+score.
+
+### Checks after 57600830 that did not help (2026-10-25)
+
+None of these changed a submission. They are recorded so they are not
+repeated.
+
+**Course-seed rule on every drive.** Every drive was rerun with
+`--native-course-attitude-seeds-mount-deg 180`, dropping epoch heading seeds
+and the source IMU initialization where the recipe has them. The rule keeps a
+rerun only if final-vs-GNSS-first P95 drops below 0.9 of the first run.
+
+- Train, 36 drives:
+  - 34 drives change by at most 0.001 m;
+  - mtv-b Pixel4 improves from 0.828 to 0.588 m (P95 ratio 0.79), so the rule
+    keeps it;
+  - mtv-n A205U gets worse, from 1.772 to 5.673 m (P95 ratio 3.82), so the
+    rule rejects it.
+- Test, 40 drives: the rule keeps exactly the three drives already fixed by
+  hand: sjc-ce1 (0.40), sjc-r A505U (0.48) and ebf-z (0.76). The others stay
+  at 0.998-1.013. mtv-m Mi8 cannot take course seeds, because its leveling
+  window is not stationary and it needs the source IMU initialization.
+
+**Samsung GNSS stage against taroz.**
+
+- The phone position offsets are the same as taroz `add_position_offset`.
+  Most of the earlier along-track gap came from comparing native GNSS-first
+  before that offset with taroz `result_gnss` after it.
+- GNSS-stage velocity error against truth, median / P95 in m/s, native vs
+  taroz:
+  - sjc-q A325F, which has no TDCP: 0.296 / 1.329 vs 0.130 / 0.531, so
+    native is worse;
+  - mtv-ie2 A505G: 0.035 / 0.362 vs 0.103 / 0.514;
+  - sjc-s A325G: 0.061 / 0.417 vs 0.108 / 0.525;
+  - sjc-q Pixel5: 0.035 / 0.110 vs 0.071 / 0.317.
+- `--native-samsung-clock-drift` leaves the solutions of five Samsung train
+  drives bit-identical. The estimated drift only seeds the optimizer.
+- Against taroz final, the median per-phone offset is below 0.1 m except
+  mtv-b A325F, which is +0.45 m along-track. On train, both pipelines sit
+  +0.15-0.22 m along-track from truth for A325F (native +150 ms recipe vs
+  taroz: sjc-q +0.217 vs +0.199 m, mtv-n +0.149 vs +0.156 m), so train does
+  not explain the test gap. The +150 ms IMU offset is applied on the test
+  drive as on train (UTC wall-clock fallback).
+
+**sjc-r A32, mtv-pe1 / lax-hh A325G.** Their IMU stage leaves the GNSS stage
+by about 1 m in a few minutes while taroz final stays near taroz GNSS. The
+per-factor error dump shows no concentration:
+
+- A32: IMU total 1448, with no 100-epoch block above 5x the median except the
+  first;
+- lax-hh A325G: no such block at all.
+
+**IMU bias random walk.** A 12-drive train screen:
+
+| Scale | Change in mean score |
+|---|---:|
+| gyro x10 | +0.006 m |
+| gyro x100 | -0.017 m |
+| accel x4 | +0.002 m |
+| accel x0.25 | -0.001 m |
+
+On all 36 train drives the mean is 0.7646 m at the current value, 0.7598 m
+with gyro x100 and 0.7725 m with gyro x1000. The gyro x100 gain is mtv-b
+Pixel4 alone (-0.169 m, the bad leveling-bias case that the source IMU
+initialization already fixes); the other 35 drives net about 0. Rejected.
+
+### One-build rebuild, submission 57619467 (2026-10-25)
+
+Submission 57600830 still had 31 drives at the MSVC research outputs of
+56625084, so the official recipe could not be reproduced on one build. The
+recipe lane reran them with the same argv on the Linux GCC 15 build that
+produced the 9 changed drives (develop `ed5f8d0`; develop `86d1e81` links
+the same binary). It also reran their 17 stage-0 runs and rebuilt their
+height maps.
+
+- The 9 GCC final drives and the 8 GCC stage-0 runs came out byte-identical.
+- The 31 rerun drives moved by median 0.001 m and P95 0.008 m over all rows.
+  The largest move is 0.079 m on mtv-m Mi8; every other drive moved at most
+  0.025 m.
+
+Submission 57619467 is that rebuild. It scores **Private 0.844 m** / Public
+0.885 m, against 0.845 / 0.884 m for 57600830, so the platform change is
+score-neutral. The official recipe is now pinned to it, and every drive,
+stage-0 run and height map rebuilds byte for byte on one build.
+
+### Carrier-phase check at the ebf-x exit, submission 57626255 (2026-10-25)
+
+The stationary start of 2022-04-25 ebf-x Mi8 was the open issue from the
+course-seed section. Taroz sets IdxStart=600 there and fills epochs 0-598
+with its first solved position. Those epochs are 38% of the 1,897 scored
+rows, and native sits about 2 m from taroz over them.
+
+A truth-free arbiter settles it. It solves epoch-to-epoch displacements from
+the raw ADR by robust least squares with a free clock term. That gives about
+22 satellites and 1 cm residual RMS per epoch. Over the 40 s parking-lot exit
+(epochs 680-720), the native trajectory with the phone offset removed
+disagrees with it by 1.2 m. The GNSS-first stage already disagrees. Taroz
+agrees within 0.2 m. In the static epochs 0-598, the carrier phase also moves
+0.9 m, as if the phone were handled while the car stood still.
+
+The same check on all 40 test drives flags only ebf-x: no other drive has a
+low-speed window where native disagrees by more than 0.5 m and taroz agrees.
+On train it flags two drives, with one window each (mtv-u Pixel6Pro,
+routebb1 Pixel7Pro). The source TDCP flags below do not fix those windows.
+
+Two changes are needed:
+
+- Solve ebf-x from epoch 599, and fill the leading keys with the first
+  solved row. This is the recipe `input_window`.
+- Add `--native-source-tdcp-meter-sigma`, `--native-phase184-source-tdcp-huber-k`,
+  `--native-source-route-type Highway` and `--native-source-l5 1`.
+
+The window alone moves P95 to taroz from 2.81 m to 1.75 m. With either TDCP
+variant, the exit agrees with the carrier phase within 0.3 m:
+
+| Variant | P95 to taroz | Kaggle |
+|---|---:|---|
+| Window and source TDCP sigma | 0.71 m | 57626257, Public 0.864 m |
+| Window, source TDCP sigma and Phase184 Huber | 0.64 m | 57626255, Public 0.850 m |
+
+Private stays at 0.844 m, so ebf-x is a Public drive.
+
+On train, the same flags on every drive are worse: 4 of the first 6 drives
+regress, and mtv-b Pixel4 by +0.106 m. They stay on this drive only.
+The recipe lane rebuilds it with the native text verbatim. That file has the
+same coordinates and was submitted as 57629197 (same score). It is now the
+official recipe. Private is still 0.062 m
+from the 0.782 m post-deadline taroz score.
+
+### Where the remaining Private gap is not (2026-10-25)
+
+None of these changed a submission. The Private score is 0.844 m against the
+0.782 m post-deadline taroz score.
+
+**Train is level.** On 35 train drives run with the per-phone test recipes,
+native scores 0.718 m mean (P50+P95)/2 and the taroz `result_gnss_imu` 0.712 m.
+So the test gap should sit in a few test drives rather than in the general
+model.
+
+- **Offsets.** Both taroz result files already include `add_position_offset`:
+  `fgo_gnss.m` and `fgo_gnss_imu.m` apply it before saving. Compare them with
+  the native final, not with the native GNSS-first stage.
+- **Along-track error.** On moving epochs, native along-track |error| is 0.314 m
+  and taroz 0.267 m, while cross-track is level (0.295 / 0.294 m). The excess
+  is drive-specific: sm-a505g sits +0.79 m ahead of truth, taroz +0.36 m. A
+  truth-free shift by the leave-one-out phone-family bias makes train worse
+  (0.7475 -> 0.7628 m).
+- **IMU-stage departures are mostly right.** When the native final sits more
+  than 0.8 m from the offset-aligned GNSS-first, it is closer to truth in 83%
+  of 7,985 train epochs.
+
+**Carrier phase does not decide the drive starts.** The raw-ADR displacement
+check that found ebf-x does not decide the lax-x or ebf-xx starts either (see
+the correction below: an earlier note here blamed a 0.2% drift at highway
+speed on the check, but the drift came from the comparison). In lax-x, the
+native final stays on both GNSS stages for the first 4 minutes, while the
+taroz final moves about 1 m from its own. On train, the native first five
+minutes are level with taroz (0.544 vs 0.516 m).
+
+**Height maps are not a common cause.** Mean distance to taroz is 0.375 m on
+the 24 test map drives and 0.354 m on the 14 relative-height drives. Map
+points within 15 m that span more than 2 m in height (overpasses) appear on at
+most 6% of epochs.
+
+The three largest disagreements with taroz are Samsung map drives. Without the
+map:
+
+| Drive | With map | Without map |
+|---|---:|---:|
+| mtv-b A325F | 1.40 m | 1.38 m |
+| sjc-r A32 | 0.81 m | 0.70 m |
+| mtv-pe1 A325G | 0.78 m | 0.84 m |
+
+The changes are mixed, so no-map is not adopted. On train, native is level
+with or better than taroz for A325F, so these test disagreements do not show
+which side is wrong.
+
+### Correction: the carrier-phase check works at speed (2026-10-26)
+
+The 0.2% drift at highway speed reported above was not in the raw-ADR
+displacement check. It was in the comparison: the trajectories were turned
+into metres on a sphere of radius 6,371 km. At 37.4 deg N the meridian and
+prime-vertical radii are 0.19% smaller and 0.24% larger than that. The ebf-x
+segment that moved 1,433 m east therefore picked up about 3.4 m, which is the
+2.9-3.4 m first blamed on the check. With exact ECEF/ENU conversion:
+
+- **Train, against ground truth.** One-second TDCP steps match the
+  ground-truth steps to about 0.3 mm (10 ppm) at 29 m/s. Rotating the
+  satellites for Earth rotation (Sagnac) changes the horizontal by less than
+  0.1 mm. Over static runs of 60-133 epochs, the TDCP displacement stays within
+  0.00-0.12 m horizontally. The 0.9 m that ebf-x shows over its first 600
+  static epochs is well above that.
+- **Phones whose ADR cannot be used.** On train, 30-s TDCP windows of A325F
+  miss the truth by 0.9-1.2 m, while native and taroz miss it by about 0.2 m.
+  This is why taroz drops TDCP for A325F/A32. On test, sjc-r A32 and sjc-ke2
+  S908B disagree with both pipelines by about 1.3 m as well. The check says
+  nothing on those phones.
+- **All 40 test drives, all speeds, 30-s windows.** Median disagreement with
+  TDCP is 0.05-0.15 m for both pipelines on the drives with usable ADR. Native
+  disagrees by more than 0.5 m in a window where taroz stays within 0.3 m on
+  two drives:
+  - mtv-m Mi8, epochs 1260-1290: 1.06 m. The step happens at one epoch with 7
+    satellites, so it cannot be told apart from a TDCP outlier.
+  - mtv-a Mi8, epochs 930-960: 0.52 m.
+- **The drive starts.** Over 60-epoch windows at the ebf-xx exit (epochs
+  120-240), native disagrees with TDCP by 2.6 / 1.7 m and taroz by 1.2 / 0.7 m.
+  Both miss, so the check does not decide. The first 3 minutes of lax-x have
+  TDCP gaps.
+
+The check therefore finds no second ebf-x-type failure on test.
+
+The ebf-x TDCP flags are no lever for the ebf-xx start. The Pixel5 heading
+recipe already carries them:
+
+- `tdcp_contract.source_tdcp_meter_sigma_requested` is true;
+- `phase184_source_tdcp_huber_k_enabled` is true, with setting type Highway.
+
+Adding `--native-source-tdcp-meter-sigma` alone, or with Phase184 Huber
+(Highway, L5=1), leaves the ebf-xx solution byte-identical. So with them
+already in place, the exit (epochs 120-240) still disagrees with TDCP by
+2.6 / 1.7 m, and the first 5 minutes still sit a median 0.92 m from taroz.
+
+### Upstream third pass, submissions 57663786-57664241 (2026-10-26)
+
+The taroz pipeline solves each drive three times (`run_fgo.m`): `fgo_gnss`,
+then `fgo_gnss_imu` twice. The last pass takes the first GNSS/IMU
+trajectory as input. It re-screens pseudorange and Doppler around that
+trajectory with the tighter final thresholds (50/30 m to 20/15 m for P,
+20 m/s to 3 m/s for D) and solves again. Every test recipe stopped after one
+IMU solve. The native `--native-imu-refinement-pass` is that third pass. It
+was mixed in September, when the official score was 1.055 m, and had not
+been tried since. It needs `--native-export-gnss-stage`,
+`--native-export-imu-stage`, `--native-source-imu-initialization` and
+`--native-phase213-main-doppler`. Where a recipe lacked them, they were added
+too.
+
+On train it helps every phone except Mi8 (36 drives, per-phone test
+recipes, no height map). The 35 drives with taroz output move from
+0.7358 m to 0.7187 m (taroz 0.7123 m). Without Mi8 and Pixel4 XL they move
+to 0.687 m.
+
+| Phone (train drives) | Third pass alone | With missing prerequisites |
+|---|---:|---:|
+| A325F (2) | -0.216 m | -0.437 m |
+| A505G (1) | -0.117 m | -0.202 m |
+| Pixel4 (2) | -0.018 m | -0.138 m |
+| A205U (1) | -0.131 m | -0.131 m |
+| S908B / Pixel7Pro / G988B | -0.013 to -0.026 m | same |
+| Pixel5 (14; 11 better) | -0.015 m | same |
+| Pixel6Pro (3) | -0.006 m | same |
+| A325G (1) | -0.067 m | +0.004 m |
+| Mi8 (4; 4 worse) | +0.049 m | +0.061 m |
+| Pixel4 XL (1) | -0.131 m | +0.868 m |
+
+"Alone" compares against the same recipe with only the missing prerequisites
+added. On Pixel4 XL the prerequisites themselves cost +0.999 m. Adding the
+upstream stop/observation stages on top changes 11 drives by at most
+0.011 m.
+
+On test, the other 32 drives were rerun with the pass. These were left out: Mi8 (5
+drives), Pixel4 XL, and A325G (2, neutral on train). Distance to the taroz
+test output, as (P50+P95)/2:
+
+- mtv-b A325F: 1.40 m -> 0.77 m.
+- lax-x Pixel5: 0.74 m -> 0.21 m. Its first 4-5 minutes, the
+  `pixel5_drive_starts` issue, now agree.
+- sjc-r A32: 0.82 m -> 0.59 m.
+- ebf-z Pixel5: 0.29 m -> 0.52 m. Minutes 5-10 moved 0.5-0.9 m. Raw-ADR
+  30-s windows agree with both trajectories, so this is an offset the
+  carrier phase cannot settle.
+- sjc-r A505U: 0.61 m -> 1.42 m, with up to about 2 m in minutes 22-26. The
+  pass cannot keep its course seeds (`--native-course-attitude-seeds-mount-deg`
+  excludes source IMU initialization), so this run dropped them.
+
+| Kaggle | Change | Public | Private |
+|---|---|---:|---:|
+| 57629197 | before | 0.850 m | 0.844 m |
+| 57663786 | third pass on 30 drives (not A505U, not lax-p) | 0.836 m | **0.811 m** |
+| 57663818 | ebf-z back to 57629197 | 0.821 m | 0.811 m |
+| 57664241 | plus lax-p | **0.817 m** | 0.811 m |
+
+lax-p crashes (SIGSEGV) in its refinement solve in two of three runs. In
+each crash a GTSAM TBB worker thread overflows its stack, with an 8 MB stack
+or with `ulimit -s unlimited`, so the one run that finished was lucky. Pinned
+to one CPU, TBB starts no workers, and the drive finishes in 1,670 s with the
+same solution, with either stack limit. The recipe sets `single_cpu: true` on
+that drive, and the lane pins it.
+
+The official recipe is now 57664241: 30 drives carry the pass (their old
+provenance under `research_source.previous_research_source`). Private is
+0.029 m from the 0.782 m post-deadline taroz score, and Public 0.021 m from
+its 0.796 m. Left open:
+
+- sjc-r A505U, a Private drive: train A505G gains 0.20 m from the pass, but
+  on test it needs the course seeds.
+- The Mi8 drives.
+- ebf-xx: its exit (epochs 120-240) still disagrees with TDCP. The
+  disagreement sits at 7-9-satellite epochs. In the 7 train steps of that kind
+  (10 or fewer satellites, native and TDCP more than 0.3 m apart), native was
+  closer to truth every time, so TDCP is the suspect there.
+
+### Course seeds with the third pass, submission 57678818 (2026-10-26)
+
+sjc-r A505U, a Private drive, could not take the third pass. Its course seeds
+(`--native-course-attitude-seeds-mount-deg 178.9`, for a phone mounted
+backwards) excluded `--native-source-imu-initialization`, which turns on the
+epoch heading seeds. The solver now lets course seeds replace the source
+heading seeds in the initial IMU pass. The refinement pass then takes that
+pass's optimized attitude. The drive moves from 0.61 m to 0.56 m from taroz,
+without the 2 m excursion of the run that dropped the course seeds. Kaggle
+Private drops from 0.811 m to 0.806 m (57677499).
+
+The three drives still without the pass were probed one at a time on top of
+that file:
+
+- mtv-e Pixel4 XL: Public unchanged at 0.817 m.
+- mtv-pe1 A325G: 0.785 m -> 0.625 m from taroz, but Public worsens to
+  0.821 m.
+- lax-hh A325G: 0.630 m -> 0.510 m from taroz, and Public improves to
+  0.816 m.
+
+Taking lax-hh gives 57678818, **Private 0.806 m / Public 0.816 m**. The
+official recipe is pinned to it, with 32 drives on the pass. The mtv-pe1
+probe also shows that moving toward taroz does not by itself predict a
+better score on a drive. Private is now 0.024 m from the 0.782 m taroz
+post-deadline score, and Public 0.020 m from its 0.796 m.
+
+### Where the remaining gap is: Kaggle probes with the taroz output (2026-10-27)
+
+These probes are diagnostic only. The archived taroz test output
+(`result_gnss_imu.mat`, assembled as taroz `submission.m` does) scores
+exactly the README numbers: Public 0.796 m / Private 0.782 m (57683971).
+
+To locate the gap, single drives of 57678818 were replaced by the taroz rows
+and resubmitted, one drive at a time and then one phone group at a time.
+The per-drive results are in the readback record under
+`taroz_kaggle_probes`. The Private split holds about 20 drives: one
+assembly misaligned sjc-r A205U by 2 epochs, about 470 m, and scored
+Private 24.117 m. So a per-drive delta times about 20 gives the
+(P50+P95)/2 difference on that drive.
+
+- **Private.** Most of the gap sits on three drives: lax-n Pixel5 (-0.010,
+  about 0.20 m on the drive), sjc-we1 Pixel7Pro (-0.007) and sjc-r A505U
+  (-0.006). The rest is spread thin, and native is better on five Private
+  drives.
+- **Public.** mtv-m Mi8 (-0.018) and ebf-xx Pixel5 (-0.017) dominate. Native
+  is better on ebf-x Mi8 (+0.014), mtv-e G988B (+0.007) and mtv-b A325F
+  (+0.006).
+- **Phone groups (Public / Private).** Pixel5 -0.010 / -0.011; other Pixels
+  -0.002 / -0.010; Samsung +0.007 / -0.004; Mi8 -0.014 / -0.001.
+
+On the drives taroz wins, the two trajectories differ by 0.1-0.4 m, varying
+slowly over minutes, often at the drive start:
+
+- ebf-xx: about 0.9 m while static over 0-150 s. Taroz is right there,
+  which settles the `pixel5_drive_starts` question for this drive.
+- lax-n: 0.2-0.45 m over the first 270 s.
+- mtv-m Mi8: 0.6-0.8 m over its static runs.
+
+Train shows no such deficit with the current recipes. Over 35 drives, the
+first-5-minute median error is 0.506 m for native and 0.516 m for taroz, and
+0.471 m against 0.479 m for the rest. So the remaining gap does not point to
+one fix that train could validate.

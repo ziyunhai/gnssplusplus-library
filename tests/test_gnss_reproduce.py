@@ -6,6 +6,7 @@ These tests need no datasets or built binaries.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -739,8 +740,24 @@ class GsdcOfficialLaneTest(unittest.TestCase):
         self.assertNotIn("E:/", text)
         self.assertNotIn("E:\\\\", text)
         submission = recipe["submission"]
-        self.assertEqual(submission["kaggle_ref"], 56625084)
-        self.assertTrue(submission["sha256"].startswith("cbd1fde1"))
+        self.assertEqual(submission["kaggle_ref"], 57678818)
+        self.assertTrue(submission["sha256"].startswith("2e0deb2c"))
+        refined = [drive for drive in recipe["drives"] if "--native-imu-refinement-pass" in drive["argv"]]
+        self.assertEqual(len(refined), 32)
+        for drive in refined:  # the refinement pass needs the exported stages, source init and main Doppler
+            for flag in ("--native-export-gnss-stage", "--native-export-imu-stage",
+                         "--native-source-imu-initialization", "--native-phase213-main-doppler"):
+                self.assertIn(flag, drive["argv"])
+        self.assertEqual([drive["id"] for drive in recipe["drives"] if drive.get("single_cpu")],
+                         ["2022-02-24-15-10-us-ca-lax-p/pixel5"])
+        windowed = [drive for drive in recipe["drives"] if drive.get("input_window")]
+        self.assertEqual([drive["id"] for drive in windowed], ["2022-04-25-21-04-us-ca-ebf-x/mi8"])
+        for drive in windowed:
+            for part in ("gnss", "imu"):
+                spec = drive["input_window"][part]
+                self.assertIn(spec["from"], drive["inputs"])
+                self.assertIn(spec["to"], drive["argv"])
+                self.assertEqual(len(spec["sha256"]), 64)
         self.assertEqual(len(recipe["drives"]), 40)
         groups: dict[str, int] = {}
         for drive in recipe["drives"]:
@@ -872,6 +889,83 @@ class GsdcOfficialLaneTest(unittest.TestCase):
             self.assertTrue(payload["submission"]["partial"])
             self.assertTrue(payload["submission"]["sha256_match"])
             self.assertEqual(payload["drives_native"], 1)
+
+    def test_input_window_writes_raw_rows_from_the_window_epoch(self) -> None:
+        driver = self._import()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "gsdc"
+            phone = root / "test" / "a-course" / "phone1"
+            phone.mkdir(parents=True)
+            gnss = ["MessageType,utcTimeMillis,Svid"]
+            gnss += [f"Raw,{utc},{svid}" for utc in (1000, 2000, 3000, 4000) for svid in (3, 7)]
+            imu = ["MessageType,utcTimeMillis,MeasurementX"]
+            imu += [f"UncalAccel,{utc},0.5" for utc in range(0, 4500, 500)]
+            (phone / "device_gnss.csv").write_text("\r\n".join(gnss) + "\r\n", encoding="utf-8")
+            (phone / "device_imu.csv").write_text("\n".join(imu) + "\n", encoding="utf-8")
+            context = {"gsdc_root": str(root), "work_dir": str(Path(tmp) / "work")}
+            entry = {"id": "a-course/phone1", "input_window": {
+                "first_epoch_index": 2, "imu_lead_ms": 1000,
+                "gnss": {"from": "test/a-course/phone1/device_gnss.csv", "to": "{work_dir}/inputs/a/device_gnss.csv"},
+                "imu": {"from": "test/a-course/phone1/device_imu.csv", "to": "{work_dir}/inputs/a/device_imu.csv"}}}
+            out_gnss = Path(tmp) / "work" / "inputs" / "a" / "device_gnss.csv"
+            out_imu = Path(tmp) / "work" / "inputs" / "a" / "device_imu.csv"
+            expected_gnss = "\r\n".join([gnss[0], *gnss[5:]]) + "\r\n"
+            expected_imu = "\n".join([imu[0], *imu[5:]]) + "\n"  # IMU from 2000 ms (window 3000 - 1000)
+            for part, text in (("gnss", expected_gnss), ("imu", expected_imu)):
+                entry["input_window"][part]["sha256"] = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            self.assertEqual(driver.prepare_input_window(entry, context), 3000)
+            self.assertEqual(out_gnss.read_bytes(), expected_gnss.encode("utf-8"))
+            self.assertEqual(out_imu.read_bytes(), expected_imu.encode("utf-8"))
+            entry["input_window"]["imu"]["sha256"] = "0" * 64
+            with self.assertRaises(SystemExit):
+                driver.prepare_input_window(entry, context)
+
+    def test_assembly_fills_keys_before_a_windowed_drive(self) -> None:
+        driver = self._import()
+        with tempfile.TemporaryDirectory() as tmp:
+            recipe, work = self._synthetic_recipe(Path(tmp))
+            solutions = {d["id"]: work / "final" / d["id"].replace("/", "__") / "solution.csv" for d in recipe["drives"]}
+            first = solutions["a-course/phone1"]
+            lines = first.read_text(encoding="utf-8").splitlines()
+            first.write_text("\n".join([lines[0], *lines[2:]]) + "\n", encoding="utf-8")  # no row for key 1000
+            with self.assertRaises(SystemExit):
+                driver.assemble_rows(recipe, solutions)
+            recipe["drives"][0]["input_window"] = {"first_epoch_index": 1}
+            rows, _ = driver.assemble_rows(recipe, solutions)
+            self.assertEqual(rows[0], ["a-course/phone1", "1000", "37.010000000", "-122.0000000000"])
+            self.assertEqual(rows[1], ["a-course/phone1", "2000", "37.010000000", "-122.0000000000"])
+            second = solutions["b-course/phone2"]
+            lines = second.read_text(encoding="utf-8").splitlines()
+            second.write_text("\n".join([lines[0], *lines[2:]]) + "\n", encoding="utf-8")
+            with self.assertRaises(SystemExit):  # the window fill applies to windowed drives only
+                driver.assemble_rows(recipe, solutions)
+
+    def test_single_cpu_pins_the_child_to_one_cpu(self) -> None:
+        driver = self._import()
+        self.assertIsNone(driver.single_cpu_preexec({"id": "a"}))
+        if not hasattr(os, "sched_setaffinity"):
+            with self.assertRaises(SystemExit):
+                driver.single_cpu_preexec({"id": "a", "single_cpu": True})
+            return
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            fake = tmp_path / "fake_solver.py"
+            fake.write_text(textwrap.dedent("""
+                import os, sys
+                out = sys.argv[sys.argv.index('--out') + 1]
+                open(out, 'w').write(str(len(os.sched_getaffinity(0))))
+            """), encoding="utf-8")
+            for single, expected in ((False, len(os.sched_getaffinity(0))), (True, 1)):
+                entry = {"id": "a-course/phone1", "group": "pixel5-heading", "output_sha256": "",
+                         "output": "{work_dir}/final/a__phone1/solution.csv",
+                         "argv": [sys.executable, str(fake), "--out", "{work_dir}/final/a__phone1/solution.csv"]}
+                if single:
+                    entry["single_cpu"] = True
+                record = driver.run_drive(entry, {"work_dir": str(tmp_path)}, os.environ)
+                self.assertEqual(record["returncode"], 0)
+                self.assertEqual(record["single_cpu"], single)
+                cpus = (tmp_path / "final" / "a__phone1" / "solution.csv").read_text(encoding="utf-8")
+                self.assertEqual(cpus, str(expected))
 
     def test_run_resume_skips_completed_drives(self) -> None:
         driver = self._import()
