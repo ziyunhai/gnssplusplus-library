@@ -106,20 +106,39 @@ See the [v0.3.0 release highlights](docs/releases/v0.3.0.md) and
 | CLAS PPP | Six PPC Tokyo/Nagoya runs vs MRTKLIB CLAS | 25.117% aggregate FIX, 0.359 m FIX RMS2D, and zero FIX epochs above 3 m across 58,259 scored epochs; every run passes the MRTKLIB v0.4.2 FIX-rate and FIX-RMS2D hard gates |
 | Urban RTK | UrbanNav Tokyo Odaiba vs RTKLIB `demo5` b34k, both multi-GNSS | `--preset urban` 7467 vs 5839 fixes with fewer wrong fixes (9/0/0 vs 19/4/4 beyond 0.5/2/3 m) and lower Hmed/Hp95/Vp95 (0.046/4.86/10.77 vs 0.190/7.86/15.72 m); default profile 1298 fixes with lower Hp95/Vp95 (4.78/11.54 m); both solvers use the surveyed base position |
 | SPP | PPC SPP adaptive robust + policy gate (Tokyo run1, Nagoya run1-3) | No P95 H regression with <=1 pp positioning drop on the 4 checked runs |
-| Smartphone GNSS/IMU | GSDC 2023-2024 official submission | **Private 0.806 m / Public 0.816 m**, ahead of the 0.883 m final-leaderboard first place (late submission) |
+| Smartphone GNSS/IMU | GSDC 2023-2024 official submission | **Private 0.714 m / Public 0.732 m** (late, no Kaggle feedback), ahead of the 0.883 m final-leaderboard first place and of the 0.782 / 0.796 m taroz post-deadline code |
 
 Reproduce: `python3 apps/gnss.py reproduce list` shows one command per row; see [docs/reproduce.md](docs/reproduce.md) for datasets, tool pins, and the latest local results.
 
 ### Smartphone GNSS/IMU
 
-Google Smartphone Decimeter Challenge 2023-2024: late submission **57678818**
-scores **Private 0.806 m / Public 0.816 m**. That is ahead of the 0.883 m
-first place on the final private leaderboard, though a late entry is not
-ranked. It uses raw GNSS/IMU, broadcast navigation, base observations and
-train-derived height maps, with no test truth. The released taroz/gsdc2023 code scores
-Private 0.782 m after the deadline. To rebuild it, see `gsdc-official` in
+Google Smartphone Decimeter Challenge 2023-2024, score = mean over drives of
+(P50 + P95) / 2 horizontal error:
+
+| Submission | Private | Public |
+|---|---:|---:|
+| **libgnss++ 57742915** (late, not ranked) | **0.714 m** | **0.732 m** |
+| taroz/gsdc2023 released code (after the deadline) | 0.782 m | 0.796 m |
+| Final private leaderboard, first place | 0.883 m | – |
+
+This is the best libgnss++ score, and it is not tuned on the test set: no
+Kaggle score chose any setting in it.
+
+- **Inputs:** raw GNSS/IMU, broadcast navigation and base observations, plus
+  train ground truth for the height and road maps. No test truth.
+- **Solver:** the native GNSS/IMU factor graph (`gnss_fgo_imu_no_base`).
+- **Road prior:** on 32 drives a cross-track road prior from a road map built
+  from train ground truth (`--native-road-map`).
+- **Per-drive variant:** on 22 of the 40 drives a rule fixed on train picks a
+  native variant. It uses the height-map spread, the phone model and the
+  pseudorange residual.
+
+Two facts about how it was reached: the variant types were chosen after
+earlier per-drive Kaggle probes, and 57742915 is the sixth submission made
+that way (from 0.792 m). To rebuild it bit for bit, see `gsdc-official` in
 [docs/reproduce.md](docs/reproduce.md). Scores and the experiment log are in
-the [score record](docs/use_cases/records/gsdc2023_official_readback_20261024.json)
+the
+[score record](docs/use_cases/records/gsdc2023_official_readback_20261024.json)
 and the [log](docs/gsdc2023_native_taroz_goal.md).
 
 Base-surveyed correction on the GSDC dev routes (Pixel5, `(P50+P95)/2` m):

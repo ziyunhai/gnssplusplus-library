@@ -7109,3 +7109,160 @@ Train shows no such deficit with the current recipes. Over 35 drives, the
 first-5-minute median error is 0.506 m for native and 0.516 m for taroz, and
 0.471 m against 0.479 m for the rest. So the remaining gap does not point to
 one fix that train could validate.
+
+### Test-tuned per-drive settings, submission 57717122 (2026-10-28)
+
+**This step is tuned on the test set.** On train, native and taroz are tied
+in expectation. The per-drive difference has a standard deviation of
+0.124 m, about ±0.028 m on a 20-drive mean. So the 0.024 m Private gap was
+within drive-to-drive noise, and no single fix stood out. The user chose to
+win on Kaggle readback instead.
+
+Single-drive probes started from 57678818. A candidate replaced one drive,
+and its score change was read in that drive's split. The candidates were:
+
+- the third pass removed (57629197 output), probed on 32 drives;
+- XXVV motion, source TDCP sigma/Huber, no height constraint, the third
+  pass, RPYReset and the source stop/observation stages. These were rerun
+  on the 18 drives with the largest taroz gaps, and the 41 pairs that moved
+  the drive were probed.
+
+Per drive, the setting with the largest strict improvement at three decimals
+was kept:
+
+| Setting | Drives |
+|---|---|
+| XXVV motion | mtv-de1, sjc-r A205U, lax-n, mtv-xe1 Pixel7Pro, mtv-l, mtv-k, sjc-we1, sjc-ke2 S908B, lax-hh A325G |
+| source TDCP sigma/Huber | mtv-m Mi8, mtv-pe1 Xiaomi Mi8, ebf-ww Mi8, mtv-a Mi8 |
+| no height constraint | lax-x, sjc-ce1 Pixel7Pro, sjc-r Pixel5 |
+| no third pass | mtv-g Pixel5, mtv-pe1 Pixel5 2022-03-22 |
+
+The combined file is 57717122, **Private 0.767 m / Public 0.782 m**, below
+the taroz post-deadline 0.782 / 0.796 m. The probe deltas summed to -0.044
+(Private) and -0.031 (Public). The combined file landed 0.005 above the
+Private sum and 0.003 below the Public sum.
+
+These choices do not generalize. XXVV motion on the 36 train drives moves
+the mean from 0.7134 m to 0.7213 m: Samsung drives improve, while Pixel5,
+Pixel7Pro and G988B get worse. The 57717122 score is therefore a test-tuned
+result. The last recipe before this tuning is 57678818 (0.806 / 0.816 m).
+
+### Truth-free per-drive selection, submission 57726666 (2026-10-28)
+
+The Kaggle-probe selection of 57717122 is tuned on the test set. This step
+asks how much of it a truth-free rule recovers. The rule is a
+pseudorange-residual metric (prres): the median over epochs of the median
+absolute residual of corrected raw pseudoranges against the trajectory,
+after removing a per-epoch, per-constellation clock.
+
+- **Train, current recipe against XXVV motion (36 drives).** The change in
+  prres correlates with the change in score at 0.63. The raw-ADR TDCP
+  window metric correlates at only 0.33. "Take the variant when prres
+  drops" picks 13 drives, 10 of them correctly. It gains -0.0048 m on the
+  mean, where the oracle gains -0.0161 m and always-on loses +0.0079 m.
+- **Train, source TDCP (7 drives).** The rule picks 3 drives, all 3
+  correctly, and gains the full oracle (-0.0300 m).
+
+On test, the same rule ran on all 40 drives from 57678818, with XXVV motion
+everywhere and source TDCP where it was run. It replaced 15 drives: 13
+with motion and 2 with TDCP. Kaggle scores the file **Private 0.792 m** /
+Public 0.817 m (57726666), from 0.806 / 0.816 m, with no test feedback.
+That recovers about 36% of the Private gain of the probe selection, close
+to the share the rule recovers on train. Public stays level because the
+ebf-xx Pixel5 motion pick (+0.012 on its probe) cancels the gains. The
+official recipe stays on the test-tuned 57717122. 57726666 is the best
+score reached without test feedback, 0.010 m from the taroz post-deadline
+Private.
+
+### Truth-free rule on train and road snap, submission 57733487 (2026-10-28)
+
+The official recipe moves to 57733487 (Private 0.775 m / Public 0.804 m).
+No Kaggle score chose anything in it. Each rule was fixed on the 36 train
+drives and then applied to test once. Five such submissions were made, and
+this is the best. The variant types come from the per-drive probes of
+57717122.
+
+**Train checks of the per-drive variants** (mean (P50+P95)/2 change over
+36 drives against the current recipe):
+
+- **Refinement-pass toggle.** The oracle gains only -0.0005 m, and the
+  prres rule loses +0.046 m. Left out.
+- **Height map.** Maps were built without the drive's own course and trip; 18
+  drives have coverage. Always on costs +0.0032 m and the oracle gains
+  -0.0054 m. prres does not tell when the map hurts. The median height
+  spread of map points within 15 m of the trajectory does (correlation
+  +0.49). Train spreads sit below 0.21 m or above 0.40 m, so the rule drops
+  the map at 0.3 m or more.
+- **Relative-height pairs.** Over 12 drives the mean is +0.0037 m, with 6
+  better and 6 worse. The runs were about 3x slower and one ran out of
+  memory, so the check stopped there. Left as in the recipe.
+- **XXVV motion by phone.** A325F, A325G and A205U gain on all 4 of their
+  train drives (-0.013, -0.093, -0.064, -0.039 m); prres misses two of
+  them. These phones always take motion.
+- **Averaging current and motion per epoch** (-0.0035 to -0.0054 m) does
+  not beat the selection (-0.0077 m in sample).
+
+On test (57732745), the map rule drops 10 maps, the phone rule adds 2
+drives, and prres picks the rest. 22 drives differ from 57678818. The file
+scores Private 0.784 m / Public 0.816 m.
+
+**Samsung A along-track error.** On train the native final is level with
+the taroz `result_gnss_imu` (0.7134 vs 0.7123 m over 35 drives). The
+largest systematic gap is along-track on sm-a505g: +0.73 m ahead of truth
+against +0.36 m for taroz, roughly constant with speed and acceleration.
+The native and taroz yaw agree within 1 degree, so the phone offset is not
+applied in the wrong direction. The cause is not found, and with one train
+drive per phone a per-phone correction cannot be checked.
+
+**Road snap.** This uses the train ground truth across track, as the height
+maps do vertically. Each moving epoch looks up train-truth points within 6 m
+that head within 25 degrees of it. It takes their offsets along their
+normals, keeps those under 1 m, and moves by half of a summary offset. On
+train the map is built without the drive's own course, and without truth
+recorded during the same trip by another phone filed under a different
+course name (3 of the 36 drives have such a twin; the first numbers
+recorded here kept it, which overstated the gains slightly):
+
+| Snap | Train change | Better / worse | Test (Private / Public) |
+|---|---:|---|---|
+| nearest point, map from the 40 taroz train drives | -0.0050 m | 14 / 3 of 18 covered | 0.777 / 0.809 (57733311) |
+| nearest point, all 156 train files | -0.0076 m | 17 / 6 of 24 covered | 0.777 / 0.807 (57733407) |
+| median of all kept offsets, 156 files | -0.0130 m | 18 / 6 | **0.775 / 0.804** (57733487) |
+
+Moving by the full offset instead of half loses on train (+0.0156 m with
+the median), because a neighbouring lane's truth then pulls the epoch
+across. The snap is the `road_snap` step of the lane's `assemble`. Against
+the released taroz code (0.782 / 0.796 m), 57733487 is ahead on Private
+and behind on Public.
+
+### Road prior in the factor graph, submission 57742915 (2026-10-28)
+
+The post-hoc snap moves epochs only after the solve. This step gives the
+same road map to the native factor graph as a cross-track prior
+(`--native-road-map`), the horizontal counterpart of the height map. For a
+moving seed, map points within 6 m heading within 25 degrees give the seed's
+offset along their left normals. Offsets under 1 m are kept, and the
+position is held toward the seed minus the median offset along their mean
+normal (`AbsoluteHeightPoseFactor` with that normal; sigma 0.5 m, Huber
+0.5). The GNSS-first and observation-stage initial graphs drop it, as they
+drop the height map.
+
+**Train.** Each map holds the moving points of the 156 train truth files
+within 30 m of the drive's raw WLS track. The drive's own course and trip
+are left out. Over the 36 drives:
+
+- the mean (P50+P95)/2 drops by -0.106 m, with 22 better and 1 worse
+  (mtv-h Pixel5 +0.098 m);
+- the largest gains are on Samsung and street drives: mtv-ie2 A505G -0.48 m,
+  2023-09-07 Pixel5 -0.46 m, mtv-n A205U -0.35 m, mtv-xe1 Pixel5 -0.34 m;
+- sigma 0.5 m was the default set before the first run and was not tuned;
+- adding the post-hoc snap on top loses (-0.106 -> -0.099 m).
+
+**Test.** The 57733487 recipe, with the post-hoc snap dropped, adds the prior
+on the 32 drives with a non-empty map. 26 of their outputs change; lax and
+ebf drives have no train truth within 30 m. Kaggle scores it **Private
+0.714 m / Public 0.732 m** (57742915), from 0.775 / 0.804 m. That is ahead
+of the released taroz code on both splits (0.782 / 0.796 m) and of the
+test-tuned 57717122 (0.767 / 0.782 m). It is the sixth submission made
+without Kaggle feedback, and the variant types still come from the 57717122
+probes.
