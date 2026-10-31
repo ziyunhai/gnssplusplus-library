@@ -140,6 +140,7 @@ struct SolveConfig {
     bool hold_fix_unchanged_set = false;
     bool kf_relinearize_from_epoch_prior = false;
     bool hold_ambiguity_kalman_update = false;
+    bool hold_ambiguity_kalman_update_validated_only = false;
     bool fix_history_motion_compensation = false;
     bool max_position_jump_motion_compensation = false;
     int hold_fix_min_matched_pairs = 4;
@@ -325,6 +326,11 @@ struct SolveConfig {
     // WP7: NLOS/multipath measurement weighting. Empty path / OFF mode
     // (both defaults) mean the feature is entirely inert.
     std::string nlos_weights_csv_path;
+    std::string road_height_map_path;
+    double road_height_sigma_m = 0.0;
+    double road_height_offset_m = 0.0;
+    double road_height_radius_m = 1.5;
+    bool road_height_publish_only = false;
     libgnss::nlos_weights::NlosWeightMode nlos_weight_mode =
         libgnss::nlos_weights::NlosWeightMode::OFF;
     double nlos_two_tier_los_threshold = 0.5;
@@ -1108,7 +1114,8 @@ public:
               << "lambda_shadow_max_abs_z,lambda_shadow_max_z_pair,"
               << "lambda_shadow_max_z_lock_count,lambda_shadow_pairs_abs_z_gt3,"
               << "postfix_residual_max_abs_m,postfix_residual_max_pair,"
-              << "fixed_candidate_doppler_consensus_age_s,hold_fix_phase_fit\n";
+              << "fixed_candidate_doppler_consensus_age_s,hold_fix_phase_fit,"
+              << "road_height_applied,road_height_innovation_m,road_height_sigma_m\n";
         return true;
     }
 
@@ -1480,6 +1487,10 @@ public:
         writeNumber(telemetry.fixed_candidate_doppler_consensus_age_s);
         file_ << ",";
         writeNumber(telemetry.hold_fix_phase_fit);
+        file_ << "," << telemetry.road_height_applied << ",";
+        writeNumber(telemetry.road_height_innovation_m);
+        file_ << ",";
+        writeNumber(telemetry.road_height_sigma_m);
         file_ << "\n";
         file_.flush();
     }
@@ -1589,6 +1600,9 @@ void printAdvancedUsage(const char* program_name) {
         << "                             max position jump check (default: off)\n"
         << "  --hold-kalman-update       Apply held DD integers as a Kalman pseudo-observation\n"
         << "                             instead of overwriting the ambiguities (default: off)\n"
+        << "  --hold-kalman-update-validated-only\n"
+        << "                             With --hold-kalman-update, apply it only after a validated\n"
+        << "                             AR fix, not after the hold-fix fallback (default: off)\n"
         << "  --hold-fix-min-matched-pairs <n>\n"
         << "                             Min held DD pairs for the hold-fix fallback (default: 4)\n"
         << "  --hold-fix-max-update-nis-per-obs <v>\n"
@@ -1836,6 +1850,12 @@ void printAdvancedUsage(const char* program_name) {
         << "                             per-pair loadings against (default: 3)\n"
         << "  --bsr-max-drops <n>        Max pairs to drop progressively in BSR-guided\n"
         << "                             decimation (default: 6)\n"
+        << "  --road-height-map <csv>    Road-surface heights (lat_deg,lon_deg,height_m, ellipsoidal)\n"
+        << "                             for the kinematic height prior; needs --road-height-sigma-m\n"
+        << "  --road-height-sigma-m <s>  Height prior sigma in metres (default: 0 = off)\n"
+        << "  --road-height-offset-m <h> Antenna height above the road surface (default: 0)\n"
+        << "  --road-height-radius-m <r> Max horizontal distance to a map point (default: 1.5)\n"
+        << "  --road-height-publish-only Apply the height update only to the published FLOAT\n"
         << "  --nlos-weights <csv>       WP7: per-epoch per-satellite LOS/NLOS weight CSV\n"
         << "                             (columns: tow,sat,los_prob; also accepts the\n"
         << "                             tow,epoch_idx,prn,is_los,... contract emitted by\n"
@@ -2661,6 +2681,10 @@ SolveConfig parseArguments(int argc, char* argv[]) {
             config.hold_ambiguity_kalman_update = true;
             continue;
         }
+        if (arg == "--hold-kalman-update-validated-only") {
+            config.hold_ambiguity_kalman_update_validated_only = true;
+            continue;
+        }
         if (arg == "--kf-relinearize-from-prior") {
             config.kf_relinearize_from_epoch_prior = true;
             continue;
@@ -2936,6 +2960,16 @@ SolveConfig parseArguments(int argc, char* argv[]) {
             config.bsr_guided_worst_axes = std::stoi(argv[++i]);
         } else if (arg == "--bsr-max-drops" && i + 1 < argc) {
             config.bsr_guided_max_drop_steps = std::stoi(argv[++i]);
+        } else if (arg == "--road-height-map" && i + 1 < argc) {
+            config.road_height_map_path = argv[++i];
+        } else if (arg == "--road-height-sigma-m" && i + 1 < argc) {
+            config.road_height_sigma_m = std::stod(argv[++i]);
+        } else if (arg == "--road-height-offset-m" && i + 1 < argc) {
+            config.road_height_offset_m = std::stod(argv[++i]);
+        } else if (arg == "--road-height-radius-m" && i + 1 < argc) {
+            config.road_height_radius_m = std::stod(argv[++i]);
+        } else if (arg == "--road-height-publish-only") {
+            config.road_height_publish_only = true;
         } else if (arg == "--nlos-weights" && i + 1 < argc) {
             config.nlos_weights_csv_path = argv[++i];
         } else if (arg == "--nlos-weight-mode" && i + 1 < argc) {
@@ -3138,6 +3172,18 @@ SolveConfig parseArguments(int argc, char* argv[]) {
     if (config.ar_filter_margin < 0.0) {
         argumentError("--arfilter-margin must be >= 0", argv[0]);
     }
+    if (config.road_height_sigma_m < 0.0) {
+        argumentError("--road-height-sigma-m must be >= 0", argv[0]);
+    }
+    if (config.road_height_sigma_m > 0.0 && config.road_height_map_path.empty()) {
+        argumentError("--road-height-sigma-m requires --road-height-map <csv>", argv[0]);
+    }
+    if (!config.road_height_map_path.empty() && !(config.road_height_sigma_m > 0.0)) {
+        argumentError("--road-height-map requires --road-height-sigma-m > 0", argv[0]);
+    }
+    if (!(config.road_height_radius_m > 0.0)) {
+        argumentError("--road-height-radius-m must be > 0", argv[0]);
+    }
     if (config.nlos_weight_mode != libgnss::nlos_weights::NlosWeightMode::OFF &&
         config.nlos_weights_csv_path.empty()) {
         argumentError("--nlos-weight-mode requires --nlos-weights <csv>", argv[0]);
@@ -3247,6 +3293,10 @@ SolveConfig parseArguments(int argc, char* argv[]) {
     }
     if (config.min_fix_satellites < 0) {
         argumentError("--min-fix-satellites must be >= 0", argv[0]);
+    }
+    if (config.hold_ambiguity_kalman_update_validated_only &&
+        !config.hold_ambiguity_kalman_update) {
+        argumentError("--hold-kalman-update-validated-only requires --hold-kalman-update", argv[0]);
     }
     if (config.elevation_mask_deg < 0.0 || config.elevation_mask_deg >= 90.0) {
         argumentError("--elevation-mask-deg must be in [0, 90)", argv[0]);
@@ -3870,6 +3920,8 @@ int main(int argc, char* argv[]) {
         rtk_config.hold_fix_unchanged_set_only = config.hold_fix_unchanged_set;
         rtk_config.kf_relinearize_from_epoch_prior = config.kf_relinearize_from_epoch_prior;
         rtk_config.hold_ambiguity_kalman_update = config.hold_ambiguity_kalman_update;
+        rtk_config.hold_ambiguity_kalman_update_validated_only =
+            config.hold_ambiguity_kalman_update_validated_only;
         rtk_config.fix_history_motion_compensation = config.fix_history_motion_compensation;
         rtk_config.max_position_jump_motion_compensation =
             config.max_position_jump_motion_compensation;
@@ -4060,6 +4112,19 @@ int main(int argc, char* argv[]) {
                       << " (" << table->by_tow.size() << " distinct epochs)" << std::endl;
             rtk_processor.setNlosWeightTable(std::move(table));
         }
+        if (!config.road_height_map_path.empty()) {
+            // Cell size = lookup radius, so the 3x3 cell search covers the radius.
+            auto map = std::make_shared<libgnss::road_height::RoadHeightMap>(
+                libgnss::road_height::loadRoadHeightCsv(config.road_height_map_path,
+                                                        config.road_height_radius_m));
+            std::cout << "Loaded road heights: " << config.road_height_map_path << " ("
+                      << map->points.size() << " points)" << std::endl;
+            rtk_processor.setRoadHeightMap(std::move(map));
+        }
+        rtk_config.road_height_sigma_m = config.road_height_sigma_m;
+        rtk_config.road_height_offset_m = config.road_height_offset_m;
+        rtk_config.road_height_radius_m = config.road_height_radius_m;
+        rtk_config.road_height_publish_only = config.road_height_publish_only;
         rtk_processor.setRTKConfig(rtk_config);
         libgnss::SPPProcessor::SPPConfig spp_config;
         spp_config.use_multi_constellation = true;

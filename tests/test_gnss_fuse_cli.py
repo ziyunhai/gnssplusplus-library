@@ -59,7 +59,7 @@ class GnssFuseCliTest(unittest.TestCase):
                         "[gnss_fuse]",
                         'gnss_pos = "missing-solution.pos"',
                         'imu = "missing-imu.csv"',
-                        "lever_arm = [0.31, 0.0, -0.55]",
+                        "lever_arm = [0.31, 0.0, 0.55]",
                         "navi776_tc = false",
                         "zupt_gnss_speed_gate = false",
                         "base_interp = true",
@@ -140,6 +140,46 @@ class GnssFuseCliTest(unittest.TestCase):
                 "--max-gnss-velocity-reanchor-mps must be finite and non-negative",
                 result.stderr,
             )
+
+    def test_rtk_hold_and_fix_satellite_options_mirror_gnss_solve(self) -> None:
+        result = self.run_fuse("--help-advanced")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("--hold-kalman-update", result.stdout)
+        self.assertIn("--min-fix-satellites <k>", result.stdout)
+
+        result = self.run_fuse(
+            "--imu", "missing-imu.csv",
+            "--gnss-pos", "missing-solution.pos",
+            "--min-fix-satellites", "-1",
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("--min-fix-satellites must be >= 0", result.stderr)
+
+        result = self.run_fuse(
+            "--max-epochs", "0",
+            "--imu", "missing-imu.csv",
+            "--gnss-pos", "missing-solution.pos",
+            "--hold-kalman-update",
+            "--hold-kalman-update-validated-only",
+            "--min-fix-satellites", "4",
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("failed to load IMU CSV", result.stderr)
+
+    def test_validated_only_kalman_hold_requires_the_kalman_hold(self) -> None:
+        result = self.run_fuse("--help-advanced")
+        self.assertIn("--hold-kalman-update-validated-only", result.stdout)
+
+        result = self.run_fuse(
+            "--imu", "missing-imu.csv",
+            "--gnss-pos", "missing-solution.pos",
+            "--hold-kalman-update-validated-only",
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "--hold-kalman-update-validated-only requires --hold-kalman-update",
+            result.stderr,
+        )
 
 
 if __name__ == "__main__":

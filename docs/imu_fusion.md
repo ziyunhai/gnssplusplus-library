@@ -16,7 +16,7 @@ gnss fuse \
   --base  data/PPC-Dataset/tokyo/run1/base.obs \
   --nav   data/PPC-Dataset/tokyo/run1/base.nav \
   --imu   data/PPC-Dataset/tokyo/run1/imu.csv \
-  --lever-arm 0.31,0,-0.55 \
+  --lever-arm 0.31,0,0.55 \
   --preset low-cost \
   --out output/fused.pos
 ```
@@ -68,6 +68,25 @@ requires finite target/covariance data and changes only position (including
 its covariance block); it never retries a rejected EKF update or overwrites
 velocity, attitude, or biases.
 
+The RTK half takes three wrong-fix guards from `gnss solve`, all off by
+default:
+
+- `--hold-kalman-update` applies the held integers as a Kalman
+  pseudo-observation instead of overwriting the ambiguities.
+- `--hold-kalman-update-validated-only` (with `--hold-kalman-update`) applies it
+  only after a validated ambiguity-resolution FIX, not after the hold-fix
+  fallback.
+- `--min-fix-satellites <k>` refuses an ambiguity-resolution FIX with fewer
+  than k non-reference satellites.
+
+With `--navi776-tc` on the six PPC runs, all three together cut the wrong-FIX
+rate from 7.08% to 2.00% of FIX. FIX within 0.5 m fall by 0.91 pp of epochs,
+but FIX within 0.25 m rise from 62.93% to 65.90%
+([measurement](ppc_rtk_vs_gnss_imu_fusion.md#kf-hold-only-after-validated-fixes)).
+On UrbanNav Tokyo they also lower the wrong-FIX rate. On Odaiba, however, they
+hold one wrong fix for 13 s, 12 m off horizontally and 44 m in height
+([UrbanNav check](ppc_rtk_vs_gnss_imu_fusion.md#urbannav-out-of-sample-check)).
+
 ## Position frame contract
 
 The loose ESKF nominal `position_enu` and `velocity_enu` are always the IMU
@@ -117,6 +136,14 @@ Acc Z ≈ +9.81, despite the upstream README saying FRD).
 presets. The accepted tuning and research flags remain backward-compatible
 and are listed under `gnss fuse --help-advanced`. Prefer `--navi776-tc`
 instead of spelling out its component tight-coupling flags.
+
+With `--navi776-tc` (or `--tc-velocity-states`), use the RTK stream written by
+`--rtk-pos-out`. The fused `--out` stream can be kilometres off on the PPC
+Tokyo runs, because the loose ESKF takes a wrong RTK velocity state
+([known issue](navi776_techniques.md#known-issue-the-velocity-state-2026-10-31)).
+Without any tight-coupling flag, PPC nagoya/run1 is kilometres off too: there
+the loose ESKF's gyro bias estimate grows to 0.23 rad/s and its heading does
+not converge.
 
 For repeatable runs, put defaults in a flat TOML `[gnss_fuse]` table and pass
 `--config <path>`. Keys may use `snake_case` or `kebab-case`; vector values
